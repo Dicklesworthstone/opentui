@@ -145,6 +145,8 @@ export function createConnectionHandler(dependencies: ConnectionDependencies): {
       clients.delete(client)
     })
     client.on("error", (err: Error) => safe.report(err))
+    // Register cleanup first; @types/ssh2 omits this server-side transport method.
+    void safe(() => (client as Connection & { setNoDelay(enabled: boolean): Connection }).setNoDelay(true))
   }
 
   const closeAll = async () => {
