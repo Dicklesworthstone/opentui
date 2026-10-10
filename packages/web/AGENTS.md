@@ -154,3 +154,5 @@ The site works like go.dev and tip.golang.org. `scripts/build-site.ts` builds it
 Accessibility, comprehension, and task completion take priority over visual minimalism.
 
 Add an element if its removal makes content unclear, hides state, harms navigation, or blocks access. Use the least visual treatment that solves the problem.
+
+For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
