@@ -583,7 +583,7 @@ test "remote detection - auto mode detects mosh environment" {
     try testing.expect(term.caps.remote);
 }
 
-test "remote detection - auto mode ignores local capabilities after forwarded SSH marker" {
+test "remote detection - auto mode ignores forwarded terminal identity after SSH marker" {
     var term = Terminal.init(.{ .remote_mode = .auto });
     defer term.deinit();
 
@@ -594,9 +594,40 @@ test "remote detection - auto mode ignores local capabilities after forwarded SS
 
     try testing.expect(term.caps.remote);
     try testing.expectEqual(utf8.WidthMethod.unicode, term.caps.unicode);
-    try testing.expect(!term.caps.ansi256);
     try testing.expect(!term.caps.notifications);
     try testing.expectEqualStrings("", term.getTerminalName());
+}
+
+test "remote detection - TERM and COLORTERM set color depth in every remote mode" {
+    const cases = [_]struct { term: []const u8, colorterm: ?[]const u8 = null, ansi256: bool, rgb: bool }{
+        .{ .term = "screen-256color", .ansi256 = true, .rgb = false },
+        .{ .term = "screen", .colorterm = "truecolor", .ansi256 = true, .rgb = true },
+        .{ .term = "screen", .colorterm = "24bit", .ansi256 = true, .rgb = true },
+        .{ .term = "xterm-256color-italic", .colorterm = "yes", .ansi256 = true, .rgb = false },
+        .{ .term = "dumb", .colorterm = "256", .ansi256 = false, .rgb = false },
+        .{ .term = "", .colorterm = "", .ansi256 = false, .rgb = false },
+    };
+    // The authoritative env_map takes the full path in every mode; setHostEnvVar forwards one key at a time.
+    for ([_]Terminal.RemoteMode{ .local, .auto, .remote }) |mode| for ([_]bool{ false, true }) |forwarded| {
+        for (cases) |case| {
+            var env = std.process.Environ.Map.init(testing.allocator);
+            defer env.deinit();
+            try env.put("SSH_CONNECTION", "192.0.2.1 54231 192.0.2.2 22");
+            try env.put("TERM", case.term);
+            if (case.colorterm) |colorterm| try env.put("COLORTERM", colorterm);
+
+            var term = Terminal.init(.{ .remote_mode = mode, .env_map = if (forwarded) null else &env });
+            defer term.deinit();
+            if (forwarded) {
+                var entries = env.iterator();
+                while (entries.next()) |entry| try term.setHostEnvVar(testing.allocator, entry.key_ptr.*, entry.value_ptr.*);
+            }
+
+            try testing.expectEqual(mode != .local, term.caps.remote);
+            try testing.expectEqual(case.ansi256, term.caps.ansi256);
+            try testing.expectEqual(case.rgb, term.caps.rgb);
+        }
+    };
 }
 
 test "remote detection - explicit local mode ignores SSH environment" {
@@ -932,22 +963,6 @@ test "environment overrides - FORCE_HYPERLINK forces hyperlink support" {
 
     term.processCapabilityResponse("\x1bP>|kitty(0.40.1)\x1b\\");
     try testing.expect(!term.caps.hyperlinks);
-}
-
-test "setHostEnvVar detects ansi256 separately from rgb" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("TERM", "screen-256color");
-
-    var term = Terminal.init(.{ .env_map = &env });
-    defer term.deinit();
-
-    try testing.expect(term.caps.ansi256);
-    try testing.expect(!term.caps.rgb);
-
-    try term.setHostEnvVar(testing.allocator, "COLORTERM", "truecolor");
-    try testing.expect(term.caps.rgb);
-    try testing.expect(term.caps.ansi256);
 }
 
 test "environment overrides - WT_SESSION enables rgb and ansi256" {

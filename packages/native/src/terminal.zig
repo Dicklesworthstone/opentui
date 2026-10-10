@@ -712,6 +712,21 @@ pub fn checkEnvironmentOverrides(self: *Terminal) void {
 
     const env_is_forwarded = if (self.host_env_map) |*host_env_map| env_map == host_env_map else false;
     self.applyKnownUnicodeWidthIdentity();
+    // Unlike the identity keys below, color depth describes the endpoint in every mode:
+    // sshd takes TERM from the client's PTY request, and COLORTERM comes from the client or the session itself.
+    if (env_map.get("TERM")) |term| {
+        if (std.ascii.findIgnoreCase(term, "256color") != null) {
+            self.caps.ansi256 = true;
+        }
+    }
+    if (env_map.get("COLORTERM")) |colorterm| {
+        if (std.mem.eql(u8, colorterm, "truecolor") or
+            std.mem.eql(u8, colorterm, "24bit"))
+        {
+            self.caps.rgb = true;
+            self.caps.ansi256 = true;
+        }
+    }
     if (self.opts.remote_mode == .auto and self.remote and env_is_forwarded) {
         return;
     }
@@ -751,9 +766,6 @@ pub fn checkEnvironmentOverrides(self: *Terminal) void {
     }
 
     if (env_map.get("TERM")) |term| {
-        if (std.ascii.findIgnoreCase(term, "256color") != null) {
-            self.caps.ansi256 = true;
-        }
         self.applyNotificationHeuristic(term);
         self.is_foot = self.is_foot or std.ascii.findIgnoreCase(term, "foot") != null;
     }
@@ -833,15 +845,6 @@ pub fn checkEnvironmentOverrides(self: *Terminal) void {
                 @memcpy(self.term_info.name[0..name.len], name);
                 self.term_info.name_len = name.len;
             }
-        }
-    }
-
-    if (env_map.get("COLORTERM")) |colorterm| {
-        if (std.mem.eql(u8, colorterm, "truecolor") or
-            std.mem.eql(u8, colorterm, "24bit"))
-        {
-            self.caps.rgb = true;
-            self.caps.ansi256 = true;
         }
     }
 
