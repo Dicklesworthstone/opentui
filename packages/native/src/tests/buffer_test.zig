@@ -375,18 +375,25 @@ test "OptimizedBuffer text ignores foreground alpha over an image marker" {
     defer pool.deinit();
     var link_pool = link.LinkPool.init(std.testing.allocator);
     defer link_pool.deinit();
-    const target = try OptimizedBuffer.init(std.testing.allocator, 1, 1, .{ .pool = &pool, .link_pool = &link_pool });
-    defer target.deinit();
     const source = try image.createFromRgba(std.testing.allocator, &[_]u8{ 7, 8, 9, 255 }, 1, 1, 4);
     defer source.deinit();
-    try std.testing.expect(try target.drawImage(source, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, .auto));
+    // Checked text draws over images that the target's owner context holds.
+    source.owner_context_id = 1;
+    for ([_]bool{ false, true }) |checked| {
+        const target = try OptimizedBuffer.init(std.testing.allocator, 1, 1, .{ .pool = &pool, .link_pool = &link_pool });
+        defer target.deinit();
+        target.owner_context_id = 1;
+        try std.testing.expect(try target.drawImage(source, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, .auto));
 
-    try target.drawText("X", 0, 0, ansi.rgbColor(40, 50, 60, 64), ansi.rgbColor(10, 20, 30, 255), 0);
+        const fg = ansi.rgbColor(40, 50, 60, 64);
+        const bg = ansi.rgbColor(10, 20, 30, 255);
+        if (checked) try target.drawTextChecked("X", 0, 0, fg, bg, 0) else try target.drawText("X", 0, 0, fg, bg, 0);
 
-    const cell = target.get(0, 0).?;
-    try std.testing.expectEqual(@as(u32, 'X'), cell.char);
-    try std.testing.expectEqual(ansi.rgbColor(10, 20, 30, 255), cell.bg);
-    try std.testing.expectEqual(ansi.rgbColor(40, 50, 60, 255), cell.fg);
+        const cell = target.get(0, 0).?;
+        try std.testing.expectEqual(@as(u32, 'X'), cell.char);
+        try std.testing.expectEqual(ansi.rgbColor(10, 20, 30, 255), cell.bg);
+        try std.testing.expectEqual(ansi.rgbColor(40, 50, 60, 255), cell.fg);
+    }
 }
 
 test "OptimizedBuffer transparent tab covers only clipped image markers" {
@@ -1368,6 +1375,7 @@ test "OptimizedBuffer - checked text at signed positions clips like drawTextClip
     const black = ansi.rgbaFromFloats(0.0, 0.0, 0.0, 1.0);
     const white = ansi.rgbaFromFloats(1.0, 1.0, 1.0, 1.0);
     const red = ansi.rgbaFromFloats(1.0, 0.0, 0.0, 1.0);
+    const translucent = ansi.rgbaFromFloats(0.0, 0.0, 1.0, 0.5);
     const min = std.math.minInt(i32);
     const Draw = struct { text: []const u8, x: i32, y: i32, bg: ?RGBA, scissor: bool = false };
     const draws = [_]Draw{
@@ -1376,6 +1384,7 @@ test "OptimizedBuffer - checked text at signed positions clips like drawTextClip
         .{ .text = "\tX", .x = -1, .y = 2, .bg = red },
         .{ .text = "\tY", .x = -2, .y = 2, .bg = red },
         .{ .text = "e\u{301}XY", .x = -1, .y = 3, .bg = null },
+        .{ .text = "QRS", .x = 2, .y = 3, .bg = translucent },
         .{ .text = "WXYZ", .x = -1, .y = 4, .bg = null, .scissor = true },
         .{ .text = "AB\u{4e16}", .x = -1, .y = 5, .bg = null },
         .{ .text = "ZZZZ", .x = 0, .y = -1, .bg = black },
@@ -2867,12 +2876,13 @@ test "OptimizedBuffer drawTextChecked warm draws avoid heap allocation" {
 }
 
 test "OptimizedBuffer drawTextChecked preserves cells and references at every allocation failure" {
-    // Exercise pool/tracker growth and each independent heap fallback.
+    // Exercise pool/tracker growth and each independent heap fallback. A tab keeps the long
+    // texts off the printable ASCII path, which allocates nothing.
     for ([_]struct { text: []const u8, visible_columns: u32, width: u32 = 512 }{
         .{ .text = "\u{e9}\u{4e2d}e\u{301}\tZ\u{3b1}\u{3b2}\u{3b3}\u{3b4}\u{3f5}", .visible_columns = 12, .width = 12 },
-        .{ .text = "x" ** 4097, .visible_columns = 4 },
+        .{ .text = "x" ** 4096 ++ "\t", .visible_columns = 4 },
         .{ .text = "\u{e9}" ** 512, .visible_columns = 4 },
-        .{ .text = "x" ** 512, .visible_columns = 512 },
+        .{ .text = "x" ** 511 ++ "\t", .visible_columns = 512 },
     }) |case| {
         const text = case.text;
         var failures: usize = 0;

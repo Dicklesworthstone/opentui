@@ -82,6 +82,7 @@ pub const EmbeddedTerminal = struct {
 
         var handler = self.terminal.vtHandler();
         handler.effects.write_pty = &writePty;
+        handler.effects.device_attributes = &deviceAttributes;
         self.stream = .init(.{ .allocator = allocator, .handler = .{ .base = handler } });
         return self;
     }
@@ -211,7 +212,10 @@ pub const EmbeddedTerminal = struct {
     pub fn encodeKey(self: *EmbeddedTerminal, key: ghostty.Key) Error![]u8 {
         var output: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer output.deinit();
-        ghostty.encodeKey(&output.writer, key.event(), .fromTerminal(&self.terminal)) catch return error.OutOfMemory;
+        var options: ghostty.KeyEncodeOptions = .fromTerminal(&self.terminal);
+        // The host terminal has already applied its Option setting, so an Alt bit here means Alt.
+        options.macos_option_as_alt = .true;
+        ghostty.encodeKey(&output.writer, key.event(), options) catch return error.OutOfMemory;
         return output.toOwnedSlice();
     }
 
@@ -294,5 +298,9 @@ pub const EmbeddedTerminal = struct {
         self.responses.appendSlice(self.allocator, data) catch {
             self.response_error = error.OutOfMemory;
         };
+    }
+
+    fn deviceAttributes(_: *ghostty.TerminalStream.Handler) ghostty.DeviceAttributes {
+        return .{};
     }
 };

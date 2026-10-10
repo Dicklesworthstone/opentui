@@ -275,23 +275,6 @@ describe("EmbeddedTerminalRenderable", () => {
     }
   })
 
-  test("encodes Meta as Super rather than Alt", () => {
-    const terminal = new EmbeddedTerminalRenderable(setup.renderer, { width: 20, height: 4 })
-    setup.renderer.root.add(terminal)
-    terminal.write("\x1b[>3u")
-
-    const encoded = terminal.encodeKey(
-      keyEvent({
-        name: "a",
-        sequence: "a",
-        code: "KeyA",
-        baseCode: "a".codePointAt(0),
-        meta: true,
-      }),
-    )
-    expect(new TextDecoder().decode(encoded)).toBe("\x1b[97;9u")
-  })
-
   test("re-encodes Kitty character and escape keys for nested terminals", () => {
     const terminal = new EmbeddedTerminalRenderable(setup.renderer, { width: 20, height: 4 })
     setup.renderer.root.add(terminal)
@@ -323,6 +306,16 @@ describe("EmbeddedTerminalRenderable", () => {
     ["Dvorak Ctrl+D in legacy mode", 0, "\x1b[100::104;5u", "\x04"],
     ["Dvorak Ctrl+U with its base-layout alternative", 5, "\x1b[117::102;5u", "\x1b[117::102;5u"],
     ["Dvorak Ctrl+D with its base-layout alternative", 5, "\x1b[100::104;5u", "\x1b[100::104;5u"],
+    ["legacy Alt+a", 0, "\x1ba", "\x1ba"],
+    ["legacy Alt+b", 0, "\x1bb", "\x1bb"],
+    ["legacy Ctrl+Alt+a into a Kitty child", 1, "\x1b\x01", "\x1b[97;7u"],
+    ["legacy Alt+Backspace", 0, "\x1b\x7f", "\x1b\x7f"],
+    ["xterm Alt+Up in legacy mode", 0, "\x1b[1;3A", "\x1b[1;3A"],
+    ["Kitty Alt+. in legacy mode", 0, "\x1b[46;3u", "\x1b."],
+    ["Kitty Alt+a", 1, "\x1b[97;3u", "\x1b[97;3u"],
+    ["Kitty Super+a", 1, "\x1b[97;9u", "\x1b[97;9u"],
+    ["Kitty Alt+Super+a", 1, "\x1b[97;11u", "\x1b[97;11u"],
+    ["Kitty Meta+a as Alt", 1, "\x1b[97;33u", "\x1b[97;3u"],
   ])("preserves %s", (_label, flags, raw, expected) => {
     const terminal = new EmbeddedTerminalRenderable(setup.renderer, { width: 20, height: 4 })
     setup.renderer.root.add(terminal)

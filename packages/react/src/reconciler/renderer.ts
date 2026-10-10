@@ -37,11 +37,12 @@ export function createRoot(renderer: CliRenderer): Root {
     }
   }
 
-  renderer.once(CliRenderEvents.DESTROY, cleanup)
+  if (!renderer.isDestroyed) renderer.once(CliRenderEvents.DESTROY, cleanup)
 
   return {
     render: (node: ReactNode) => {
-      if (!renderer.isDestroyed) engine.attach(renderer)
+      if (renderer.isDestroyed) return
+      engine.attach(renderer)
       container = _render(
         React.createElement(
           AppContext.Provider,
