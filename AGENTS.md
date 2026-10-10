@@ -60,3 +60,5 @@ terminal or platform is unavailable locally.
 - Model C-string inputs as pointer parameters and pass owned, NUL-terminated byte buffers directly; string returns are
   not portable. Create callbacks through the loaded library/platform facade, not `new JSCallback(...)`, and assume only
   same-thread callbacks.
+
+For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
