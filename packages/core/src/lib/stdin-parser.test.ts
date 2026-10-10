@@ -4,6 +4,7 @@ import { ManualClock } from "../testing/manual-clock.js"
 import type { Clock, TimerHandle } from "./clock.js"
 import type { ScrollInfo } from "./parse.mouse.js"
 import { StdinParser, type StdinEvent, type StdinParserOptions } from "./stdin-parser.js"
+import conformance from "./stdin-parser.conformance.json" with { type: "json" }
 
 type KeySnap = {
   type: "key"
@@ -169,6 +170,43 @@ function assertChunkInvariant(input: Uint8Array, opts?: StdinParserOptions) {
   } finally {
     whole.destroy()
     split.destroy()
+  }
+}
+
+// Conformance vectors for the native parser port (issue 044); the JSON file's `format` field defines them.
+// `bun test --todo src/lib/stdin-parser.test.ts` also runs the todo rows: a todo row that passes fails that run,
+// so remove its issue id once the port fixes it.
+type ConformanceRow = [name: string, steps: Array<string | number[] | null>, expected: string[], issue?: string]
+const CONFORMANCE = conformance.rows as ConformanceRow[]
+
+function notation(event: Snap): string {
+  switch (event.type) {
+    case "key": {
+      const flags = (["ctrl", "meta", "shift"] as const).filter((flag) => event[flag]).map((flag) => ` ${flag}`)
+      const kind = event.eventType === "press" ? "" : ` ${event.eventType}`
+      return `key(${JSON.stringify(event.name)}${flags.join("")}${kind})`
+    }
+    case "mouse":
+      return `mouse(${event.event.type} ${event.event.x},${event.event.y} b${event.event.button})`
+    case "response":
+      return `response(${JSON.stringify(event.sequence)})`
+    case "paste":
+      return `paste(${JSON.stringify(Buffer.from(event.bytes).toString())})`
+  }
+}
+
+function runConformance(steps: ConformanceRow[1]): string[] {
+  const { parser, clock } = createTimedParser()
+  const out: string[] = []
+  try {
+    for (const step of [...steps, null]) {
+      if (step === null) clock.advance(TEST_TIMEOUT_MS)
+      else parser.push(buf(step))
+      out.push(...snap(parser).map(notation))
+    }
+    return out
+  } finally {
+    parser.destroy()
   }
 }
 
@@ -2101,25 +2139,6 @@ describe("StdinParser", () => {
       }
     })
 
-    test("multiple sequential timeouts", () => {
-      const { parser, clock } = createTimedParser()
-      try {
-        parser.push(Buffer.from("\x1b"))
-        clock.advance(10)
-        expect(snap(parser)).toEqual([k("escape", { raw: "\x1b" })])
-
-        parser.push(Buffer.from("\x1b"))
-        clock.advance(10)
-        expect(snap(parser)).toEqual([k("escape", { raw: "\x1b" })])
-
-        parser.push(Buffer.from("\x1b"))
-        clock.advance(10)
-        expect(snap(parser)).toEqual([k("escape", { raw: "\x1b" })])
-      } finally {
-        parser.destroy()
-      }
-    })
-
     test("custom timeout delay", () => {
       const { parser, clock } = createTimedParser({ timeoutMs: 50 })
       try {
@@ -2490,6 +2509,7 @@ describe("StdinParser", () => {
       }
     })
 
+    // The first, second, and fourth rows pin behavior on main that the 044 conformance vectors replace.
     table([
       ["CSI with unknown final byte produces empty-name key", "\x1b[h", [k("", { raw: "\x1b[h" })]],
       ["ESC followed by punctuation stays one empty-name key", "\x1b!", [k("", { raw: "\x1b!" })]],
@@ -2521,6 +2541,18 @@ describe("StdinParser", () => {
         p.destroy()
       }
     })
+  })
+
+  describe("conformance vectors", () => {
+    for (const [name, steps, expected, issue] of CONFORMANCE) {
+      const bytewise = steps.flatMap((step) => (step === null ? [null] : Array.from(buf(step), (byte) => [byte])))
+      const run = () => {
+        expect(runConformance(steps)).toEqual(expected)
+        expect(runConformance(bytewise)).toEqual(expected)
+      }
+      if (issue) test.todo(`${name} (${issue})`, run)
+      else test(name, run)
+    }
   })
 
   describe("timer/clock disagreement race condition", () => {
