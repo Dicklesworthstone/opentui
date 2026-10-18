@@ -518,6 +518,8 @@ test "embedded terminal drains generated PTY responses incrementally" {
         // Quiet mode 1 still reports errors, such as this file medium.
         .{ .query = "\x1b_Gi=32,s=1,v=1,a=q,q=1,t=f,f=24;L25vbmU=\x1b\\", .reply = "" },
         .{ .query = "\x1b_Ga=T,i=7,f=24,s=2,v=2;////////////////\x1b\\", .reply = "" },
+        // No glyph protocol: the compositor never draws registered glyphs.
+        .{ .query = "\x1b_25a1;s\x1b\\\x1b_25a1;q;cp=41\x1b\\", .reply = "" },
         .{ .query = set_colors ++ "\x1bc" ++ ask_colors, .reply = reset_colors },
         .{ .query = set_colors ++ "\x1b[!p" ++ ask_colors, .reply = reset_colors },
     };
