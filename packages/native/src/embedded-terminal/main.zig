@@ -73,8 +73,6 @@ pub const EmbeddedTerminal = struct {
                 .cols = options.cols,
                 .rows = options.rows,
                 .max_scrollback_bytes = options.max_scrollback,
-                // The compositor draws cells only; a zero limit makes Ghostty ignore Kitty graphics silently.
-                .kitty_image_storage_limit = 0,
                 // Ghostty answers OSC 10/11 and renders one-sided changes only when both defaults are set.
                 .colors = .{
                     .background = .init(ghostty.RenderState.empty.colors.background),
@@ -298,7 +296,7 @@ pub const EmbeddedTerminal = struct {
         return count;
     }
 
-    fn writePty(handler: *ghostty.TerminalStream.Handler, data: [:0]const u8) void {
+    fn writePty(handler: *ghostty.TerminalStream.Handler, data: []const u8) void {
         const self: *EmbeddedTerminal = @fieldParentPtr("terminal", handler.terminal);
         if (self.response_error != null) return;
         if (data.len > response_limit - @min(self.responses.items.len, response_limit)) {

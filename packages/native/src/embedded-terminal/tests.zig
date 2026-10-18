@@ -379,6 +379,13 @@ test "embedded terminal selection highlights text without unused cells" {
             .highlight = .{ "##......", "........", "........" },
         },
         .{
+            // Unicode 17 widths, as in OpenTUI text: U+1F6D9 is unassigned (1 cell), and a consonant after
+            // U+1CF5 starts its own cell.
+            .output = "a\u{1F6D9}b\u{1CF5}\u{0915}",
+            .text = "a\u{1F6D9}b\u{1CF5}\u{0915}",
+            .highlight = .{ "#####...", "........", "........" },
+        },
+        .{
             .output = "e\xcc\x81 \xf0\x9f\x98\x80",
             .text = "e\xcc\x81 \xf0\x9f\x98\x80",
             .highlight = .{ "####....", "........", "........" },
@@ -387,6 +394,12 @@ test "embedded terminal selection highlights text without unused cells" {
             .output = "abcdefg\xe7\x95\x8c",
             .text = "abcdefg\xe7\x95\x8c",
             .highlight = .{ "#######.", "##......", "........" },
+        },
+        .{
+            // DECSTR turns off ISO protection (SPA/EPA), so the erase clears the cells.
+            .output = "\x1bVpr\x1bW\x1b[!p\x1b[1;1H\x1b[K",
+            .text = "",
+            .highlight = .{ "........", "........", "........" },
         },
     };
 
@@ -489,6 +502,10 @@ test "embedded terminal drains generated PTY responses incrementally" {
     const terminal = try EmbeddedTerminal.init(std.testing.io, std.testing.allocator, .{ .cols = 20, .rows = 4 });
     defer terminal.deinit();
 
+    const set_colors = "\x1b]4;1;rgb:00/ff/00\x1b\\\x1b]10;rgb:11/22/33\x1b\\\x1b]11;rgb:44/55/66\x1b\\\x1b]12;rgb:77/88/99\x1b\\";
+    const ask_colors = "\x1b]4;1;?\x1b\\\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\";
+    // RIS and DECSTR restore the palette but keep the dynamic colors, as xterm does.
+    const reset_colors = "\x1b]4;1;rgb:cccc/6666/6666\x1b\\\x1b]10;rgb:1111/2222/3333\x1b\\\x1b]11;rgb:4444/5555/6666\x1b\\\x1b]12;rgb:7777/8888/9999\x1b\\";
     const cases = [_]struct { query: []const u8, reply: []const u8 }{
         .{ .query = "\x1b[5n", .reply = "\x1b[0n" },
         .{ .query = "\x1b[c", .reply = "\x1b[?62;22c" },
@@ -501,15 +518,17 @@ test "embedded terminal drains generated PTY responses incrementally" {
         // Quiet mode 1 still reports errors, such as this file medium.
         .{ .query = "\x1b_Gi=32,s=1,v=1,a=q,q=1,t=f,f=24;L25vbmU=\x1b\\", .reply = "" },
         .{ .query = "\x1b_Ga=T,i=7,f=24,s=2,v=2;////////////////\x1b\\", .reply = "" },
+        .{ .query = set_colors ++ "\x1bc" ++ ask_colors, .reply = reset_colors },
+        .{ .query = set_colors ++ "\x1b[!p" ++ ask_colors, .reply = reset_colors },
     };
     for (cases) |case| {
         try terminal.write(case.query);
-        var output: [64]u8 = undefined;
+        var output: [128]u8 = undefined;
         const first_len = try terminal.drainResponses(output[0..2]);
         const rest_len = try terminal.drainResponses(output[first_len..]);
         try std.testing.expectEqualStrings(case.reply, output[0 .. first_len + rest_len]);
     }
-    try std.testing.expectEqual(0, terminal.terminal.screens.active.kitty_images.total_bytes);
+    try std.testing.expectEqual(0, @sizeOf(@TypeOf(terminal.terminal.screens.active.kitty_images)));
 }
 
 test "embedded terminal preserves queued responses when the bound is reached" {

@@ -2511,6 +2511,8 @@ test "calculateTextWidth: Devanagari conjuncts" {
     try testing.expectEqual(@as(u32, 2), utf8.calculateTextWidth(kta, 4, .hidden, false, .unicode));
     try testing.expectEqual(@as(u32, 2), utf8.calculateTextWidth(jna, 4, .hidden, false, .unicode));
     try testing.expectEqual(@as(u32, 2), utf8.calculateTextWidth(ksha, 4, .hidden, false, .unicode));
+    // Unicode 17: a consonant after VEDIC SIGN JIHVAMULIYA starts its own cluster (Unicode 18 joins it).
+    try testing.expectEqual(@as(u32, 2), utf8.calculateTextWidth("\u{1CF5}\u{0915}", 4, .hidden, false, .unicode));
 }
 
 test "calculateTextWidth: Bengali script" {
