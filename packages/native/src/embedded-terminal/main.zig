@@ -73,6 +73,8 @@ pub const EmbeddedTerminal = struct {
                 .cols = options.cols,
                 .rows = options.rows,
                 .max_scrollback_bytes = options.max_scrollback,
+                // The compositor draws cells only; a zero limit makes Ghostty ignore Kitty graphics silently.
+                .kitty_image_storage_limit = 0,
                 // Ghostty answers OSC 10/11 and renders one-sided changes only when both defaults are set.
                 .colors = .{
                     .background = .init(ghostty.RenderState.empty.colors.background),
