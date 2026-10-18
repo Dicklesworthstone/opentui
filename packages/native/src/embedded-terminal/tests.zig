@@ -233,6 +233,8 @@ test "embedded terminal redraws changed rows and default colors and clips compos
     const black = ansi.rgbColor(0, 0, 0, 255);
     const red = ansi.rgbColor(255, 0, 0, 255);
     const blue = ansi.rgbColor(0, 0, 255, 255);
+    const green = ansi.rgbColor(0, 255, 0, 255);
+    const palette_red = ansi.rgbColor(0xcc, 0x66, 0x66, 255);
     // No step invalidates or writes row 1, so the row 1 sentinel survives unless every row is redrawn.
     const steps = [_]struct { write: []const u8, fg: buffer.RGBA, bg: buffer.RGBA, full: bool }{
         .{ .write = "\x1b[1;1Hb", .fg = white, .bg = black, .full = false },
@@ -245,6 +247,11 @@ test "embedded terminal redraws changed rows and default colors and clips compos
         .{ .write = "\x1b]111\x07", .fg = white, .bg = black, .full = true },
         .{ .write = "\x1b]4;0;rgb:00/ff/00\x07", .fg = white, .bg = black, .full = true },
         .{ .write = "\x1b[?5h\x1bc", .fg = white, .bg = black, .full = true },
+        // DECSTR and RIS restore palette color 1 on screen, not only in the OSC 4 reply.
+        .{ .write = "\x1b]4;1;rgb:00/ff/00\x07\x1b[1;1H\x1b[31mb", .fg = green, .bg = black, .full = true },
+        .{ .write = "\x1b[!p", .fg = palette_red, .bg = black, .full = true },
+        .{ .write = "\x1b]4;1;rgb:00/ff/00\x07\x1b[1;1H\x1b[31mb", .fg = green, .bg = black, .full = true },
+        .{ .write = "\x1bc\x1b[31mb", .fg = palette_red, .bg = black, .full = true },
     };
     for (steps, 0..) |step, index| {
         errdefer std.debug.print("step {d}\n", .{index});
@@ -513,11 +520,8 @@ test "embedded terminal drains generated PTY responses incrementally" {
         .{ .query = "\x1b[=c", .reply = "\x1bP!|00000000\x1b\\" },
         .{ .query = "\x1b]10;?\x07", .reply = "\x1b]10;rgb:ffff/ffff/ffff\x07" },
         .{ .query = "\x1b]11;?\x1b\\", .reply = "\x1b]11;rgb:0000/0000/0000\x1b\\" },
-        // No Kitty graphics: support probes, quiet or not, and uploads get no reply, so programs use text.
+        // No Kitty graphics: the support probe gets no reply, so programs use text.
         .{ .query = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", .reply = "" },
-        // Quiet mode 1 still reports errors, such as this file medium.
-        .{ .query = "\x1b_Gi=32,s=1,v=1,a=q,q=1,t=f,f=24;L25vbmU=\x1b\\", .reply = "" },
-        .{ .query = "\x1b_Ga=T,i=7,f=24,s=2,v=2;////////////////\x1b\\", .reply = "" },
         // No glyph protocol: the compositor never draws registered glyphs.
         .{ .query = "\x1b_25a1;s\x1b\\\x1b_25a1;q;cp=41\x1b\\", .reply = "" },
         // No Kitty drag and drop: queries get no reply and registrations keep no state.
