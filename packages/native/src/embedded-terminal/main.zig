@@ -38,6 +38,8 @@ const StreamHandler = struct {
         if (action == .set_mode or action == .reset_mode or action == .restore_mode) {
             if (value.mode == .@"132_column") return;
         }
+        // Ghostty answers and stores Kitty drag and drop commands without a drop effect; OpenTUI has none.
+        if (action == .kitty_dnd) return;
         self.base.vt(action, value);
     }
 

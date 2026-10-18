@@ -520,6 +520,8 @@ test "embedded terminal drains generated PTY responses incrementally" {
         .{ .query = "\x1b_Ga=T,i=7,f=24,s=2,v=2;////////////////\x1b\\", .reply = "" },
         // No glyph protocol: the compositor never draws registered glyphs.
         .{ .query = "\x1b_25a1;s\x1b\\\x1b_25a1;q;cp=41\x1b\\", .reply = "" },
+        // No Kitty drag and drop: queries get no reply and registrations keep no state.
+        .{ .query = "\x1b]72;t=q\x1b\\\x1b]72;t=p\x1b\\\x1b]72;t=a;text/plain\x1b\\", .reply = "" },
         .{ .query = set_colors ++ "\x1bc" ++ ask_colors, .reply = reset_colors },
         .{ .query = set_colors ++ "\x1b[!p" ++ ask_colors, .reply = reset_colors },
     };
@@ -531,6 +533,7 @@ test "embedded terminal drains generated PTY responses incrementally" {
         try std.testing.expectEqualStrings(case.reply, output[0 .. first_len + rest_len]);
     }
     try std.testing.expectEqual(0, @sizeOf(@TypeOf(terminal.terminal.screens.active.kitty_images)));
+    try std.testing.expectEqual(null, terminal.terminal.kitty_dnd);
 }
 
 test "embedded terminal preserves queued responses when the bound is reached" {
