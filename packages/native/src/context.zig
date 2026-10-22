@@ -466,8 +466,8 @@ const SceneMeasure = struct {
 
     fn measure(data: ?*anyopaque, width: f32, width_mode: u32, height: f32, height_mode: u32) callconv(.c) yoga.ExternalYogaSize {
         const self: *SceneMeasure = @ptrCast(@alignCast(data.?));
-        const node = self.owner.sceneNode(self.handle) catch unreachable;
-        std.debug.assert(node.scene_node.?.handle.generation == self.handle.generation);
+        const node = (self.owner.sceneNode(self.handle) catch unreachable).scene_node.?;
+        std.debug.assert(node.handle.generation == self.handle.generation);
         std.debug.assert(self.owner.mutating and !self.owner.scene_measuring);
         self.owner.scene_measuring = true;
         defer self.owner.scene_measuring = false;
@@ -475,13 +475,19 @@ const SceneMeasure = struct {
         // call. Unlike native measurement failures, they do not poison the tree.
         var result: yoga.ExternalYogaSize = .{ .width = std.math.nan(f32), .height = std.math.nan(f32) };
         self.callback(self.handle.context_id, self.handle.slot, self.handle.generation, width, width_mode, height, height_mode, &result);
-        // Yoga warns about NaN and measures zero. A size beyond the i32 cell range
-        // would instead fail the whole frame in layout validation.
-        return .{ .width = cellRangeOrNan(result.width), .height = cellRangeOrNan(result.height) };
+        // Yoga would warn and measure zero for NaN or negative sizes. A size beyond the
+        // i32 cell range would fail the whole frame in layout validation. Yoga caches
+        // the zero, so Scene.retryFailedMeasures handles the node before the next solve.
+        const size: yoga.ExternalYogaSize = .{ .width = cellRangeOrZero(result.width), .height = cellRangeOrZero(result.height) };
+        if (size.width != result.width or size.height != result.height) {
+            node.measure_failed = true;
+            node.owner.measure_failed = true;
+        }
+        return size;
     }
 
-    fn cellRangeOrNan(value: f32) f32 {
-        return if (@as(f64, value) <= std.math.maxInt(i32)) value else std.math.nan(f32);
+    fn cellRangeOrZero(value: f32) f32 {
+        return if (value >= 0 and @as(f64, value) <= std.math.maxInt(i32)) value else 0;
     }
 };
 
@@ -2352,7 +2358,7 @@ pub const Context = struct {
         const text = node.scene_node.?.text orelse return error.WrongKind;
         var dirty: u32 = 0;
         try yoga.check(yoga.yogaNodeIsDirtyChecked(node.yoga_node, &dirty));
-        try validateTextBytes(text.buffer, bytes, 0);
+        try validateTextBytes(text.buffer.tabWidth(), bytes, 0);
         try self.replaceTextContent(text, bytes);
         textResourceChanged(text);
         if (text.owned_style) |style| {
@@ -2363,22 +2369,12 @@ pub const Context = struct {
         node.scene_node.?.owner.work.clearRetainingCapacity();
     }
 
-    pub fn validateTextBytes(text: *const text_buffer.UnifiedTextBuffer, bytes: []const u8, retained_bytes: u32) !void {
-        // Rope columns and line counts are u32. Tabs are the largest cell/byte
-        // expansion; reserve one count for the trailing logical line.
-        const bytes_max = (std.math.maxInt(u32) - 1) / @as(u32, @max(text.tabWidth(), 1));
+    pub fn validateTextBytes(tab_width: u8, bytes: []const u8, retained_bytes: u32) !void {
+        // Rope columns and line counts are u32. Tabs and control notation (two cells per byte)
+        // are the largest cell/byte expansion; reserve one count for the trailing logical line.
+        const bytes_max = (std.math.maxInt(u32) - 1) / @as(u32, @max(tab_width, 2));
         if (retained_bytes > bytes_max or bytes.len > bytes_max - retained_bytes) return error.TextLimit;
         if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUnicode;
-    }
-
-    fn validateEditTextBytes(text: *const text_buffer.UnifiedTextBuffer, bytes: []const u8, retained_bytes: u32) !void {
-        try validateTextBytes(text, bytes, retained_bytes);
-        // Cell-based editing cannot navigate standalone zero-width controls yet.
-        var codepoints = std.unicode.Utf8View.initUnchecked(bytes).iterator();
-        while (codepoints.nextCodepoint()) |codepoint| {
-            if ((codepoint < 0x20 and codepoint != '\t' and codepoint != '\r' and codepoint != '\n') or
-                (codepoint >= 0x7f and codepoint <= 0x9f)) return error.InvalidUnicode;
-        }
     }
 
     pub fn sceneSetStyledText(self: *Context, handle: Handle, bytes: []const u8, chunks: []const StyledTextChunk) !void {
@@ -2416,7 +2412,7 @@ pub const Context = struct {
     };
 
     fn prepareStyledTextResource(self: *Context, prepared: *PreparedStyledTextResource, text: anytype, bytes: []const u8, chunks: []const StyledTextChunk) !void {
-        try validateTextBytes(text.buffer, bytes, 0);
+        try validateTextBytes(text.buffer.tabWidth(), bytes, 0);
         var offset: usize = 0;
         for (chunks) |chunk| {
             if ((chunk.byte_count == 0 and @TypeOf(text) != *SharedText) or chunk.byte_count > bytes.len - offset or
@@ -2660,6 +2656,32 @@ pub const Context = struct {
             },
         };
         return buffer.copyTextRange(offsets.start, offsets.end, out);
+    }
+
+    /// Lays `bytes` out as setText would, without storing them, and returns the cursor offset at their end.
+    pub fn editMeasureText(self: *Context, handle: Handle, bytes: []const u8) !u32 {
+        try self.checkSceneRead();
+        const buffer = (try self.getEditBuffer(handle)).buffer.tb;
+        return measureEditText(bytes, buffer.tabWidth(), buffer.controlDisplay(), buffer.widthMethod());
+    }
+
+    /// Returns the cursor offset at the end of `bytes` after setText on an edit buffer with these
+    /// settings: the cells of each line plus one per line break.
+    pub fn measureEditText(bytes: []const u8, tab_width: u8, control_display: utf8.ControlDisplay, width_method: utf8.WidthMethod) !u32 {
+        // The byte limit keeps the widths and line breaks within u32.
+        try validateTextBytes(tab_width, bytes, 0);
+        var offset: u32 = 0;
+        var rest = bytes;
+        while (true) {
+            const end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+            const line = rest[0..end];
+            offset += utf8.calculateTextWidth(line, tab_width, control_display, utf8.isAsciiOnly(line), width_method);
+            if (end == rest.len) return offset;
+            // Lines end at LF, CR, or CRLF, as textToSegments splits them.
+            const crlf = std.mem.startsWith(u8, rest[end..], "\r\n");
+            offset += 1;
+            rest = rest[end + 1 + @intFromBool(crlf) ..];
+        }
     }
 
     pub fn textViewGetSelectedText(self: *Context, handle: Handle, out: []u8) !u32 {
@@ -3046,7 +3068,7 @@ pub const Context = struct {
         defer self.mutating = false;
         const text = try self.getTextBuffer(handle);
         try text.checkMutable();
-        try validateTextBytes(text.buffer, bytes, 0);
+        try validateTextBytes(text.buffer.tabWidth(), bytes, 0);
         try self.replaceTextContent(text, bytes);
         text.reclaimAppendBuffers();
         if (text.owned_style) |style| {
@@ -3128,7 +3150,7 @@ pub const Context = struct {
         defer self.mutating = false;
         const text = try self.getTextBuffer(handle);
         try text.checkMutable();
-        try validateTextBytes(text.buffer, bytes, text.buffer.getByteSize());
+        try validateTextBytes(text.buffer.tabWidth(), bytes, text.buffer.getByteSize());
         if (bytes.len == 0) return;
         // Each append takes a registry slot. When none is left, one owned copy of the whole
         // document replaces them all, so a long append stream copies O(n^2) bytes in total.
@@ -3393,7 +3415,7 @@ pub const Context = struct {
         defer self.mutating = false;
         const edit = try self.getEditBuffer(handle);
         try edit.checkMutable();
-        try validateEditTextBytes(edit.buffer.tb, bytes, 0);
+        try validateTextBytes(edit.buffer.tb.tabWidth(), bytes, 0);
         if (preserve_history) {
             try edit.buffer.replaceText(bytes);
         } else {
@@ -3406,7 +3428,7 @@ pub const Context = struct {
         defer self.mutating = false;
         const edit = try self.getEditBuffer(handle);
         try edit.checkMutable();
-        try validateEditTextBytes(edit.buffer.tb, bytes, edit.buffer.tb.getByteSize());
+        try validateTextBytes(edit.buffer.tb.tabWidth(), bytes, edit.buffer.tb.getByteSize());
         try edit.buffer.insertText(bytes);
     }
 
@@ -3445,7 +3467,7 @@ pub const Context = struct {
             .delete_forward => try edit.buffer.deleteForward(),
             .backspace => try edit.buffer.backspace(),
             .new_line => {
-                try validateEditTextBytes(edit.buffer.tb, "\n", edit.buffer.tb.getByteSize());
+                try validateTextBytes(edit.buffer.tb.tabWidth(), "\n", edit.buffer.tb.getByteSize());
                 try edit.buffer.insertText("\n");
             },
             .delete_line => try edit.buffer.deleteLine(),
@@ -3554,7 +3576,7 @@ pub const Context = struct {
         defer self.mutating = false;
         const view = try self.getEditorView(handle);
         try view.edit.checkMutable();
-        try validateEditTextBytes(view.edit.buffer.tb, bytes, view.edit.buffer.tb.getByteSize());
+        try validateTextBytes(view.edit.buffer.tb.tabWidth(), bytes, view.edit.buffer.tb.getByteSize());
         const steps = try view.view.replaceSelectedText(bytes);
         view.invalidate();
         return steps;
@@ -3565,7 +3587,7 @@ pub const Context = struct {
         defer self.mutating = false;
         const view = try self.getEditorView(handle);
         try view.edit.checkMutable();
-        try validateEditTextBytes(view.edit.buffer.tb, bytes, 0);
+        try validateTextBytes(view.edit.buffer.tb.tabWidth(), bytes, 0);
         var offset: usize = 0;
         for (chunks) |chunk| {
             if (chunk.byte_count == 0 or chunk.byte_count > bytes.len - offset or

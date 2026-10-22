@@ -4,6 +4,7 @@ const tb = @import("text-buffer.zig");
 const seg_mod = @import("text-buffer-segment.zig");
 const iter_mod = @import("text-buffer-iterators.zig");
 const utf8 = @import("utf8.zig");
+const text_work = @import("text-work.zig");
 const NativeRenderable = @import("native-renderable.zig").NativeRenderable;
 
 const UnifiedTextBuffer = tb.UnifiedTextBuffer;
@@ -517,6 +518,7 @@ pub const UnifiedTextBufferView = struct {
             .cached_line_vline_counts = &self.cached_line_vline_counts,
         };
 
+        text_work.add(.layouts, 1);
         const calculated = if (self.wrap_mode == .none or self.wrap_width == null)
             calculateUnwrappedVirtualLines(virtual_allocator, self.text_buffer, output)
         else switch (self.wrap_mode) {
@@ -1069,6 +1071,7 @@ pub const UnifiedTextBufferView = struct {
         var cols_before: u32 = 0;
         const mem_registry = self.text_buffer.memRegistry();
         const tab_width = self.text_buffer.tabWidth();
+        const control_display = self.text_buffer.controlDisplay();
         const width_method = self.text_buffer.widthMethod();
 
         while (seg_idx < rope.count()) : (seg_idx += 1) {
@@ -1083,23 +1086,25 @@ pub const UnifiedTextBufferView = struct {
                     bytes,
                     coords.col - cols_before,
                     tab_width,
+                    control_display,
                     is_ascii,
                     false,
                     width_method,
                 );
                 if (pos.byte_offset >= bytes.len) return null;
-                var width = utf8.getGraphemeWidthAt(bytes, pos.byte_offset, tab_width, width_method);
+                var width = utf8.getGraphemeWidthAt(bytes, pos.byte_offset, tab_width, control_display, width_method);
                 if (width == 0) {
                     const next = utf8.findGraphemePosByWidth(
                         bytes,
                         pos.columns_used + 1,
                         tab_width,
+                        control_display,
                         is_ascii,
                         false,
                         width_method,
                     );
                     if (next.byte_offset < bytes.len) {
-                        width = utf8.getGraphemeWidthAt(bytes, next.byte_offset, tab_width, width_method);
+                        width = utf8.getGraphemeWidthAt(bytes, next.byte_offset, tab_width, control_display, width_method);
                     }
                 }
                 const first_cp = utf8.decodeUtf8Unchecked(bytes, pos.byte_offset).cp;
@@ -1353,6 +1358,7 @@ pub const UnifiedTextBufferView = struct {
                     window,
                     keep_cols,
                     view.text_buffer.tabWidth(),
+                    view.text_buffer.controlDisplay(),
                     (chunk.chunk.flags & TextChunk.Flags.ASCII_ONLY) != 0,
                     view.text_buffer.widthMethod(),
                 );
@@ -1376,6 +1382,7 @@ pub const UnifiedTextBufferView = struct {
                     window,
                     drop_cols,
                     view.text_buffer.tabWidth(),
+                    view.text_buffer.controlDisplay(),
                     (chunk.chunk.flags & TextChunk.Flags.ASCII_ONLY) != 0,
                     true,
                     view.text_buffer.widthMethod(),
@@ -1428,7 +1435,8 @@ pub const UnifiedTextBufferView = struct {
 
             var prefix_accumulated: u32 = 0;
             for (vline.chunks.items) |chunk| {
-                if (prefix_accumulated >= prefix_width) break;
+                // Marks right after the prefix belong to its last glyph.
+                if (prefix_accumulated >= prefix_width and chunk.width_cols != 0) break;
 
                 const space_left = prefix_width - prefix_accumulated;
                 if (chunk.width_cols <= space_left) {
@@ -1524,10 +1532,12 @@ pub const UnifiedTextBufferView = struct {
             }
         }
 
+        text_work.add(.measure_passes, 1);
         var result: MeasureResult = .{ .line_count = 0, .width_cols_max = 0 };
         // No-wrap path avoids allocations by using marker-based line widths.
         if (width == 0 or self.wrap_mode == .none) {
             result.line_count = self.text_buffer.lineCount();
+            text_work.add(.measure_lines, result.line_count);
             var row: u32 = 0;
             while (row < result.line_count) : (row += 1) {
                 result.width_cols_max = @max(result.width_cols_max, self.text_buffer.lineWidthAt(row));
@@ -1598,6 +1608,7 @@ pub const UnifiedTextBufferView = struct {
             fn line_end_callback(ctx_ptr: *anyopaque, line_info: iter_mod.LineInfo) void {
                 const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
                 if (ctx.failed) return;
+                text_work.add(.lines_laid_out, 1);
 
                 const first_vline_idx: u32 = @intCast(ctx.output.virtual_lines.items.len);
                 ctx.output.cached_line_first_vline.append(ctx.allocator, first_vline_idx) catch {
@@ -1857,6 +1868,7 @@ pub const UnifiedTextBufferView = struct {
                     slice_bytes,
                     max_width_cols,
                     wctx.text_buffer.tabWidth(),
+                    wctx.text_buffer.controlDisplay(),
                     is_ascii_only,
                     wctx.text_buffer.widthMethod(),
                 );
@@ -1869,7 +1881,7 @@ pub const UnifiedTextBufferView = struct {
 
                 // A zero-width prefix, such as an appended combining mark, stays with the preceding text.
                 if (!allow_forced_grapheme or max_width_cols == 0) {
-                    const prefix = if (is_ascii_only) 0 else utf8.zeroWidthPrefixLen(slice_bytes, wctx.text_buffer.tabWidth(), wctx.text_buffer.widthMethod());
+                    const prefix = if (is_ascii_only) 0 else utf8.zeroWidthPrefixLen(slice_bytes, wctx.text_buffer.tabWidth(), wctx.text_buffer.controlDisplay(), wctx.text_buffer.widthMethod());
                     return .{ .width_cols = 0, .bytes_used = @intCast(prefix) };
                 }
 
@@ -1877,6 +1889,7 @@ pub const UnifiedTextBufferView = struct {
                     slice_bytes,
                     max_width_cols,
                     wctx.text_buffer.tabWidth(),
+                    wctx.text_buffer.controlDisplay(),
                     is_ascii_only,
                     true,
                     wctx.text_buffer.widthMethod(),
@@ -1890,6 +1903,7 @@ pub const UnifiedTextBufferView = struct {
                     slice_bytes,
                     forced.columns_used,
                     wctx.text_buffer.tabWidth(),
+                    wctx.text_buffer.controlDisplay(),
                     is_ascii_only,
                     wctx.text_buffer.widthMethod(),
                 );
@@ -2125,7 +2139,7 @@ pub const UnifiedTextBufferView = struct {
                             const layout_allocator = storage.arena.allocator();
                             if (layout == null) {
                                 var breaks: std.ArrayListUnmanaged(utf8.LayoutWrapBreak) = .empty;
-                                const classes = utf8.findChunkLayoutInfo(layout_allocator, chunk_bytes, wctx.text_buffer.tabWidth(), chunk.isAsciiOnly(), wctx.text_buffer.widthMethod(), &breaks) catch break :save false;
+                                const classes = utf8.findChunkLayoutInfo(layout_allocator, chunk_bytes, wctx.text_buffer.tabWidth(), wctx.text_buffer.controlDisplay(), chunk.isAsciiOnly(), wctx.text_buffer.widthMethod(), &breaks) catch break :save false;
                                 layout = .{ .wrap_breaks = breaks.toOwnedSlice(layout_allocator) catch break :save false, .word_classes = classes };
                             }
                             storage.layouts.append(layout_allocator, layout.?) catch break :save false;
@@ -2151,9 +2165,19 @@ pub const UnifiedTextBufferView = struct {
                     finalizePendingWord(wctx);
                     if (wctx.failed) return;
                 }
+                // Zero-width text that continues the previous chunk's grapheme stays with it; a pending word holds that grapheme.
+                var previous_cp: ?u21 = if (wctx.pending_word_pieces.items.len > 0) null else if (wctx.word_chunk) |previous| utf8.chunkWordClassEdges(previous.getBytes(wctx.text_buffer.memRegistry())).last_cp else null;
+                var break_state: @import("uucode").grapheme.BreakState = .default;
                 wctx.word_chunk = chunk;
                 wctx.word_chunk_col_start = 0;
                 wctx.word_chunk_byte_start = 0;
+                while (wctx.word_chunk_byte_start < chunk_bytes.len) : (wctx.word_chunk_byte_start += utf8.decodeUtf8Unchecked(chunk_bytes, wctx.word_chunk_byte_start).len) {
+                    const cp = utf8.decodeUtf8Unchecked(chunk_bytes, wctx.word_chunk_byte_start).cp;
+                    if (utf8.isGraphemeBreak(previous_cp, cp, &break_state, wctx.text_buffer.widthMethod())) break;
+                    previous_cp = cp;
+                }
+                if (utf8.calculateTextWidth(chunk_bytes[0..wctx.word_chunk_byte_start], wctx.text_buffer.tabWidth(), wctx.text_buffer.controlDisplay(), false, wctx.text_buffer.widthMethod()) > 0) wctx.word_chunk_byte_start = 0;
+                if (!addVirtualChunkSticky(wctx, chunk, 0, wctx.word_chunk_byte_start, 0, 0)) return;
                 const last_word_class = if (layout) |info| blk: {
                     var cjk_idx: usize = 0;
                     for (info.wrap_breaks) |wrap_break| {
@@ -2177,6 +2201,7 @@ pub const UnifiedTextBufferView = struct {
                     const streamed_layout = utf8.walkChunkLayoutInfoComptime(
                         chunk_bytes,
                         wctx.text_buffer.tabWidth(),
+                        wctx.text_buffer.controlDisplay(),
                         chunk.isAsciiOnly(),
                         wctx.text_buffer.widthMethod(),
                         wctx,
@@ -2202,15 +2227,14 @@ pub const UnifiedTextBufferView = struct {
                         wctx.source_line_has_non_whitespace = true;
                     }
                 }
-                wctx.word_chunk = null;
             }
 
             /// One grapheme that is wider than the space left, plus the zero-width clusters
             /// after it, which the wrap search also keeps on the line.
-            fn forceCharGrapheme(comptime width_method: utf8.WidthMethod, bytes: []const u8, tab_width: u8, is_ascii_only: bool) utf8.PosByWidthResult {
-                const forced = utf8.findGraphemePosByWidth(bytes, 1, tab_width, is_ascii_only, true, width_method);
+            fn forceCharGrapheme(comptime width_method: utf8.WidthMethod, bytes: []const u8, tab_width: u8, control_display: utf8.ControlDisplay, is_ascii_only: bool) utf8.PosByWidthResult {
+                const forced = utf8.findGraphemePosByWidth(bytes, 1, tab_width, control_display, is_ascii_only, true, width_method);
                 if (forced.grapheme_count == 0) return forced;
-                const kept = utf8.findWrapPosByWidthGraphemeSafe(bytes, forced.columns_used, tab_width, is_ascii_only, width_method);
+                const kept = utf8.findWrapPosByWidthGraphemeSafe(bytes, forced.columns_used, tab_width, control_display, is_ascii_only, width_method);
                 return .{ .byte_offset = @max(forced.byte_offset, kept.byte_offset), .grapheme_count = forced.grapheme_count, .columns_used = forced.columns_used };
             }
 
@@ -2218,12 +2242,13 @@ pub const UnifiedTextBufferView = struct {
                 const chunk_bytes = chunk.getBytes(wctx.text_buffer.memRegistry());
                 const is_ascii_only = (chunk.flags & TextChunk.Flags.ASCII_ONLY) != 0;
                 const tab_width = wctx.text_buffer.tabWidth();
+                const control_display = wctx.text_buffer.controlDisplay();
                 var chunk_byte_offset: usize = 0;
                 var chunk_col_offset: u32 = 0;
                 // Zero-width clusters stay with the preceding grapheme, as in unsplit text,
                 // even when an edit put them at the start of a chunk.
                 if (!is_ascii_only) {
-                    chunk_byte_offset = utf8.zeroWidthPrefixLen(chunk_bytes, tab_width, width_method);
+                    chunk_byte_offset = utf8.zeroWidthPrefixLen(chunk_bytes, tab_width, control_display, width_method);
                     try addVirtualChunk(wctx, chunk, 0, @intCast(chunk_byte_offset), 0, 0);
                 }
 
@@ -2239,7 +2264,7 @@ pub const UnifiedTextBufferView = struct {
                             continue;
                         }
                         const remaining_bytes = chunk_bytes[chunk_byte_offset..];
-                        const force_result = forceCharGrapheme(width_method, remaining_bytes, tab_width, is_ascii_only);
+                        const force_result = forceCharGrapheme(width_method, remaining_bytes, tab_width, control_display, is_ascii_only);
                         if (force_result.grapheme_count > 0) {
                             try addVirtualChunk(wctx, chunk, @intCast(chunk_byte_offset), force_result.byte_offset, chunk_col_offset, force_result.columns_used);
                             chunk_col_offset += force_result.columns_used;
@@ -2255,6 +2280,7 @@ pub const UnifiedTextBufferView = struct {
                         remaining_bytes,
                         remaining_width_cols,
                         tab_width,
+                        control_display,
                         is_ascii_only,
                         width_method,
                     );
@@ -2264,7 +2290,7 @@ pub const UnifiedTextBufferView = struct {
                             try commitVirtualLine(wctx);
                             continue;
                         }
-                        const force_result = forceCharGrapheme(width_method, remaining_bytes, tab_width, is_ascii_only);
+                        const force_result = forceCharGrapheme(width_method, remaining_bytes, tab_width, control_display, is_ascii_only);
                         if (force_result.grapheme_count > 0) {
                             try addVirtualChunk(wctx, chunk, @intCast(chunk_byte_offset), force_result.byte_offset, chunk_col_offset, force_result.columns_used);
                             chunk_col_offset += force_result.columns_used;
@@ -2350,6 +2376,7 @@ pub const UnifiedTextBufferView = struct {
             fn line_end_callback(ctx_ptr: *anyopaque, line_info: iter_mod.LineInfo) void {
                 const wctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
                 if (wctx.failed) return;
+                text_work.add(if (calculation == .render) .lines_laid_out else .measure_lines, 1);
 
                 var used_measure_cache = false;
                 var measure_cache_chunk: ?*const TextChunk = null;
@@ -2461,6 +2488,7 @@ pub const UnifiedTextBufferView = struct {
                     wctx.source_line_has_non_whitespace = false;
                     wctx.source_line_cjk_breaks = true;
                     wctx.word_line_last_cp = null;
+                    wctx.word_chunk = null;
                 }
                 if (comptime wrap_mode == .word and calculation == .measure) {
                     wctx.logical_measure_line_count = 0;
