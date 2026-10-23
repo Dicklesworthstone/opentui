@@ -261,6 +261,7 @@ pub const Editor = struct {
     pub fn prepareView(self: *Editor) !void {
         _ = self.view.text_buffer_view.getVirtualLines();
         if (self.view.text_buffer_view.virtual_lines_dirty) return error.OutOfMemory;
+        self.view.settle();
     }
 };
 
@@ -2211,7 +2212,8 @@ pub const Context = struct {
         try yoga.check(switch (group) {
             api.OT_STYLE_ENUM => yoga.yogaNodeStyleSetEnumChecked(node.yoga_node, kind, @intFromFloat(value)),
             api.OT_STYLE_FLOAT => yoga.yogaNodeStyleSetFloatChecked(node.yoga_node, kind, value),
-            api.OT_STYLE_VALUE => yoga.yogaNodeStyleSetValueChecked(node.yoga_node, kind, edge, unit, value),
+            // Finite summed edges and gaps saturate so Yoga's f32 sums stay finite; NaN still unsets.
+            api.OT_STYLE_VALUE => yoga.yogaNodeStyleSetValueChecked(node.yoga_node, kind, edge, unit, if (kind >= api.OT_STYLE_VALUE_MARGIN and std.math.isFinite(value) and @abs(value) > 1e30) std.math.copysign(@as(f32, 1e30), value) else value),
             api.OT_STYLE_DIMENSION => yoga.yogaNodeStyleSetDimensionChecked(node.yoga_node, kind, unit, value, flags),
             else => unreachable,
         });
@@ -3540,6 +3542,7 @@ pub const Context = struct {
         if (!std.math.isFinite(margin)) return error.InvalidOptions;
         const view = try self.getEditorView(handle);
         try view.edit.checkMutable();
+        if (view.view.follow_pending) try view.prepareView();
         view.view.setScrollMargin(margin);
         view.invalidate();
     }
@@ -3551,7 +3554,12 @@ pub const Context = struct {
         // Cursor commands synchronously update every view of the edit buffer.
         try view.edit.checkMutable();
         if (command == .tab_indicator) try validateTabIndicator(command.tab_indicator);
-        try view.prepareView();
+        // Cursor and text changes only make a scroll due; visual moves need the layout.
+        switch (command) {
+            .move_up, .move_down, .goto_line_end => try view.prepareView(),
+            .wrap_mode => if (view.view.follow_pending) try view.prepareView(),
+            .delete_selection, .cursor_offset, .tab_indicator => {},
+        }
         switch (command) {
             .move_up => view.view.moveUpVisual(),
             .move_down => view.view.moveDownVisual(),
@@ -3588,7 +3596,7 @@ pub const Context = struct {
     pub fn editorPrepareView(self: *Context, handle: Handle, follow_cursor: bool) !*Editor {
         try self.checkSceneRead();
         const view = try self.getEditorView(handle);
-        if (follow_cursor) view.view.updateBeforeRender();
+        if (follow_cursor) _ = view.view.updateCursorBeforeRender();
         try view.prepareView();
         return view;
     }
@@ -3683,6 +3691,7 @@ pub const Context = struct {
         if (options.foreground) |color| try buf.validateColor(color);
         if (options.background) |color| try buf.validateColor(color);
         if (local) {
+            if (is_editor and value.view.follow_pending) try value.prepareView();
             if (view.getViewport()) |viewport| {
                 const x = if (view.wrap_mode == .none) std.math.cast(i32, viewport.x) orelse return error.InvalidOptions else 0;
                 const y = std.math.cast(i32, viewport.y) orelse return error.InvalidOptions;

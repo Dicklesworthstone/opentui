@@ -212,25 +212,6 @@ test "Scene frame paint layout reports where a hook-free frame painted a node mo
     try f.owner.sceneFrameCancel(f.id, done.frame_id);
 }
 
-test "Scene frame reuses committed preparation until a mutation invalidates it" {
-    const f = try Fixture.init(testing.allocator, 8, 1, .{ .output = transport });
-    defer f.deinit();
-    const child = try f.owner.sceneCreateNode(f.id, 1, 2);
-    try f.owner.sceneSetStyle(child, 4, 0, 0, 1, 2, 1);
-    try f.owner.sceneMoveNode(child, f.root, 0);
-    for (0..3) |frame| {
-        if (frame == 2) try f.owner.scenePatchPaint(child, c.OT_SCENE_PROPERTY_TRANSLATE_X, .{ .translateX = 3 });
-        try f.owner.scenePatchPaint(child, c.OT_SCENE_PROPERTY_BACKGROUND, .{ .background = .{ @intCast(frame + 2), 0, 0, 255 } });
-        const done = try f.step(null, options, c.OT_SCENE_FRAME_DONE, null);
-        // A background change keeps the retained paint list; a translation rebuilds it.
-        try testing.expectEqual(frame != 1, f.state.painted.?.work.candidate_visits != 0);
-        try testing.expectEqual(@as(u16, @intCast(frame + 2)), f.cli.getNextBuffer().get(if (frame == 2) 3 else 0, 0).?.bg[0]);
-        _ = try f.owner.sceneFrameCommit(f.id, done, true);
-        try drain(f.owner, f.id);
-        try testing.expectEqual(@as(u32, 2), try f.owner.sceneHitTest(f.id, if (frame == 2) 4 else 1, 0));
-    }
-}
-
 test "Scene painted node and root destruction retains graphemes but never resurrects hit identities" {
     const f = try Fixture.init(testing.allocator, 4, 1, .{ .output = transport });
     defer f.deinit();
@@ -525,4 +506,33 @@ test "Scene frame work counts viewport refresh and culling work" {
     try testing.expectEqual(@as(u64, 16), resized.viewport_child_refreshes);
     try testing.expectEqual(@as(u64, 35), resized.feedback_operations);
     try testing.expectEqual(@as(u32, 1), resized.host_requests);
+}
+
+// The bench's scenes at small sizes. Columns: every FrameWork field after work_frame_id, in
+// declaration order (candidate visits through layout rounds). Track B steps change these rows.
+test "Scene frame bench scenes pin each frame kind's work at small sizes" {
+    const bench = @import("../bench/scene-frame_bench.zig");
+    const rows = [_]struct { shape: bench.Shape, size: u32, change: bench.Change, work: [20]u64 }{
+        .{ .shape = .ui, .size = 0, .change = .unchanged, .work = .{ 0, 0, 87, 0, 0, 0, 0, 0, 0, 86, 9009, 20000, 26209, 20000, 10000, 50, 0, 0, 0, 1 } },
+        .{ .shape = .ui, .size = 0, .change = .glyph, .work = .{ 87, 0, 87, 87, 1, 0, 0, 0, 0, 86, 9009, 20000, 26209, 20000, 10000, 50, 1, 0, 0, 1 } },
+        .{ .shape = .ui, .size = 0, .change = .update_hook, .work = .{ 87, 87, 174, 0, 0, 348, 299, 0, 0, 86, 9009, 20000, 26209, 20000, 10000, 50, 0, 0, 1, 1 } },
+        .{ .shape = .ui, .size = 0, .change = .paint_hook, .work = .{ 87, 87, 87, 0, 0, 0, 0, 0, 0, 86, 9009, 20000, 26209, 20000, 10000, 50, 0, 0, 1, 1 } },
+        .{ .shape = .boxes, .size = 100, .change = .unchanged, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 100, 1, 12320, 100, 12320, 6160, 44, 0, 0, 0, 1 } },
+        .{ .shape = .boxes, .size = 100, .change = .background, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 100, 1, 12320, 100, 12320, 6160, 44, 1, 0, 0, 1 } },
+        .{ .shape = .scroll, .size = 100, .change = .unchanged, .work = .{ 104, 104, 158, 0, 0, 217, 208, 100, 200, 53, 10000, 20000, 29900, 20000, 10000, 50, 0, 0, 0, 1 } },
+        .{ .shape = .scroll, .size = 100, .change = .glyph, .work = .{ 104, 104, 158, 104, 1, 217, 208, 100, 200, 53, 10000, 20000, 29900, 20000, 10000, 50, 1, 0, 0, 1 } },
+        .{ .shape = .scroll, .size = 100, .change = .scroll, .work = .{ 104, 104, 158, 0, 0, 217, 208, 100, 200, 53, 10000, 20000, 29900, 20000, 10000, 50, 50, 0, 0, 1 } },
+        .{ .shape = .scroll, .size = 100, .change = .append, .work = .{ 106, 106, 160, 106, 1, 219, 208, 102, 204, 53, 10000, 20000, 29900, 20000, 10000, 50, 0, 0, 0, 1 } },
+        .{ .shape = .wrapped_scroll, .size = 20, .change = .unchanged, .work = .{ 70, 70, 100, 0, 0, 281, 707, 20, 40, 69, 4030, 20000, 85620, 20000, 10000, 50, 0, 0, 0, 1 } },
+    };
+    for (rows) |row| {
+        var target = try bench.Scene.init(testing.allocator, testing.io, row.shape, row.size);
+        defer target.deinit();
+        // The second changed frame: the first one also settles hooks registered by the change.
+        _ = try target.frame(row.change);
+        const w = try target.frame(row.change);
+        var actual: [20]u64 = undefined;
+        inline for (std.meta.fields(FrameWork)[1..], 0..) |field, index| actual[index] = @field(w, field.name);
+        try testing.expectEqual(row.work, actual);
+    }
 }

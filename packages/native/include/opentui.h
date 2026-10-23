@@ -236,7 +236,8 @@ typedef struct ot_handle {
 
 /* Complete slider options. orientation is horizontal=0 or vertical=1. Colors
  * retain terminal color intent. All numbers and derived thumb arithmetic must be finite.
- * Values are not clamped: zero and inverted ranges retain the legacy full thumb.
+ * Values are not clamped: zero and inverted ranges retain the legacy full thumb. A track
+ * longer than the i32 cell range uses that range.
  * reserved must be zero. New sliders default to horizontal, min=0, max=100,
  * value=0, viewport_size=10, foreground=#9a9ea3, background=#252527 (both opaque). */
 typedef struct ot_scene_slider_options {
@@ -541,7 +542,8 @@ typedef struct ot_scene_frame_geometry {
 
 /* One node whose paint hooks a RECORD request asks the host to record, in paint
  * order. hooks holds the RENDER_BEFORE, RENDER_SELF, and RENDER_AFTER bits to
- * record. paint is the prepared geometry native code paints at; clip and opacity
+ * record. paint is the prepared geometry native code paints at, clamped like
+ * OT_LAYOUT_PAINT; clip and opacity
  * are the inherited paint state. flags has OT_SCENE_GEOMETRY_PAINT and, when the
  * public observation succeeded, OT_SCENE_GEOMETRY_PUBLIC. */
 typedef struct ot_scene_paint_slot {
@@ -671,7 +673,9 @@ ot_status ot_scene_has_measure(ot_context *, const ot_handle *node, uint32_t *ou
 ot_status ot_scene_mark_dirty(ot_context *, const ot_handle *node);
 /* Use OT_STYLE_* groups/kinds, OT_EDGE_* (or OT_GUTTER_* for GAP), and OT_UNIT_*.
  * Only OT_STYLE_DIMENSION accepts OT_STYLE_DISABLE_FLEX_SHRINK, which disables
- * flex shrink atomically with the dimension update. Other flags must be zero. */
+ * flex shrink atomically with the dimension update. Other flags must be zero.
+ * Finite MARGIN, PADDING, POSITION, and GAP values beyond ±1e30 are stored as ±1e30, so
+ * get_style reads the stored value; Yoga clamps resolved percentages the same way. */
 ot_status ot_scene_set_style(ot_context *, const ot_handle *node, uint32_t group,
     uint32_t kind, uint32_t edge, uint32_t unit, float value, uint32_t flags);
 ot_status ot_scene_get_style(ot_context *, const ot_handle *node, uint32_t group,
@@ -679,6 +683,7 @@ ot_status ot_scene_get_style(ot_context *, const ot_handle *node, uint32_t group
 /* Exact size/version and zero reserved. Borders use L=1 B=2 R=4 T=8;
  * styles are single=0 double=1 rounded=2 heavy=3. Colors retain terminal color intent.
  * focusable is 0 or 1. New nodes default to 0 and focused color {0,170,255,255}.
+ * Translations must be finite with a magnitude of at most FLT_MAX.
  * Border layout widths and paint properties publish together on acceptance. */
 ot_status ot_scene_set_paint(ot_context *, const ot_handle *node, const ot_scene_paint_options *);
 /* --- Staged scene properties ---
@@ -832,7 +837,9 @@ ot_status ot_scene_get_text_lines(ot_context *, const ot_handle *node, uint32_t 
  * and translations immediately, without running layout. OT_LAYOUT_YOGA instead
  * copies the six actual Yoga computed values, including zero dimensions, and
  * sets screen_x/y to zero. OT_LAYOUT_PAINT copies prepared paint geometry, including
- * screen_x/y. During a RECORD request, mutations do not change those coordinates.
+ * screen_x/y, with each axis that leaves the signed 32-bit cell range clamped to the
+ * whole cells it paints within 2^22 of the origin, at least one; PUBLIC and YOGA keep
+ * the unclamped values. During a RECORD request, mutations do not change those coordinates.
  * These reads do not run layout. Other selectors reject without changing output. */
 ot_status ot_scene_get_layout(ot_context *, const ot_handle *node, uint32_t observation, ot_scene_layout *out_layout);
 /* Paint a hook-free scene and retain its DONE draft in out_frame. Commit it with
@@ -1379,6 +1386,9 @@ typedef struct ot_editor_viewport {
  * Viewports and their coordinate sums must fit INT32_MAX. */
 ot_status ot_editor_view_set_viewport(ot_context *, const ot_handle *, const ot_editor_viewport *,
     uint32_t size_only, uint32_t move_cursor);
+/* Cursor changes (edits and moves) do not lay out text; they make a scroll to the cursor
+ * due. The viewport read and the other editor view calls apply a due scroll first, so the
+ * viewport read can lay out text and return OT_OUT_OF_MEMORY, but only while a scroll is due. */
 ot_status ot_editor_view_get_viewport(ot_context *, const ot_handle *, ot_editor_viewport *out_viewport);
 ot_status ot_editor_view_set_scroll_margin(ot_context *, const ot_handle *, float margin);
 #define OT_EDITOR_MOVE_UP UINT32_C(0)
@@ -1456,8 +1466,9 @@ typedef struct ot_editor_view_info {
     uint32_t selection_end;
     uint32_t selection_occupancy;
 } ot_editor_view_info;
-/* follow_cursor is 0/1. Zero preserves the viewport during observational queries;
- * one retains editor render-preparation behavior for visible line-count queries. */
+/* follow_cursor is 0/1. Zero preserves the viewport during observational queries, apart
+ * from a scroll that an earlier cursor change made due; one retains editor render-preparation
+ * behavior for visible line-count queries. */
 ot_status ot_editor_view_get_info(ot_context *, const ot_handle *, uint32_t follow_cursor, ot_editor_view_info *out_info);
 /* Reads selection without preparing lines or following the cursor. Reuses the
  * info record with both line counts zero; absent or zero-width selections report

@@ -17,7 +17,7 @@ Its build file exports only the Zig VT modules.
 The change to `src/build/SharedDeps.zig` removes unused GUI frame data.
 The Yoga archive contains only the `yoga` source directory.
 
-The Yoga source is upstream Yoga 3.2.1 with four changes, applied in this order:
+The Yoga source is upstream Yoga 3.2.1 with five changes, applied in this order:
 
 - `yoga-error-boundary.patch` routes every Yoga allocation through `yoga/OTAllocator.h`, so a test build can
   inject allocation failures. It also makes style updates, child insertion, and child moves leave the node
@@ -32,6 +32,8 @@ The Yoga source is upstream Yoga 3.2.1 with four changes, applied in this order:
   layout cache also compares available sizes exactly, because a subtree laid out for one fractional size
   rounds differently at another size that rounds to the same cell. Only the scene's config in
   `src/context.zig` sets the option; other configs keep upstream rounding and caching.
+- `yoga-finite-percent.patch` clamps a resolved percentage to ±1e30, so a deep percentage chain cannot
+  overflow f32 and stop layout on an indefinite available size.
 
 `src/tests/yoga_test.zig` tests each change.
 
