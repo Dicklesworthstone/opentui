@@ -3,6 +3,7 @@
 const std = @import("std");
 const TestPools = @import("test-pools.zig").TestPools;
 const text_work = @import("../text-work.zig");
+const iter_mod = @import("../text-buffer-iterators.zig");
 const TextBuffer = @import("../text-buffer.zig").UnifiedTextBuffer;
 const text_buffer_view = @import("../text-buffer-view.zig");
 const TextBufferView = text_buffer_view.UnifiedTextBufferView;
@@ -53,21 +54,21 @@ test "text work: one edit in a 10,000-line editor lays out the whole document" {
     const rows = [_]struct { mode: WrapMode, insert: Counts, burst: Counts, measure: Counts }{
         .{
             .mode = .none,
-            .insert = .{ .layouts = 1, .lines_laid_out = 10_000, .marker_rebuilds = 1, .marker_leaves = 30_000, .marker_lookups = 8 },
-            .burst = .{ .layouts = 10, .lines_laid_out = 100_000, .marker_rebuilds = 10, .marker_leaves = 300_000, .marker_lookups = 80 },
-            // Unwrapped measure reads every line width from the markers.
-            .measure = .{ .measure_passes = 1, .measure_lines = 10_000, .marker_lookups = 19_999 },
+            .insert = .{ .layouts = 1, .lines_laid_out = 10_000, .line_seeks = 6, .line_seek_nodes = 92 },
+            .burst = .{ .layouts = 10, .lines_laid_out = 100_000, .line_seeks = 60, .line_seek_nodes = 930 },
+            // Unwrapped measure reads the widest line from the rope metrics.
+            .measure = .{ .measure_passes = 1 },
         },
         .{
             .mode = .word,
-            .insert = .{ .layouts = 1, .lines_laid_out = 10_000, .marker_rebuilds = 1, .marker_leaves = 30_000, .marker_lookups = 8, .ascii_bytes = 790_001 },
-            .burst = .{ .layouts = 10, .lines_laid_out = 100_000, .marker_rebuilds = 10, .marker_leaves = 300_000, .marker_lookups = 80, .ascii_bytes = 7_900_065 },
+            .insert = .{ .layouts = 1, .lines_laid_out = 10_000, .line_seeks = 6, .line_seek_nodes = 92, .ascii_bytes = 790_001 },
+            .burst = .{ .layouts = 10, .lines_laid_out = 100_000, .line_seeks = 60, .line_seek_nodes = 930, .ascii_bytes = 7_900_065 },
             .measure = .{ .measure_passes = 1, .measure_lines = 10_000, .ascii_bytes = 790_011 },
         },
         .{
             .mode = .char,
-            .insert = .{ .layouts = 1, .lines_laid_out = 10_000, .marker_rebuilds = 1, .marker_leaves = 30_000, .marker_lookups = 8, .prefix_seeks = 10_001 },
-            .burst = .{ .layouts = 10, .lines_laid_out = 100_000, .marker_rebuilds = 10, .marker_leaves = 300_000, .marker_lookups = 80, .prefix_seeks = 100_010 },
+            .insert = .{ .layouts = 1, .lines_laid_out = 10_000, .line_seeks = 6, .line_seek_nodes = 92, .prefix_seeks = 10_001 },
+            .burst = .{ .layouts = 10, .lines_laid_out = 100_000, .line_seeks = 60, .line_seek_nodes = 930, .prefix_seeks = 100_010 },
             .measure = .{ .measure_passes = 1, .measure_lines = 10_000, .prefix_seeks = 10_001 },
         },
     };
@@ -92,9 +93,9 @@ test "text work: one edit in a 10,000-line editor lays out the whole document" {
         try expectWork(row.burst);
         // The cursor listener laid the document out already, so the frame only draws.
         screen.drawEditorView(ev, 0, 0);
-        try expectWork(.{ .marker_lookups = 10, .clusters_drawn = 3_171 });
+        try expectWork(.{ .line_seeks = 8, .line_seek_nodes = 124, .clusters_drawn = 3_171 });
         eb.moveRight();
-        try expectWork(.{ .marker_lookups = 13, .prefix_seeks = 1, .grapheme_width_reads = 1 });
+        try expectWork(.{ .line_seeks = 11, .line_seek_nodes = 171, .prefix_seeks = 1, .grapheme_width_reads = 1 });
         _ = try ev.getTextBufferView().measureForDimensions(100, 40);
         try expectWork(row.measure);
     }
@@ -123,6 +124,46 @@ test "text work: an append measures and lays out a 5,000-line view once each" {
     _ = view.getVirtualLineCount();
     // The second measure hits the cache; render lays the document out again.
     try expectWork(.{ .layouts = 1, .lines_laid_out = 5_000, .measure_passes = 1, .measure_lines = 5_000, .ascii_bytes = 355_083 });
+}
+
+test "text work: line lookups after an edit in a 10,000-line buffer" {
+    const allocator = std.testing.allocator;
+    var pools = TestPools.init(allocator);
+    defer pools.deinit();
+    const text = try repeatLines(allocator, "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor in", 10_000);
+    defer allocator.free(text);
+
+    const eb = try EditBuffer.init(allocator, &pools.graphemes, &pools.links, .unicode, null);
+    defer eb.deinit();
+    try eb.setText(text);
+    try eb.setCursor(5_000, 3);
+    _ = text_work.take();
+    try eb.insertText("x");
+    try eb.backspace();
+    try expectWork(.{ .line_seeks = 17, .line_seek_nodes = 274, .prefix_seeks = 3 });
+    try eb.deleteForward();
+    try expectWork(.{ .line_seeks = 17, .line_seek_nodes = 267, .prefix_seeks = 3, .grapheme_width_reads = 1 });
+
+    const tb = eb.getTextBuffer();
+    try tb.append("\nappended");
+    _ = tb.lineWidthAt(10_000);
+    try expectWork(.{ .line_seeks = 1, .line_seek_nodes = 17 });
+    // A highlight seeks its first line and walks the leaves of the lines it covers.
+    try tb.addHighlightByCharRange(0, tb.getLength(), 1, 1, 0);
+    try expectWork(.{ .line_seeks = 2, .line_seek_nodes = 29, .highlight_leaves = 30_003, .line_span_builds = 10_001, .line_span_highlights = 10_001 });
+    try tb.addHighlightByCharRange(5_000 * 80 + 3, 5_000 * 80 + 9, 1, 1, 0);
+    try expectWork(.{ .line_seeks = 2, .line_seek_nodes = 30, .highlight_leaves = 3, .line_span_builds = 1, .line_span_highlights = 2 });
+
+    // Zero-width appends have no weight; balancing counts their leaves, so the depth stays logarithmic.
+    const zero_width = try TextBuffer.init(allocator, &pools.graphemes, &pools.links, .unicode);
+    defer zero_width.deinit();
+    try zero_width.setText(text);
+    for (0..200) |_| try zero_width.append("\u{200b}");
+    try std.testing.expect(zero_width.rope().root.depth() <= 2 * std.math.log2_int_ceil(u32, zero_width.rope().count()));
+    _ = text_work.take();
+    _ = zero_width.lineWidthAt(9_999);
+    _ = iter_mod.offsetToCoords(zero_width.rope(), zero_width.textEndOffset());
+    try expectWork(.{ .line_seeks = 3, .line_seek_nodes = 53 });
 }
 
 test "text work: drawing rows of a wrapped CJK line rescans its clusters from the line start" {
@@ -303,4 +344,87 @@ test "text work: each UTF-8 scan entry counts its seeks, width reads, and bytes"
     try expectAfter(utf8.findWrapPosByWidthGraphemeSafe("\u{e9}\u{e9}\u{e9}", 2, 4, .hidden, false, .wcwidth), .{ .prefix_seeks = 1, .bytes_scanned = 4 });
     try expectAfter(utf8.findPosByWidth("\u{e9}\u{e9}\u{e9}", 1, 4, .hidden, false, true, .wcwidth), .{ .prefix_seeks = 1, .bytes_scanned = 2 });
     try expectAfter(utf8.findGraphemePosByWidth("\u{e9}\u{e9}\u{e9}", 1, 4, .hidden, false, true, .unicode), .{ .prefix_seeks = 1, .bytes_scanned = 2 });
+}
+
+test "text work: styled text on a buffer that borrows a style registers every chunk and scans the object table" {
+    const ctx = @import("../context.zig");
+    const bytes = "const x = 1;\nfoo";
+    // 8 chunks of 2 bytes that alternate 2 styles.
+    var chunks: [8]ctx.StyledTextChunk = undefined;
+    for (&chunks, 0..) |*chunk, index| chunk.* = if (index % 2 == 0)
+        .{ .byte_count = 2, .foreground = .{ 255, 0, 0, 255 } }
+    else
+        .{ .byte_count = 2, .attributes = 1 };
+    // Zero borrowers: the buffer owns the style that styled text creates. `copied` is per set: the
+    // second set copies the `chunkN` names of the first too. A borrowed style measures each chunk;
+    // `scanned` is the "\nf" chunk on the scalar path.
+    const rows = [_]struct { capacity: u32, borrowers: u32, slots: u64, copied: [2]u64, scanned: u64 }{
+        .{ .capacity = 64, .borrowers = 0, .slots = 0, .copied = .{ 0, 0 }, .scanned = 0 },
+        .{ .capacity = 64, .borrowers = 1, .slots = 128, .copied = .{ 4, 12 }, .scanned = 2 },
+        .{ .capacity = 64, .borrowers = 8, .slots = 128, .copied = .{ 4, 12 }, .scanned = 2 },
+        .{ .capacity = 4096, .borrowers = 1, .slots = 8192, .copied = .{ 4, 12 }, .scanned = 2 },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("capacity {d}, borrowers {d}\n", .{ row.capacity, row.borrowers });
+        const owner = try ctx.Context.init(std.testing.allocator, std.testing.io, .{ .object_capacity = row.capacity });
+        defer owner.deinit() catch unreachable;
+        const style = try owner.createSyntaxStyle();
+        for ([_][]const u8{ "keyword", "string", "comment" }) |name| _ = try owner.syntaxStyleRegister(style, name, .{ .fg = null, .bg = null, .attributes = 1 });
+        var buffers: [8]ctx.Handle = undefined;
+        for (buffers[0..@max(row.borrowers, 1)]) |*buffer| {
+            buffer.* = try owner.createTextBuffer(.unicode);
+            if (row.borrowers > 0) try owner.textBufferSetSyntaxStyle(buffer.*, style);
+        }
+        _ = text_work.take();
+        _ = try owner.syntaxStyleRegister(style, "type", .{ .fg = null, .bg = null, .attributes = 2 });
+        try expectWork(.{ .style_registrations = 1, .style_dependent_slots = row.slots });
+        // The last borrower reuses the `chunkN` names of the first.
+        for ([_]ctx.Handle{ buffers[0], buffers[@max(row.borrowers, 1) - 1] }, row.copied) |buffer, copied| {
+            try owner.textBufferSetStyledText(buffer, bytes, &chunks);
+            try expectWork(.{ .styled_text_sets = 1, .styled_text_bytes = 16, .style_registrations = 8, .style_entries_copied = copied, .style_dependent_slots = row.slots, .bytes_scanned = row.scanned });
+        }
+    }
+}
+
+test "text work: highlights added one range at a time rebuild the spans of their line each time" {
+    const allocator = std.testing.allocator;
+    var pools = TestPools.init(allocator);
+    defer pools.deinit();
+    const line = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+    const text = try repeatLines(allocator, line, 100);
+    defer allocator.free(text);
+    const tb = try TextBuffer.init(allocator, &pools.graphemes, &pools.links, .unicode);
+    defer tb.deinit();
+    const view = try TextBufferView.init(allocator, tb);
+    defer view.deinit();
+    try tb.setText(text);
+    // A 24-row viewport over the 100 lines, so spans built per drawn line can show their bound.
+    view.setViewport(.{ .x = 0, .y = 0, .width = 80, .height = 24 });
+    const screen = try OptimizedBuffer.init(allocator, 80, 24, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
+    defer screen.deinit();
+    screen.drawTextBuffer(view, 0, 0);
+    // 100 lines of 10 words: one range per word, alone or inside one transaction.
+    const rows = [_]struct { transaction: bool, add: Counts }{
+        .{ .transaction = false, .add = .{ .line_seeks = 2_000, .line_seek_nodes = 16_600, .highlight_leaves = 2_990, .line_span_builds = 1_000, .line_span_highlights = 5_500 } },
+        .{ .transaction = true, .add = .{ .line_seeks = 2_000, .line_seek_nodes = 16_600, .highlight_leaves = 2_990, .line_span_builds = 100, .line_span_highlights = 1_000 } },
+    };
+    for (rows) |row| {
+        errdefer std.debug.print("transaction {}\n", .{row.transaction});
+        tb.clearAllHighlights();
+        _ = text_work.take();
+        if (row.transaction) tb.startHighlightsTransaction();
+        for (0..100) |row_index| {
+            var words = std.mem.tokenizeScalar(u8, line, ' ');
+            while (words.next()) |word| {
+                // Highlight offsets exclude line breaks.
+                const start: u32 = @intCast(row_index * line.len + words.index - word.len);
+                try tb.addHighlightByCharRange(start, start + @as(u32, @intCast(word.len)), 1, 1, 0);
+            }
+        }
+        if (row.transaction) tb.endHighlightsTransaction();
+        try expectWork(row.add);
+        // Drawing reads the spans built above; it builds none.
+        screen.drawTextBuffer(view, 0, 0);
+        try expectWork(.{ .clusters_drawn = 1_344 });
+    }
 }

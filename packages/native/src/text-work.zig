@@ -11,9 +11,13 @@ pub const Counts = struct {
     /// `measureForDimensions` calls that miss the measure cache.
     measure_passes: u64 = 0,
     measure_lines: u64 = 0,
-    marker_rebuilds: u64 = 0,
-    marker_leaves: u64 = 0,
-    marker_lookups: u64 = 0,
+    /// Line lookups by rope descent, and the branches they visit.
+    line_seeks: u64 = 0,
+    line_seek_nodes: u64 = 0,
+    /// Leaves a highlight walks after it finds its first line.
+    highlight_leaves: u64 = 0,
+    /// Rope nodes whose metrics a tab-width change recomputes.
+    remeasure_nodes: u64 = 0,
     /// Linear steps over render-cluster records before each drawn virtual chunk.
     cluster_scan_steps: u64 = 0,
     left_skip_steps: u64 = 0,
@@ -25,6 +29,18 @@ pub const Counts = struct {
     bytes_scanned: u64 = 0,
     /// Bytes that the ASCII layout scanner walks.
     ascii_bytes: u64 = 0,
+    /// Styled-text replacements of one buffer and the bytes each copies.
+    styled_text_sets: u64 = 0,
+    styled_text_bytes: u64 = 0,
+    /// `registerStyleDefinition` calls, new names and overwrites alike.
+    style_registrations: u64 = 0,
+    /// Entries that `prepareDefinitions` copies into a provisional style table.
+    style_entries_copied: u64 = 0,
+    /// Object-table slots that the scans for buffers borrowing a shared style visit.
+    style_dependent_slots: u64 = 0,
+    /// `buildLineSpans` calls and the highlights they sort.
+    line_span_builds: u64 = 0,
+    line_span_highlights: u64 = 0,
 };
 
 const enabled = builtin.is_test;
