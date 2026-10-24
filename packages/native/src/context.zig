@@ -244,17 +244,15 @@ pub const Editor = struct {
         while (next) |node| : (next = node.measure_next) yoga.yogaNodeInvalidateMeasure(node.yoga_node);
         if (self.node) |node| {
             yoga.yogaNodeInvalidateMeasure(node.yoga_node);
-            node.scene_node.?.owner.preparation_dirty = true;
-            node.scene_node.?.owner.work.clearRetainingCapacity();
+            node.scene_node.?.owner.invalidateObservation(node);
         }
     }
 
     pub fn invalidatePreparation(self: *Editor) void {
         if (self.node) |node| {
             // Idle frames reuse geometry but still prepare the view and follow its cursor.
-            if (node.scene_node.?.owner.attempt == null) return;
-            node.scene_node.?.owner.preparation_dirty = true;
-            node.scene_node.?.owner.work.clearRetainingCapacity();
+            if (node.scene_node.?.owner.attempt == null) return scene.Scene.markObservationStale(node);
+            node.scene_node.?.owner.invalidateObservation(node);
         }
     }
 
@@ -278,9 +276,10 @@ pub const SharedText = struct {
         while (next) |view| : (next = view.next) try view.checkMutable();
     }
 
-    pub fn invalidate(self: *SharedText) void {
+    /// The Yoga measure depends on the bytes and layout options, never on styles or highlights.
+    pub fn invalidate(self: *SharedText, measure: bool) void {
         var next = self.views;
-        while (next) |view| : (next = view.next) view.invalidate();
+        while (next) |view| : (next = view.next) if (measure) view.invalidate() else view.invalidatePreparation();
     }
 
     fn reclaimAppendBuffers(self: *SharedText) void {
@@ -316,10 +315,7 @@ pub const TextView = struct {
     }
 
     pub fn invalidatePreparation(self: *TextView) void {
-        if (self.node) |node| {
-            node.scene_node.?.owner.preparation_dirty = true;
-            node.scene_node.?.owner.work.clearRetainingCapacity();
-        }
+        if (self.node) |node| node.scene_node.?.owner.invalidateObservation(node);
     }
 
     pub fn prepareView(self: *TextView) !void {
@@ -2102,8 +2098,7 @@ pub const Context = struct {
         if (node.editor) |previous| previous.node = null;
         node.editor = editor;
         if (editor) |view| view.node = value;
-        node.owner.preparation_dirty = true;
-        node.owner.work.clearRetainingCapacity();
+        node.owner.invalidateObservation(value);
     }
 
     pub fn sceneSetEditorOptions(self: *Context, handle: Handle, options: scene.EditorOptions) !void {
@@ -2132,8 +2127,7 @@ pub const Context = struct {
         if (node.control.text_view.view) |previous| previous.node = null;
         node.control.text_view.view = text_view;
         if (text_view) |view| view.node = value;
-        node.owner.preparation_dirty = true;
-        node.owner.work.clearRetainingCapacity();
+        node.owner.invalidateObservation(value);
     }
 
     pub fn sceneSetTextViewPaint(self: *Context, handle: Handle, enabled: bool) !void {
@@ -2217,6 +2211,7 @@ pub const Context = struct {
             api.OT_STYLE_DIMENSION => yoga.yogaNodeStyleSetDimensionChecked(node.yoga_node, kind, unit, value, flags),
             else => unreachable,
         });
+        if (group == api.OT_STYLE_ENUM and kind == api.OT_STYLE_ENUM_DISPLAY) node.scene_node.?.owner.visibility_epoch +%= 1;
     }
 
     pub fn sceneGetStyle(self: *Context, handle: Handle, group: u32, kind: u32, edge: u32) !scene.StyleValue {
@@ -2376,8 +2371,7 @@ pub const Context = struct {
         var dirty: u32 = 0;
         try yoga.check(yoga.yogaNodeIsDirtyChecked(node.yoga_node, &dirty));
         try validateTextBytes(text.buffer.tabWidth(), bytes, 0);
-        try self.replaceTextContent(text, bytes);
-        textResourceChanged(text);
+        if (try self.replaceTextContent(text, bytes)) textResourceChanged(text);
         if (text.owned_style) |style| {
             text.buffer.setSyntaxStyle(null);
             text.owned_style = null;
@@ -2401,16 +2395,16 @@ pub const Context = struct {
         const text = node.scene_node.?.text orelse return error.WrongKind;
         var dirty: u32 = 0;
         try yoga.check(yoga.yogaNodeIsDirtyChecked(node.yoga_node, &dirty));
-        try self.replaceStyledTextResource(text, bytes, chunks);
-        textResourceChanged(text);
+        if (try self.replaceStyledTextResource(text, bytes, chunks)) textResourceChanged(text);
         node.scene_node.?.owner.work.clearRetainingCapacity();
     }
 
-    fn replaceStyledTextResource(self: *Context, text: anytype, bytes: []const u8, chunks: []const StyledTextChunk) !void {
+    /// Returns whether the bytes changed.
+    fn replaceStyledTextResource(self: *Context, text: anytype, bytes: []const u8, chunks: []const StyledTextChunk) !bool {
         var prepared: PreparedStyledTextResource = undefined;
         try self.prepareStyledTextResource(&prepared, text, bytes, chunks);
         defer prepared.deinit(self.allocator);
-        self.commitStyledTextResource(&prepared, text);
+        return self.commitStyledTextResource(&prepared, text);
     }
 
     const PreparedStyledTextResource = struct {
@@ -2494,7 +2488,8 @@ pub const Context = struct {
         prepared.buffer_ready = true;
     }
 
-    fn commitStyledTextResource(self: *Context, prepared: *PreparedStyledTextResource, text: anytype) void {
+    fn commitStyledTextResource(self: *Context, prepared: *PreparedStyledTextResource, text: anytype) bool {
+        const changed = !holdsBytes(text, prepared.bytes.?);
         text.input_mem_id = prepared.buffer.commit();
         prepared.bytes = null;
         if (prepared.buffer.retained_style) |retained| self.invalidateStyleDependents(retained);
@@ -2504,6 +2499,7 @@ pub const Context = struct {
             prepared.style = null;
             if (previous) |old| old.deinit();
         }
+        return changed;
     }
 
     pub fn sceneSetTextOptions(self: *Context, handle: Handle, options: scene.TextOptions) !void {
@@ -2580,7 +2576,7 @@ pub const Context = struct {
             text.view.setWrapWidth(if (viewport.width > 0) viewport.width else null);
         }
         if (measure_changed) yoga.yogaNodeMarkDirty(node.yoga_node);
-        if (prepare_changed) node.scene_node.?.owner.preparation_dirty = true;
+        if (prepare_changed) node.scene_node.?.owner.invalidateObservation(node);
         node.scene_node.?.owner.work.clearRetainingCapacity();
     }
 
@@ -3092,14 +3088,14 @@ pub const Context = struct {
         const text = try self.getTextBuffer(handle);
         try text.checkMutable();
         try validateTextBytes(text.buffer.tabWidth(), bytes, 0);
-        try self.replaceTextContent(text, bytes);
+        const changed = try self.replaceTextContent(text, bytes);
         text.reclaimAppendBuffers();
         if (text.owned_style) |style| {
             text.buffer.setSyntaxStyle(null);
             text.owned_style = null;
             style.deinit();
         }
-        text.invalidate();
+        text.invalidate(changed);
     }
 
     pub fn textBufferSetStyledText(self: *Context, handle: Handle, bytes: []const u8, chunks: []const StyledTextChunk) !void {
@@ -3107,9 +3103,9 @@ pub const Context = struct {
         defer self.mutating = false;
         const text = try self.getTextBuffer(handle);
         try text.checkMutable();
-        try self.replaceStyledTextResource(text, bytes, chunks);
+        const changed = try self.replaceStyledTextResource(text, bytes, chunks);
         text.reclaimAppendBuffers();
-        text.invalidate();
+        text.invalidate(changed);
     }
 
     pub const text_replacement_count_max = 256;
@@ -3160,10 +3156,10 @@ pub const Context = struct {
         }
         for (prepared, 0..) |*candidate, index| {
             const text = views[index].text;
-            self.commitStyledTextResource(candidate, text);
+            const changed = self.commitStyledTextResource(candidate, text);
             text.reclaimAppendBuffers();
             views[index].view.resetLocalSelection();
-            text.invalidate();
+            text.invalidate(changed);
             output[index] = .{ .text_length = text.buffer.getLength(), .byte_count = text.buffer.getByteSize() };
         }
     }
@@ -3181,7 +3177,7 @@ pub const Context = struct {
         const copy = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(copy);
         try text.buffer.appendWithOwnership(copy, true);
-        text.invalidate();
+        text.invalidate(true);
     }
 
     pub fn textBufferClear(self: *Context, handle: Handle, reset: bool) !void {
@@ -3197,7 +3193,7 @@ pub const Context = struct {
         } else {
             try text.buffer.clear();
         }
-        text.invalidate();
+        text.invalidate(true);
     }
 
     pub fn textBufferSetSyntaxStyle(self: *Context, handle: Handle, style_handle: ?Handle) !void {
@@ -3212,7 +3208,7 @@ pub const Context = struct {
             text.owned_style = null;
             previous.deinit();
         }
-        text.invalidate();
+        text.invalidate(false);
     }
 
     pub fn textBufferSetDefaults(self: *Context, handle: Handle, options: TextDefaults) !void {
@@ -3221,7 +3217,7 @@ pub const Context = struct {
         const text = try self.getTextBuffer(handle);
         try text.checkMutable();
         try setBufferDefaults(text.buffer, options);
-        text.invalidate();
+        text.invalidate(false);
     }
 
     pub fn editBufferSetTabWidth(self: *Context, handle: Handle, width: u8) !void {
@@ -3241,7 +3237,7 @@ pub const Context = struct {
         try text.checkMutable();
         try text.buffer.checkTabWidth(width);
         text.buffer.setTabWidth(width);
-        text.invalidate();
+        text.invalidate(true);
     }
 
     pub fn textBufferHighlight(self: *Context, handle: Handle, operation: TextHighlight) !void {
@@ -3250,7 +3246,7 @@ pub const Context = struct {
         const text = try self.getTextBuffer(handle);
         try text.checkMutable();
         try highlightBuffer(text.buffer, operation);
-        text.invalidate();
+        text.invalidate(false);
     }
 
     pub fn textViewSetViewport(self: *Context, handle: Handle, viewport: text_buffer_view.Viewport, size_only: bool) !void {
@@ -3419,7 +3415,7 @@ pub const Context = struct {
                 if (dependent.buffer.tb.getSyntaxStyle() == style) dependent.invalidate();
             } else if (slot.kind == .text_buffer and slot.ptr != null) {
                 const dependent: *SharedText = @ptrCast(@alignCast(slot.ptr.?));
-                if (dependent.buffer.getSyntaxStyle() == style) dependent.invalidate();
+                if (dependent.buffer.getSyntaxStyle() == style) dependent.invalidate(false);
             }
         }
     }
@@ -3740,17 +3736,32 @@ pub const Context = struct {
         self.edit_event_userdata = userdata;
     }
 
-    fn replaceTextContent(self: *Context, text: anytype, bytes: []const u8) !void {
+    /// Returns whether the bytes changed.
+    fn replaceTextContent(self: *Context, text: anytype, bytes: []const u8) !bool {
+        const changed = !holdsBytes(text, bytes);
         const copy = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(copy);
         // Owned scene/shared text excludes registrations borrowed from the rope arena.
         text.input_mem_id = try text.buffer.replaceOwnedText(copy, text.input_mem_id);
+        return changed;
+    }
+
+    /// Replacements put the whole text in the `input_mem_id` slot. The rope holds exactly those
+    /// bytes when it has no other slot and the byte counts agree. An append adds a slot. A clear
+    /// leaves a stale slot and a flatten drops the slot's line breaks; both make the counts
+    /// differ whenever the slot is not the text.
+    fn holdsBytes(text: anytype, bytes: []const u8) bool {
+        const registry = &text.buffer.mem_registry;
+        const current = registry.get(@as(?u8, text.input_mem_id) orelse return false).?;
+        return registry.buffers.items.len == 1 and text.buffer.getByteSize() == bytes.len and std.mem.eql(u8, current, bytes);
     }
 
     fn textResourceChanged(text: *Text) void {
         var next = text.view.measure_dependents;
         while (next) |dependent| {
+            // A dependent without a Yoga measure function does not solve, so mark its refresh stale.
             yoga.yogaNodeMarkDirty(dependent.yoga_node);
+            scene.Scene.markObservationStale(dependent);
             next = dependent.measure_next;
         }
     }
@@ -3860,8 +3871,7 @@ pub const Context = struct {
                 if (value.node) |node| {
                     node.setMeasureTargetPreservingProvider(.none, node.scene_node.?.measure_overridden) catch unreachable;
                     node.scene_node.?.control.text_view.view = null;
-                    node.scene_node.?.owner.preparation_dirty = true;
-                    node.scene_node.?.owner.work.clearRetainingCapacity();
+                    node.scene_node.?.owner.invalidateObservation(node);
                 }
                 if (value.previous) |previous| previous.next = value.next else value.text.views = value.next;
                 if (value.next) |next| next.previous = value.previous;
@@ -3879,8 +3889,7 @@ pub const Context = struct {
                 if (value.node) |node| {
                     node.setMeasureTargetPreservingProvider(.none, node.scene_node.?.measure_overridden) catch unreachable;
                     node.scene_node.?.editor = null;
-                    node.scene_node.?.owner.preparation_dirty = true;
-                    node.scene_node.?.owner.work.clearRetainingCapacity();
+                    node.scene_node.?.owner.invalidateObservation(node);
                 }
                 if (value.previous) |previous| previous.next = value.next else value.edit.views = value.next;
                 if (value.next) |next| next.previous = value.previous;
