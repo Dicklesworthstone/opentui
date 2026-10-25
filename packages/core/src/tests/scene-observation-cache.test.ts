@@ -596,21 +596,29 @@ describe("scene staging", () => {
   const stageWidth = (staging: SceneStaging, node = nodeAt(1, 1), value = 1, target = context) =>
     staging.stageStyle(target, node, c.OT_STYLE_DIMENSION, c.OT_DIMENSION_WIDTH, 0, c.OT_UNIT_POINT, value, 0)
   test.each<[string, (staging: SceneStaging) => unknown, string]>([
-    [
-      "an unknown style group",
-      (staging) => staging.stageStyle(context, nodeAt(1, 1), 9, 0, 0, 0, 0, 0),
-      "InvalidArgument",
-    ],
     ["an infinite style value", (staging) => stageWidth(staging, nodeAt(1, 1), Infinity), "Scene style value"],
     [
       "a fractional enum value",
       (staging) => staging.stageStyle(context, nodeAt(1, 1), 0, 9, 0, 0, 0.5, 0),
       "enum value",
     ],
+    // Packed records hold each field in one byte; a wider value would alias another property.
+    ...(
+      [
+        [256 + c.OT_STYLE_DIMENSION, c.OT_DIMENSION_WIDTH, 0, c.OT_UNIT_POINT],
+        [2 ** 31, c.OT_DIMENSION_WIDTH, 0, c.OT_UNIT_POINT],
+        [c.OT_STYLE_VALUE, 256 + c.OT_STYLE_VALUE_MARGIN, 0, c.OT_UNIT_POINT],
+        [c.OT_STYLE_VALUE, c.OT_STYLE_VALUE_MARGIN, 256, c.OT_UNIT_POINT],
+        [c.OT_STYLE_DIMENSION, c.OT_DIMENSION_WIDTH, 0, 256 + c.OT_UNIT_POINT],
+      ] as const
+    ).map(([group, kind, edge, unit]): [string, (staging: SceneStaging) => unknown, string] => [
+      `style fields ${[group, kind, edge, unit]}`,
+      (staging) => staging.stageStyle(context, nodeAt(1, 1), group, kind, edge, unit, 1, 0),
+      "InvalidArgument",
+    ]),
     ["another Context object", (staging) => stageWidth(staging, nodeAt(1, 1), 1, otherContext), "WrongContext"],
     ["another Context id", (staging) => stageWidth(staging, { ...nodeAt(1, 1), contextId: 8n }), "WrongContext"],
     ["a destroyed node's paint", (staging) => staging.stagePaint(context, nodeAt(1, 2), { zIndex: 2 }), "StaleHandle"],
-    ["an invalid paint", (staging) => staging.stagePaint(context, nodeAt(1, 1), { opacity: 2 }), "opacity"],
     ["a destroyed paint owner", (staging) => staging.stagePaint(context, nodeAt(2, 1), {}, rejectingOwner), "owner"],
     [
       "a destroyed background owner",
@@ -706,22 +714,26 @@ describe("scene staging", () => {
     ])
   })
 
-  test("a flush reports a record native rejects once and then applies later records", async () => {
+  class Custom extends Renderable {
+    paint(paint: { border: number }): void {
+      this.setNativeScenePaint(paint)
+    }
+  }
+  // Native validates staged records; one it rejects is reported once by the flush, which then applies later records.
+  test.each<[string, (node: Custom) => void]>([
+    // Only Box paints border sides; the encoder cannot see the node kind.
+    ["a border on a non-box", (node) => node.paint({ border: 15 })],
+    ["an unknown style group", (node) => renderer!.nativeScene.setStyle(node, 9, 0, 0, 0, 0)],
+  ])("a flush rejects %s once and then applies later records", async (_, stage) => {
     const setup = await createTestRenderer({ width: 20, height: 5 })
     renderer = setup.renderer
-    // Only Box paints border sides; the encoder cannot see the node kind, so native rejects this record.
-    class BorderedText extends Renderable {
-      stageBorder(): void {
-        this.setNativeScenePaint({ border: 15 })
-      }
-    }
-    const custom = new BorderedText(renderer, { width: 3, height: 1 })
+    const custom = new Custom(renderer, { width: 3, height: 1 })
     const box = new BoxRenderable(renderer, { width: 3, height: 1 })
     renderer.root.add(custom)
     renderer.root.add(box)
     await setup.renderOnce()
 
-    custom.stageBorder()
+    stage(custom)
     box.width = 9
     expect(() => renderer!.nativeScene.flushStaged()).toThrow("InvalidArgument after 0 of 2 staged entries")
     expect(renderer.nativeScene.hasStagedMutations).toBe(true)
