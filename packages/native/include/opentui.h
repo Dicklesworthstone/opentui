@@ -1958,8 +1958,9 @@ ot_status ot_buffer_draw_text_view(ot_context *, const ot_handle *target, const 
     const ot_handle *view, int32_t x, int32_t y);
 /* Same destination rules as ot_buffer_draw_text_view. Paints synchronously with
  * the destination's current clipping and opacity, without publishing cursor state.
- * The scene-body source is a Text or Box scene node, drawn as its built-in painting
- * would draw it at x, y with the node's paint size and the current focus. */
+ * The scene-body source is a Text, Box, Slider or Arrow scene node, drawn as its
+ * built-in painting would draw it at x, y with the node's paint size and the
+ * current focus. */
 ot_status ot_buffer_draw_editor_view(ot_context *, const ot_handle *target, const ot_scene_frame_request *,
     const ot_handle *view, int32_t x, int32_t y);
 ot_status ot_buffer_draw_scene_body(ot_context *, const ot_handle *target, const ot_scene_frame_request *,
@@ -2436,6 +2437,7 @@ typedef struct ot_session_pump_result {
 #define OT_INPUT_EXPECT_REPLIES UINT32_C(1)
 #define OT_INPUT_EXPECT_KITTY_KEYBOARD UINT32_C(2)
 #define OT_INPUT_EXPECT_CURSOR_POSITION UINT32_C(4)
+#define OT_INPUT_EXPECT_SENTINEL UINT32_C(8)
 
 #define OT_INPUT_EVENTS_MIN UINT32_C(4)
 #define OT_INPUT_PAYLOAD_BYTES_MIN UINT32_C(4384)
@@ -3110,6 +3112,14 @@ ot_status ot_session_input_feed(
  * modified F3 key. KITTY_KEYBOARD keeps a partial Kitty key waiting and makes
  * CSI R and CSI 1 ; N R replies, since the Kitty protocol sends F3 as CSI 13 ~;
  * a session with a renderer applies its terminal's negotiated state instead.
+ * SENTINEL, which implies REPLIES, means that a DA1 reply (CSI ? ... c) ends the
+ * outstanding queries; clear it when that reply arrives. While it is set, a
+ * partial reply waits without a deadline: an OSC, DCS, or APC string that begins
+ * like one (OSC and a digit, DCS and > or a digit, APC and G), a bare CSI, OSC,
+ * DCS, or APC introducer, and a CSI of digits. A held string continues only
+ * while it matches a reply prefix, and a CSI that timed out completes only as a
+ * reply; another byte ends either one and is typed. A lone Escape still times
+ * out, and a reply that follows it is not typed. KEEP_REPLY also keeps such a CSI.
  * Changing flags emits nothing; the next feed resolves a unit that may no longer wait. */
 ot_status ot_session_input_expect(ot_context *context, const ot_handle *session, uint32_t flags);
 

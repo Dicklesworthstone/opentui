@@ -194,12 +194,17 @@ const Stats = struct {
     filtered: u32 = 0,
     /// Filtered frames that also sent a host request.
     filtered_requests: u32 = 0,
+    /// Filtered frames with a request that kept the last frame's lists (B5a).
+    reused_filtered_requests: u32 = 0,
     /// Frames with a hooked node under a hidden ancestor.
     hidden_hooked: u32 = 0,
     /// Host replies that hid an ancestor of the requesting node mid-frame.
     reply_hides: u32 = 0,
     /// Host replies that detached the requesting node mid-frame.
     reply_detaches: u32 = 0,
+    /// Host replies that destroyed a node mid-frame, and RECORD replies that changed the scene.
+    reply_destroys: u32 = 0,
+    record_replies: u32 = 0,
     /// RESIZE requests from children of the viewport content.
     content_resizes: u32 = 0,
     /// Replies to those requests that changed text on a content child, mid-batch.
@@ -761,6 +766,11 @@ const Harness = struct {
                     recordings = .{ .{}, .{} };
                     try self.expectSameSlots(first, second, &recordings);
                     records = .{ recordings[reference].view(), recordings[candidate].view() };
+                    // Paint hooks may change the scene while they record.
+                    if (self.random.uintLessThan(u32, 4) == 0) {
+                        try self.reply();
+                        self.stats.record_replies += 1;
+                    }
                 },
                 else => {
                     switch (first.kind) {
@@ -788,10 +798,7 @@ const Harness = struct {
                             break;
                         }
                     }
-                    for (0..self.random.uintLessThan(u32, 3)) |_| {
-                        const slot = self.liveSlot(scaffold_slots) orelse break;
-                        try self.apply(self.generateReply(slot));
-                    }
+                    try self.reply();
                     // Hiding the requester's parent mid-frame makes the visibility walk meet a hidden
                     // ancestor of a node it already stamped (B2 invariant 7).
                     // Detaching it instead makes the walk meet a node whose ancestry moved.
@@ -807,6 +814,20 @@ const Harness = struct {
                 },
             }
         }
+    }
+
+    /// Zero to two changes, and sometimes a destroyed node, from a host reply.
+    fn reply(self: *Harness) !void {
+        for (0..self.random.uintLessThan(u32, 3)) |_| {
+            const slot = self.liveSlot(scaffold_slots) orelse break;
+            try self.apply(self.generateReply(slot));
+        }
+        if (self.random.uintLessThan(u32, 8) != 0) return;
+        const slot = self.liveSlot(scaffold_slots) orelse return;
+        // Content rows stay, so viewport scenes keep enough children to cull.
+        if (self.model.parent[slot] == content_slot) return;
+        try self.apply(.{ .destroy = slot });
+        self.stats.reply_destroys += 1;
     }
 
     fn expectSameRequest(self: *const Harness, first: scene.FrameRequest, second: scene.FrameRequest) !void {
@@ -832,6 +853,10 @@ const Harness = struct {
         for (slots[0], slots[1], 0..) |a, b, index| {
             try testing.expectEqual(a.num, b.num);
             try testing.expectEqual(a.hooks, b.hooks);
+            try testing.expectEqual(a.hook_generation, b.hook_generation);
+            try testing.expectEqual(a.public_layout == null, b.public_layout == null);
+            // Bitwise, as below: NaN layouts compare equal.
+            if (a.public_layout) |layout| try testing.expectEqualSlices(u8, std.mem.asBytes(&layout), std.mem.asBytes(&b.public_layout.?));
             try testing.expectEqual(a.layout, b.layout);
             try testing.expectEqual(a.clip, b.clip);
             try testing.expectEqual(a.opacity, b.opacity);
@@ -858,6 +883,7 @@ const Harness = struct {
         if (spec.cancel_first and try self.drive(spec)) {
             for (self.twins) |twin| try twin.owner.sceneFrameCancel(twin.id, twin.state.painted.?.ticket.frame_id);
         }
+        const stamps = self.twins[candidate].state.test_stamp_steps;
         if (!try self.drive(spec)) return;
         // A write after paint must reach the terminal, on a skipped or partly diffed draft too.
         if (self.random.uintLessThan(u32, 8) == 0) {
@@ -909,10 +935,13 @@ const Harness = struct {
         const work = (try self.twins[candidate].owner.sceneGetStats(self.twins[candidate].id)).frameWork;
         self.stats.frames += 1;
         self.stats.reused += @intFromBool(work.candidate_visits == 0);
+        // A frame that keeps its candidates keeps their stamps too (B5a).
+        if (work.candidate_visits == 0) try testing.expectEqual(stamps, self.twins[candidate].state.test_stamp_steps);
         self.stats.skipped += @intFromBool(work.damage_rows == 0);
         self.stats.partial += @intFromBool(work.damage_rows != 0 and work.damage_rows < self.twins[candidate].cli.height);
         self.stats.filtered += @intFromBool(work.overlap_tests != 0);
         self.stats.filtered_requests += @intFromBool(work.overlap_tests != 0 and work.host_requests != 0);
+        self.stats.reused_filtered_requests += @intFromBool(work.candidate_visits == 0 and work.overlap_tests != 0 and work.host_requests != 0);
         self.stats.hidden_hooked += @intFromBool(hidden_hooked);
         for (self.model.handles, 0..) |maybe, slot| {
             if (maybe == null or self.model.kind[slot] != .scroll or self.model.children[slot].items.len == 0) continue;
@@ -954,15 +983,21 @@ const Harness = struct {
         return false;
     }
 
-    /// A candidate frame that retained its work list paints in the model's order. The model
-    /// sorts on every frame, as the scene does, so tie orders stay in step.
+    /// A paint list that the next frame may keep is in the model's order. The model sorts on
+    /// every frame, as the scene does, so tie orders stay in step; it does not cull.
     fn expectPaintOrder(self: *Harness) !void {
         const f = self.twins[candidate];
         var order: [node_count_max]usize = undefined;
         const count = self.model.paintOrder(&order, 0, root_slot);
-        if (f.state.work.items.len == 0) return;
+        if (f.state.candidates.items.len == 0 or f.state.members.items.len == 0 or f.state.filter_count != 0) return;
+        // A reply after paint changed layout or a view: the next frame prepares again.
+        var dirty: u32 = 0;
+        try yoga.check(yoga.yogaNodeIsDirtyChecked((try f.owner.raw().getRenderable(self.handle(candidate, root_slot))).yoga_node, &dirty));
+        if (dirty != 0 or f.state.preparation_dirty) return;
+        // A z-index change after its parent sorted in this frame sorts in the next one.
+        for (f.state.members.items) |entry| if (entry.node.scene_node.?.sort_dirty) return;
         var painted: usize = 0;
-        for (f.state.work.items) |entry| {
+        for (f.state.members.items) |entry| {
             if (entry.node.scene_node.?.kind == c.OT_SCENE_ROOT or !entry.visible or entry.bars) continue;
             try testing.expect(painted < count);
             try testing.expectEqual(self.handle(candidate, order[painted]), entry.node.scene_node.?.handle);
@@ -1058,7 +1093,9 @@ const Harness = struct {
         const work = (try f.owner.sceneGetStats(f.id)).frameWork;
         const cells = @as(u64, f.cli.width) * f.cli.height;
         try testing.expect(work.full_path_reasons & renderer.FrameWork.full_path_forced != 0);
-        try testing.expect(work.candidate_visits != 0);
+        // Every visible node, the root included, at least once (B5a).
+        var order: [node_count_max]usize = undefined;
+        try testing.expect(work.candidate_visits > self.model.paintOrder(&order, 0, root_slot));
         // Retained paint (B3): the reference clears and repaints every frame and diffs every row.
         try testing.expect(work.cells_cleared >= cells);
         try testing.expectEqual(f.cli.height, work.damage_rows);
@@ -1136,48 +1173,54 @@ test "Scene twin Sessions match a forced full-frame reference on every frame" {
         const stats = try runParity(seed, 256);
         inline for (std.meta.fields(Stats)) |field| @field(total, field.name) +%= @field(stats, field.name);
     }
-    // Every frame kind B2, B3, and D2b rely on is reached in quantity (about a quarter of
-    // today's counts; decoded frames at about two thirds), and each minimum fails if the draw
-    // that produces its kind is removed. Counts at 64 x 256: reused 853, filtered 1,646,
-    // filtered with a request 441, hooked under a hidden ancestor 4,672, reply hid the
-    // requester's parent 28, reply detached the requester 37, content-child RESIZE 45, a
-    // truncation change in its reply 44, unmeasured content text replaced 12, UPDATE 2,766,
-    // RESIZE 52, LAYOUT_CHANGED 1,990, recordings 982, box bodies 222, decoded 12,267, an
-    // editor's cursor 2,086, a host cursor 7,481, skipped paint 7,933, partly diffed 1,258,
-    // draft writes after paint 2,888, raw writes between frames 416, shared text changes shown
-    // 439, style changes shown 214, view binds 327, selections 253, equal re-sends 416, palette
-    // changes 66, frames showing a scroll node with children 1,355, scrolls and option changes
-    // 159, SCROLL requests 27.
+    // Every frame kind B2, B3, D2b, and B5 rely on is reached in quantity, and each minimum
+    // fails if the draw that produces its kind is removed. Minimums are about a quarter of the
+    // counts at 64 x 256 (decoded frames about two thirds), derived again after replies began to
+    // destroy nodes: those must spare content rows, or viewport scenes fall below the culling
+    // cutoff (filtered frames with a request fell from 441 to 51). Counts: reused 8,988,
+    // filtered 1,074, filtered with a request 422, kept lists in such a frame 77, hooked under
+    // a hidden ancestor 4,686, reply hid the requester's parent 30, reply detached the
+    // requester 37, reply destroyed a node 326, a RECORD reply changed the scene 254,
+    // content-child RESIZE 46, a truncation change in its reply 42, unmeasured content text
+    // replaced 14, UPDATE 2,756, RESIZE 55, LAYOUT_CHANGED 1,733, recordings 962, box bodies 162,
+    // decoded 12,522, an editor's cursor 2,358, a host cursor 7,604, skipped paint 8,116, partly
+    // diffed 1,228, draft writes after paint 2,916, raw writes between frames 384, shared text
+    // changes shown 391, style changes shown 198, view binds 359, selections 243, equal re-sends
+    // 421, palette changes 79, frames showing a scroll node with children 1,200, scrolls and
+    // option changes 168, SCROLL requests 31.
     const minimums: Stats = .{
-        .reused = 145,
-        .filtered = 250,
-        .filtered_requests = 45,
-        .hidden_hooked = 2000,
-        .reply_hides = 8,
-        .reply_detaches = 6,
-        .content_resizes = 12,
-        .content_reply_texts = 12,
-        .unmeasured_texts = 4,
-        .updates = 650,
-        .resizes = 14,
-        .layout_changes = 350,
-        .records = 60,
-        .bodies = 10,
-        .decoded = 8000,
-        .editor_cursors = 400,
-        .host_cursors = 1600,
+        .reused = 2200,
+        .filtered = 260,
+        .filtered_requests = 100,
+        .reused_filtered_requests = 18,
+        .hidden_hooked = 1150,
+        .reply_hides = 7,
+        .reply_detaches = 9,
+        .reply_destroys = 80,
+        .record_replies = 60,
+        .content_resizes = 11,
+        .content_reply_texts = 10,
+        .unmeasured_texts = 3,
+        .updates = 680,
+        .resizes = 13,
+        .layout_changes = 430,
+        .records = 240,
+        .bodies = 40,
+        .decoded = 8300,
+        .editor_cursors = 580,
+        .host_cursors = 1900,
         .skipped = 2000,
         .partial = 300,
-        .draft_writes = 700,
-        .raw_writes = 90,
-        .shared_changes = 100,
-        .style_changes = 50,
-        .rebinds = 70,
-        .selections = 55,
-        .resends = 190,
-        .palettes = 20,
-        .scroll_frames = 330,
-        .scroll_changes = 40,
+        .draft_writes = 720,
+        .raw_writes = 95,
+        .shared_changes = 95,
+        .style_changes = 49,
+        .rebinds = 89,
+        .selections = 60,
+        .resends = 105,
+        .palettes = 19,
+        .scroll_frames = 300,
+        .scroll_changes = 42,
         .scroll_requests = 7,
     };
     inline for (std.meta.fields(Stats)) |field| {

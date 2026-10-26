@@ -9,6 +9,8 @@ import { ImageRenderable } from "./renderables/Image.js"
 import { TextRenderable } from "./renderables/Text.js"
 import {
   DebugOverlayCorner,
+  type AnimationTickCallback,
+  type AnimationTickOptions,
   type CursorStyleOptions,
   type MousePointerStyle,
   type ProgramStatus,
@@ -650,6 +652,9 @@ class ScrollbackSnapshotRenderContext extends EventEmitter implements RenderCont
   public setMousePointer(_shape: MousePointerStyle): void {}
   public requestLive(): void {}
   public dropLive(): void {}
+  public onAnimationTick(): () => void {
+    return () => {}
+  }
   public getSelection(): Selection | null {
     return null
   }
@@ -920,6 +925,19 @@ export enum RendererControlState {
 
 const CLICK_REPEAT_INTERVAL_MS = 500
 
+// Timers can fire up to about 1 ms before clock.now() reaches their delay, so every tick window is at least this wide.
+const ANIMATION_TIMER_SLACK_MS = 1
+
+interface AnimationTicker {
+  fps: number
+  /** The tick window in ms × fps. Due times are next × 1000 / fps; a frame at `time` covers every due index up to
+   * floor((time × fps + window) / 1000). Counting in these units keeps the default window (500) exact. */
+  window: number
+  next: number
+  last: number
+  callback: AnimationTickCallback
+}
+
 export class CliRenderer extends EventEmitter implements RenderContext {
   private static animationFrameId = 0
   private lib: RenderLib
@@ -1002,6 +1020,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
   private immediateRerenderRequested: boolean = false
 
   private liveRequestCounter: number = 0
+  private animationTickers = new Set<AnimationTicker>()
+  private animationTimer: TimerHandle | null = null
   private _controlState: RendererControlState = RendererControlState.IDLE
 
   private frameCallbacks: ((deltaTime: number) => Promise<void>)[] = []
@@ -4339,6 +4359,69 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     if (this.animationRequest.delete(handle)) this.dropLive()
   }
 
+  /** Calls `callback` `fps` times a second on a clock that all subscribers share. Due times are multiples of
+   * 1000 / fps, so equal rates tick together; one timer requests a frame at the earliest due time, and every frame,
+   * whatever its cause, runs each tick that is due within its tolerance. Returns the unsubscribe function. */
+  public onAnimationTick(fps: number, callback: AnimationTickCallback, options: AnimationTickOptions = {}): () => void {
+    const interval = 1000 / fps
+    const { tolerance } = options
+    if (!(interval > 0 && interval < Infinity)) throw new RangeError(`fps must be positive and finite, got ${fps}`)
+    if (tolerance !== undefined && !(tolerance >= 0 && tolerance < interval)) {
+      throw new RangeError(`tolerance must be at least 0 and below the interval (${interval} ms), got ${tolerance}`)
+    }
+    if (this._isDestroyed) return () => {}
+    const now = this.clock.now()
+    // The default tolerance is half the interval: 500 in window units.
+    const window = Math.max(tolerance === undefined ? 500 : tolerance * fps, ANIMATION_TIMER_SLACK_MS * fps)
+    // The first due time is the first one out of reach, so a new subscriber never ticks in the frame it joins.
+    const ticker = { fps, window, next: Math.floor((now * fps + window) / 1000) + 1, last: now, callback }
+    this.animationTickers.add(ticker)
+    this.scheduleAnimationTick()
+    return () => {
+      if (this.animationTickers.delete(ticker)) this.scheduleAnimationTick()
+    }
+  }
+
+  // An app-level timer like any other, not scheduled work: idle() resolves between ticks. The fastest subscribers
+  // request frames at their due times; slower ones only at the end of their window, so they share those frames.
+  private scheduleAnimationTick(): void {
+    if (this.animationTimer !== null) this.clock.clearTimeout(this.animationTimer)
+    this.animationTimer = null
+    let fastest = 0
+    for (const ticker of this.animationTickers) fastest = Math.max(fastest, ticker.fps)
+    let due = Infinity
+    for (const ticker of this.animationTickers) {
+      const late = ticker.fps === fastest ? 0 : ticker.window
+      due = Math.min(due, (ticker.next * 1000 + late) / ticker.fps)
+    }
+    if (due === Infinity) return
+    this.animationTimer = this.clock.setTimeout(
+      () => {
+        this.animationTimer = null
+        this.requestRender()
+      },
+      Math.max(0, due - this.clock.now()),
+    )
+  }
+
+  private runAnimationTicks(time: number): void {
+    if (this.animationTickers.size === 0) return
+    for (const ticker of this.animationTickers) {
+      const reach = Math.floor((time * ticker.fps + ticker.window) / 1000)
+      if (reach < ticker.next) continue
+      const ticks = reach + 1 - ticker.next
+      const deltaTime = Math.max(0, time - ticker.last)
+      ticker.next = reach + 1
+      ticker.last = time
+      try {
+        ticker.callback(deltaTime, ticks, time)
+      } catch (error) {
+        console.error("Error in animation tick callback:", error)
+      }
+    }
+    this.scheduleAnimationTick()
+  }
+
   private yieldFrame(): Promise<void> {
     if (!this.canRender) return Promise.resolve()
     return new Promise((resolve) => {
@@ -4639,6 +4722,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this.animationRequest.clear()
     this.frameCallbacks = []
     this.liveRequestCounter = 0
+    this.animationTickers.clear()
+    this.scheduleAnimationTick()
     this.immediateRerenderRequested = false
 
     if (this._usesProcessStdout) {
@@ -4870,6 +4955,11 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
       this.renderStats.frameCount++
       const overallStart = performance.now()
+
+      // The paint below draws what tick callbacks change, so their requests need no extra frame.
+      const requestedBeforeTicks = this.immediateRerenderRequested
+      this.runAnimationTicks(now)
+      this.immediateRerenderRequested = requestedBeforeTicks
 
       const animationFrameEnd = CliRenderer.animationFrameId
       const animationRequestStart = performance.now()

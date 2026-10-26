@@ -462,14 +462,14 @@ test "Scene frame work counts each frame kind and publishes only presented scene
     const text = try f.owner.sceneCreateNode(f.id, 2, 3);
     try f.owner.sceneSetText(text, "hi");
     try f.owner.sceneMoveNode(text, f.root, 1);
-    // The forced first frame merges the scene's reasons with the encoder's. Without the flag,
-    // the next frame has no retained work to reuse; unchanged and paint-only frames reuse it.
+    // The forced first frame merges the scene's reasons with the encoder's. Forced frames walk
+    // but keep their lists, so the next frame reuses them, as unchanged and paint-only frames do.
     // Unchanged frames paint nothing and diff no row; a changed member's row is the only one diffed.
     try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_FULL_FRAME);
     try testing.expectEqual(plainWork(1, 3, 3, 1, 0, 2, FrameWork.full_path_forced | FrameWork.full_path_screen | FrameWork.full_path_unretained, 2), try presentWork(f, .{}));
     try testing.expectEqual(plainWork(2, 3, 0, 0, 2, 0, FrameWork.full_path_forced, 2), try presentWork(f, .{}));
     try f.owner.sceneSetDebugFlags(f.id, 0);
-    try testing.expectEqual(plainWork(3, 3, 0, 0, 0, 0, 0, 0), try presentWork(f, .{}));
+    try testing.expectEqual(plainWork(3, 0, 0, 0, 0, 0, 0, 0), try presentWork(f, .{}));
     try testing.expectEqual(plainWork(4, 0, 0, 0, 0, 0, 0, 0), try presentWork(f, .{}));
     try f.owner.scenePatchPaint(fill, c.OT_SCENE_PROPERTY_BACKGROUND, .{ .background = .{ 3, 0, 0, 255 } });
     try testing.expectEqual(plainWork(5, 0, 0, 0, 1, 1, 0, 1), try presentWork(f, .{}));
@@ -541,7 +541,7 @@ test "Scene frame work counts each frame kind and publishes only presented scene
     (try f.owner.raw().getSession(f.id)).cancel();
 }
 
-const Retained = enum { unchanged, scroll, scroll_same, scroll_grow, scroll_colors, scroll_arrow, focus, blur, register, destroy_style, unbind, rebind, select, reset, styled_text, text_options, view_paint_off, view_paint_on, box_details, arrow, editor_select, editor_rebind, editor_unbind, z_order, surface_write, resend, same_width, sub_cell, palette, draft_write, session_draw, lease_next, lease_current, raw_render, skipped_commit, width_method, preserve, recorded, image };
+const Retained = enum { unchanged, scroll, scroll_same, scroll_grow, scroll_colors, scroll_arrow, focus, blur, register, destroy_style, unbind, rebind, select, reset, styled_text, text_options, view_paint_off, view_paint_on, box_details, arrow, slider, editor_select, editor_rebind, editor_unbind, z_order, surface_write, resend, same_width, sub_cell, palette, draft_write, session_draw, lease_next, lease_current, raw_render, skipped_commit, width_method, preserve, recorded, image };
 
 /// A node at a fixed place, painted after its earlier siblings.
 fn placedAt(f: Fixture, parent: context.Handle, kind: u32, num: u32, left: f32, top: f32, width: f32, height: f32) !context.Handle {
@@ -556,7 +556,7 @@ fn placedAt(f: Fixture, parent: context.Handle, kind: u32, num: u32, left: f32, 
 
 // Retained paint (B3) on a 10 x 9 screen: a box (rows 0-2), a text (row 3), a text view of a
 // styled shared buffer (row 4), an editor (row 5), a surface taller than its node (rows 6-7),
-// an arrow (row 8), at column 8 a parent (row 0) whose child (rows 2-3) paints under a
+// an arrow and a slider (row 8), at column 8 a parent (row 0) whose child (rows 2-3) paints under a
 // later sibling, and below them a scroll node (rows 4-7) of six rows. Each row changes one input and expects the rows it damages and the full-path
 // reasons. The table runs without VERIFY, then with it: VERIFY must pass and change no count.
 test "Scene frame retained paint damages the rows of changed inputs only" {
@@ -578,6 +578,7 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
     _ = try placedAt(f, parent, c.OT_SCENE_BOX, 8, 0, 2, 2, 2);
     const above = try placedAt(f, f.root, c.OT_SCENE_BOX, 9, 8, 2, 2, 2);
     const arrow = try placedAt(f, f.root, c.OT_SCENE_ARROW, 11, 0, 8, 1, 1);
+    const slider = try placedAt(f, f.root, c.OT_SCENE_SLIDER, 30, 2, 8, 4, 1);
     const scroll = try placedAt(f, f.root, c.OT_SCENE_BOX, 12, 8, 4, 2, 4);
     try f.owner.sceneSetScroll(scroll, .{});
     for (0..6) |index| {
@@ -638,6 +639,7 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
         .{ .change = .view_paint_on, .damage = 3 },
         .{ .change = .box_details, .damage = 5 },
         .{ .change = .arrow, .damage = 3 },
+        .{ .change = .slider, .damage = 3 },
         .{ .change = .editor_select, .damage = 3 },
         .{ .change = .editor_rebind, .damage = 3 },
         .{ .change = .editor_unbind, .damage = 3 },
@@ -700,6 +702,7 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
             .view_paint_off, .view_paint_on => try f.owner.sceneSetTextViewPaint(view_node, row.change == .view_paint_on),
             .box_details => try f.owner.sceneSetBoxDetails(box, .{ .title = "t" }),
             .arrow => try f.owner.sceneSetArrow(arrow, .{ .direction = 1 }),
+            .slider => try f.owner.sceneSetSlider(slider, .{ .value = 70 }),
             .editor_rebind => {
                 fresh_editor = try f.owner.createEditorView(edit, 6, 1);
                 try f.owner.sceneSetEditorView(editor_node, fresh_editor);
@@ -983,7 +986,7 @@ test "Scene frame work solves Yoga only for text writes that can change the meas
 // A reply changes the visibility of a member whose feedback already started. The visibility
 // stamp must give way to the walk: no request may reach a node the reply hid.
 test "Scene feedback visibility follows replies that hide, detach, or move a started member" {
-    for (std.enums.values(enum { hide_parent, detach, into_hidden, hide_root })) |reply| {
+    for (std.enums.values(enum { hide_parent, detach, into_hidden, hide_root, queued_sibling })) |reply| {
         const f = try Fixture.init(testing.allocator, 8, 4, .{});
         defer f.deinit();
         const hidden = try f.owner.sceneCreateNode(f.id, 1, 9);
@@ -997,6 +1000,10 @@ test "Scene feedback visibility follows replies that hide, detach, or move a sta
         try f.owner.sceneMoveNode(child, parent, 0);
         try f.owner.sceneSetHooks(parent, c.OT_SCENE_HOOK_UPDATE, 1, 0, 0);
         try f.owner.sceneSetHooks(child, c.OT_SCENE_HOOK_UPDATE, 1, 0, 0);
+        // A later sibling whose update is queued when the reply moves it drops that update.
+        const sibling = try f.owner.sceneCreateNode(f.id, 1, 5);
+        if (reply == .queued_sibling) try f.owner.sceneMoveNode(sibling, holder, 1);
+        try f.owner.sceneSetHooks(sibling, c.OT_SCENE_HOOK_UPDATE, 1, 0, 0);
         var request: scene.FrameRequest = undefined;
         if (reply == .hide_root) {
             // Round 2 solves without the hidden root and stamps nothing for it.
@@ -1011,6 +1018,10 @@ test "Scene feedback visibility follows replies that hide, detach, or move a sta
                 .detach => try f.owner.sceneMoveNode(parent, null, 0),
                 .into_hidden => try f.owner.sceneMoveNode(parent, hidden, 0),
                 .hide_root => unreachable,
+                .queued_sibling => {
+                    try f.owner.sceneMoveNode(sibling, hidden, 0);
+                    request = try f.step(request, options, c.OT_SCENE_FRAME_UPDATE, child);
+                },
             }
         }
         const done = try f.step(request, options, c.OT_SCENE_FRAME_DONE, null);
@@ -1045,6 +1056,91 @@ const StaleReply = struct {
         try f.owner.sceneSetTextOptions(self.target, .{ .truncate = self.truncate });
     }
 };
+
+// Frames that keep their preparation hold node pointers across host replies. A reply that
+// destroys the hooked node, or its parent, must leave no pointer to its storage, which the
+// node pool gives to the next node; a list entry left behind fails on the null scene node.
+test "Scene preparation drops destroyed nodes from UPDATE and RECORD replies" {
+    for ([_]u32{ c.OT_SCENE_HOOK_UPDATE, c.OT_SCENE_HOOK_RENDER_AFTER }) |hook| for ([_]bool{ false, true }) |parent_destroyed| {
+        const f = try Fixture.init(testing.allocator, 4, 2, .{});
+        defer f.deinit();
+        try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_VERIFY);
+        const parent = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_BOX, 2);
+        try f.owner.sceneMoveNode(parent, f.root, 0);
+        const target = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_TEXT, 3);
+        try f.owner.sceneSetText(target, "ab");
+        try f.owner.sceneMoveNode(target, parent, 0);
+        try f.owner.sceneSetHooks(target, hook, 1, 2, 1);
+        const kind: u32 = if (hook == c.OT_SCENE_HOOK_UPDATE) c.OT_SCENE_FRAME_UPDATE else c.OT_SCENE_FRAME_RECORD;
+        for (0..4) |index| {
+            var request = try f.owner.sceneFrameStep(f.id, null, options);
+            while (request.kind != c.OT_SCENE_FRAME_DONE) {
+                if (index == 2 and request.kind == kind) try f.owner.sceneDestroyNode(if (parent_destroyed) parent else target);
+                const record: ?[]const u8 = if (request.kind == c.OT_SCENE_FRAME_RECORD) &.{} else null;
+                request = try f.owner.sceneFrameStepWithRecording(f.id, request, options, record);
+            }
+            _ = try f.owner.sceneFrameCommit(f.id, request, false);
+            try drain(f.owner, f.id);
+            if (index != 2) continue;
+            // The released storage returns as a new node in the same place.
+            const next = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_TEXT, 4);
+            try f.owner.sceneSetText(next, "cd");
+            try f.owner.sceneMoveNode(next, f.root, 0);
+        }
+        try testing.expectEqual('c', f.cli.currentRenderBuffer.get(0, 0).?.char);
+        if (parent_destroyed) try f.owner.sceneDestroyNode(target);
+    };
+}
+
+/// Presents one frame; RECORD requests get an empty recording.
+fn presentRecorded(f: Fixture) !FrameWork {
+    var request = try f.owner.sceneFrameStep(f.id, null, options);
+    while (request.kind != c.OT_SCENE_FRAME_DONE) {
+        const record: ?[]const u8 = if (request.kind == c.OT_SCENE_FRAME_RECORD) &.{} else null;
+        request = try f.owner.sceneFrameStepWithRecording(f.id, request, options, record);
+    }
+    _ = try f.owner.sceneFrameCommit(f.id, request, false);
+    try drain(f.owner, f.id);
+    return work(f);
+}
+
+// Kept lists equal what a fresh walk would list (VERIFY checks each kept frame), with no hook,
+// layout feedback, or paint hooks only. A hidden node placed in a frame is listed once, for its
+// first refresh, then dropped, and feedback no longer visits it. A z-index sort reorders the
+// lists. A style change keeps them, but a measurement-only solve makes the next frame read
+// geometry again.
+test "Scene kept preparation drops hidden placements, follows sorts, and rereads measured solves" {
+    for ([_]u32{ 0, c.OT_SCENE_HOOK_UPDATE, c.OT_SCENE_HOOK_RENDER_AFTER }, [_]u64{ 0, 16, 0 }) |hook, operations| {
+        const f = try Fixture.init(testing.allocator, 4, 2, .{});
+        defer f.deinit();
+        try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_VERIFY);
+        const box = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_BOX, 2);
+        try f.owner.sceneMoveNode(box, f.root, 0);
+        if (hook != 0) try f.owner.sceneSetHooks(box, hook, 1, 0, 0);
+        var texts: [3]context.Handle = undefined;
+        for (&texts, 0..) |*text, index| {
+            text.* = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_TEXT, @intCast(3 + index));
+            try f.owner.sceneSetText(text.*, "x");
+            try f.owner.sceneMoveNode(text.*, box, @intCast(index));
+        }
+        try f.owner.sceneSetStyle(texts[2], c.OT_STYLE_ENUM, c.OT_STYLE_ENUM_DISPLAY, 0, 0, @floatFromInt(c.OT_DISPLAY_NONE), 0);
+        try testing.expect((try presentRecorded(f)).candidate_visits != 0);
+        try testing.expectEqual(@as(usize, 4), f.state.candidates.items.len);
+        for (0..2) |_| {
+            const kept = try presentRecorded(f);
+            try testing.expectEqual(@as(u64, 0), kept.candidate_visits);
+            try testing.expectEqual(operations, kept.feedback_operations);
+        }
+        try f.owner.scenePatchPaint(texts[0], c.OT_SCENE_PROPERTY_Z_INDEX, .{ .zIndex = 1 });
+        for (0..3) |_| _ = try presentRecorded(f);
+        try testing.expectEqual(texts[0], f.state.members.items[f.state.members.items.len - 1].node.scene_node.?.handle);
+        try testing.expectEqual(@as(u64, 0), (try presentRecorded(f)).candidate_visits);
+        try f.owner.sceneSetStyle(box, 4, 0, 0, 1, 3, 1);
+        try f.owner.sceneMeasureLayout(f.id, f.root);
+        try testing.expect((try presentRecorded(f)).candidate_visits != 0);
+        try testing.expectEqual(@as(f32, 3), (try f.owner.sceneGetLayout(box, false)).width);
+    }
+}
 
 // A viewport of 4 x 2 cells over a column of N one-line text rows; 2 rows show. Each row is
 // one frame kind; columns are viewport child refreshes, visibility steps, view preparations,
@@ -1232,39 +1328,51 @@ test "Scene frame work counts viewport refresh and culling work" {
 }
 
 // The bench's scenes at small sizes. Columns: every FrameWork field after work_frame_id, in
-// declaration order (candidate visits through damage rows). Track B steps change these rows.
-// Unchanged frames paint and diff nothing (B3); the scroll scene's status text is as tall as
+// declaration order (candidate visits through damage rows), then the preparation entries
+// stamped. Track B steps change these rows.
+// Unchanged frames paint and diff nothing (B3) and keep both lists through hooks and filters
+// (B5a), so they walk and stamp nothing; the scroll scene's status text is as tall as
 // the screen, so its glyph damages every row. A recorded frame follows a recorded frame, so it
 // has no retained frame to compare with.
 test "Scene frame bench scenes pin each frame kind's work at small sizes" {
     const bench = @import("../bench/scene-frame_bench.zig");
-    const rows = [_]struct { shape: bench.Shape, size: u32, change: bench.Change, work: [18]u64 }{
-        .{ .shape = .ui, .size = 0, .change = .unchanged, .work = .{ 0, 0, 87, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 } },
-        .{ .shape = .ui, .size = 0, .change = .glyph, .work = .{ 87, 0, 87, 87, 1, 0, 0, 0, 0, 86, 9009, 10000, 1, 1, 0, 0, 1, 1 } },
-        .{ .shape = .ui, .size = 0, .change = .update_hook, .work = .{ 87, 87, 174, 0, 0, 348, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0 } },
-        .{ .shape = .ui, .size = 0, .change = .paint_hook, .work = .{ 87, 87, 87, 0, 0, 0, 0, 0, 0, 86, 9009, 10000, 50, 0, 16, 1, 1, 50 } },
-        .{ .shape = .boxes, .size = 100, .change = .unchanged, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 } },
-        .{ .shape = .boxes, .size = 100, .change = .background, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 100, 1, 6160, 1, 1, 0, 0, 1, 1 } },
-        .{ .shape = .scroll, .size = 100, .change = .unchanged, .work = .{ 104, 104, 58, 0, 0, 217, 0, 0, 200, 0, 0, 0, 0, 0, 0, 0, 1, 0 } },
-        .{ .shape = .scroll, .size = 100, .change = .glyph, .work = .{ 104, 104, 158, 104, 1, 217, 0, 100, 200, 53, 10000, 10000, 50, 1, 0, 0, 1, 50 } },
-        .{ .shape = .scroll, .size = 100, .change = .scroll, .work = .{ 104, 104, 108, 0, 0, 217, 0, 0, 200, 53, 10000, 10000, 50, 50, 0, 0, 1, 50 } },
-        .{ .shape = .scroll, .size = 100, .change = .append, .work = .{ 106, 106, 160, 106, 1, 219, 0, 102, 204, 53, 10000, 10000, 50, 0, 0, 0, 1, 50 } },
-        .{ .shape = .wrapped_scroll, .size = 20, .change = .unchanged, .work = .{ 70, 70, 80, 0, 0, 281, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 1, 0 } },
+    const rows = [_]struct { shape: bench.Shape, size: u32, change: bench.Change, work: [19]u64 }{
+        .{ .shape = .ui, .size = 0, .change = .unchanged, .work = .{ 0, 0, 87, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 } },
+        .{ .shape = .ui, .size = 0, .change = .glyph, .work = .{ 87, 0, 87, 87, 1, 0, 0, 0, 0, 86, 9009, 10000, 1, 1, 0, 0, 1, 1, 87 } },
+        .{ .shape = .ui, .size = 0, .change = .update_hook, .work = .{ 0, 0, 174, 0, 0, 348, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0 } },
+        .{ .shape = .ui, .size = 0, .change = .paint_hook, .work = .{ 0, 0, 87, 0, 0, 0, 0, 0, 0, 86, 9009, 10000, 50, 0, 16, 1, 1, 50, 0 } },
+        .{ .shape = .boxes, .size = 100, .change = .unchanged, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 } },
+        .{ .shape = .boxes, .size = 100, .change = .background, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 100, 1, 6160, 1, 1, 0, 0, 1, 1, 0 } },
+        .{ .shape = .scroll, .size = 100, .change = .unchanged, .work = .{ 0, 0, 58, 0, 0, 217, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 } },
+        .{ .shape = .scroll, .size = 100, .change = .glyph, .work = .{ 104, 104, 158, 104, 1, 217, 0, 100, 200, 53, 10000, 10000, 50, 1, 0, 0, 1, 50, 104 } },
+        .{ .shape = .scroll, .size = 100, .change = .scroll, .work = .{ 104, 104, 108, 0, 0, 217, 0, 0, 200, 53, 10000, 10000, 50, 50, 0, 0, 1, 50, 104 } },
+        .{ .shape = .scroll, .size = 100, .change = .append, .work = .{ 106, 106, 160, 106, 1, 219, 0, 102, 204, 53, 10000, 10000, 50, 0, 0, 0, 1, 50, 106 } },
+        .{ .shape = .wrapped_scroll, .size = 20, .change = .unchanged, .work = .{ 0, 0, 80, 0, 0, 281, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 } },
         // The scroll shape as one scroll node: one node fewer, two hidden Yoga nodes read per
         // solve, a scroll is an offset without a solve, and an append follows the bottom.
-        .{ .shape = .scroll_node, .size = 100, .change = .unchanged, .work = .{ 103, 103, 56, 0, 0, 213, 0, 0, 200, 0, 0, 0, 0, 0, 0, 0, 1, 0 } },
-        .{ .shape = .scroll_node, .size = 100, .change = .scroll, .work = .{ 103, 103, 106, 0, 0, 213, 0, 0, 200, 52, 9950, 10000, 50, 50, 0, 0, 1, 50 } },
-        .{ .shape = .scroll_node, .size = 100, .change = .append, .work = .{ 105, 105, 158, 107, 1, 215, 0, 102, 204, 52, 9950, 10000, 50, 50, 0, 0, 1, 50 } },
+        .{ .shape = .scroll_node, .size = 100, .change = .unchanged, .work = .{ 0, 0, 56, 0, 0, 213, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 } },
+        .{ .shape = .scroll_node, .size = 100, .change = .scroll, .work = .{ 103, 103, 106, 0, 0, 213, 0, 0, 200, 52, 9950, 10000, 50, 50, 0, 0, 1, 50, 103 } },
+        .{ .shape = .scroll_node, .size = 100, .change = .append, .work = .{ 105, 105, 158, 107, 1, 215, 0, 102, 204, 52, 9950, 10000, 50, 50, 0, 0, 1, 50, 105 } },
+        .{ .shape = .boxes, .size = 100, .change = .paint_hook, .work = .{ 0, 0, 101, 0, 0, 0, 0, 0, 0, 100, 1, 6160, 44, 0, 16, 1, 1, 44, 0 } },
+        .{ .shape = .scroll, .size = 100, .change = .update_hook, .work = .{ 0, 0, 58, 0, 0, 217, 0, 0, 100, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0 } },
+        .{ .shape = .scroll, .size = 100, .change = .paint_hook, .work = .{ 0, 0, 108, 0, 0, 217, 0, 0, 100, 53, 10000, 10000, 50, 0, 16, 1, 1, 50, 0 } },
     };
     for (rows) |row| {
         var target = try bench.Scene.init(testing.allocator, testing.io, row.shape, row.size);
         defer target.deinit();
+        const state = (try target.owner.raw().getRenderable(target.root)).scene_node.?.owner;
         // The second changed frame: the first one also settles hooks registered by the change.
+        // A steady change repeats it, so retention outlives a frame's host requests.
         _ = try target.frame(row.change);
-        const w = try target.frame(row.change);
-        var actual: [18]u64 = undefined;
-        inline for (std.meta.fields(FrameWork)[1..], 0..) |field, index| actual[index] = @field(w, field.name);
-        try testing.expectEqual(row.work, actual);
+        const steady = row.change == .unchanged or row.change == .update_hook or row.change == .paint_hook;
+        for (0..@as(usize, if (steady) 2 else 1)) |_| {
+            const stamps = state.test_stamp_steps;
+            const w = try target.frame(row.change);
+            var actual: [19]u64 = undefined;
+            inline for (std.meta.fields(FrameWork)[1..], 0..) |field, index| actual[index] = @field(w, field.name);
+            actual[18] = state.test_stamp_steps - stamps;
+            try testing.expectEqual(row.work, actual);
+        }
     }
 }
 

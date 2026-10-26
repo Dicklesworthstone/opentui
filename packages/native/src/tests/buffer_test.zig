@@ -1148,8 +1148,6 @@ test "OptimizedBuffer text views attach a combining mark only to the glyph drawn
         wrap: bool = false,
         scissor_width: u32 = 4,
         truncate: bool = false,
-        /// The one-chunk text that draws the same cells, when it is not the joined chunks.
-        reference: ?[]const u8 = null,
         /// Per source, the cell that holds the mark, or null when no drawn glyph comes before it.
         mark: [2]?u32,
     };
@@ -1164,7 +1162,7 @@ test "OptimizedBuffer text views attach a combining mark only to the glyph drawn
         .{ .chunks = &.{ "abcde", "\u{301}" }, .truncate = true, .mark = .{ 3, 3 } },
         .{ .chunks = &.{ "abcd", "\u{301}e" }, .truncate = true, .mark = .{ null, null } },
         .{ .chunks = &.{ "a", "\u{301}", "bcdef" }, .viewport = .{ .x = 0, .y = 0, .width = 5, .height = 2 }, .truncate = true, .mark = .{ 0, 0 } },
-        .{ .chunks = &.{ "\u{2714}", "\u{fe0f}" }, .reference = "\u{2714}", .mark = .{ null, null } },
+        .{ .chunks = &.{ "\u{2714}", "\u{fe0f}" }, .mark = .{ 0, 0 } },
         .{ .chunks = &.{ "a\t", "\u{301}" }, .mark = .{ null, null } },
         .{ .chunks = &.{ "abc", "\u{301}d" }, .viewport = .{ .x = 0, .y = 0, .width = 3, .height = 2 }, .wrap = true, .mark = .{ 2, 2 } },
         .{ .chunks = &.{ "\u{4e2d}", "\u{301}", "\u{301}" }, .mark = .{ 0, 0 } },
@@ -1178,7 +1176,7 @@ test "OptimizedBuffer text views attach a combining mark only to the glyph drawn
         // The editor scrolls to its cursor, so it cannot keep a viewport that starts right of column 0.
         if (source == .insert and (row.viewport.x != 0 or row.truncate)) continue;
         errdefer std.debug.print("opacity={d} source={t} chunks={any}\n", .{ opacity, source, row.chunks });
-        const text = try std.mem.concat(std.testing.allocator, u8, if (row.reference) |reference| &.{reference} else row.chunks);
+        const text = try std.mem.concat(std.testing.allocator, u8, row.chunks);
         defer std.testing.allocator.free(text);
         const one_chunk = try OptimizedBuffer.init(std.testing.allocator, 4, 2, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
         defer one_chunk.deinit();
@@ -2225,6 +2223,52 @@ test "OptimizedBuffer - fillRect transparent path is a no-op without trackers" {
     try std.testing.expectEqual(ansi.greenF(blue_bg), ansi.greenF(unchangedSpace.bg));
     try std.testing.expectEqual(ansi.blueF(blue_bg), ansi.blueF(unchangedSpace.bg));
     try std.testing.expectEqual(ansi.TextAttributes.UNDERLINE, unchangedSpace.attributes);
+}
+
+test "OptimizedBuffer - drawBox places titles against the whole box when the buffer or a scissor clips it" {
+    var pools = TestPools.init(std.testing.allocator);
+    defer pools.deinit();
+    const buf = try OptimizedBuffer.init(std.testing.allocator, 12, 3, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
+    defer buf.deinit();
+    // Equal corners make the top and the bottom title rows read the same.
+    const border_chars = [_]u32{ '+', '+', '+', '+', '-', '|', 0, 0, 0, 0, 0 };
+    const sides: buffer_mod.BorderSides = .{ .top = true, .right = true, .bottom = true, .left = true };
+    const fg = ansi.rgbColor(250, 240, 230, 255);
+    const bg = ansi.rgbColor(10, 20, 30, 255);
+    const Case = struct { x: i32, y: i32 = 0, alignment: u8 = 0, title: []const u8 = "ab", clip: ?buffer_mod.ClipRect = null, row: []const u8 };
+    // A 10-cell box: a 2-cell title starts at x + 2 (left), x + 4 (center), or x + 6 (right).
+    const cases = [_]Case{
+        .{ .x = 0, .row = "+-ab-----+  " },
+        .{ .x = -2, .row = "ab-----+    " },
+        .{ .x = -3, .row = "b-----+     " },
+        .{ .x = -2, .alignment = 1, .row = "--ab---+    " },
+        .{ .x = -2, .alignment = 2, .row = "----ab-+    " },
+        .{ .x = 6, .alignment = 1, .row = "      +---ab" },
+        .{ .x = 5, .alignment = 2, .row = "     +-----a" },
+        .{ .x = -2, .title = "世界", .row = "世界---+    " },
+        // The wide glyph covers columns -1 and 0, so column 0 keeps its cell.
+        .{ .x = -3, .title = "世界", .row = " 界---+     " },
+        .{ .x = -2, .alignment = 2, .title = "e\u{301}x", .row = "----e\u{301}x-+    " },
+        .{ .x = -2, .alignment = 2, .title = "abcdef", .row = "abcdef-+    " },
+        .{ .x = -2, .title = "abcdefg", .row = "-------+    " },
+        .{ .x = 0, .y = -1, .row = "+-ab-----+  " },
+        .{ .x = 0, .clip = .{ .x = 3, .y = 0, .width = 9, .height = 3 }, .row = "   b-----+  " },
+        .{ .x = 2, .alignment = 2, .clip = .{ .x = 0, .y = 0, .width = 8, .height = 3 }, .row = "  +-----    " },
+    };
+    var text: [256]u8 = undefined;
+    for ([_]bool{ false, true }) |checked| for (cases) |case| {
+        errdefer std.debug.print("checked={} case={any}\n", .{ checked, case });
+        buf.clear(bg, null);
+        if (case.clip) |rect| try buf.pushScissorRect(rect.x, rect.y, rect.width, rect.height);
+        defer buf.clearScissorRects();
+        const args = .{ buf, case.x, case.y, 10, 3, &border_chars, sides, fg, bg, fg, false, case.title, case.alignment, case.title, case.alignment };
+        try if (checked) @call(.auto, OptimizedBuffer.drawBoxChecked, args) else @call(.auto, OptimizedBuffer.drawBox, args);
+        var rows = std.mem.splitScalar(u8, text[0..try buf.writeResolvedChars(&text, true)], '\n');
+        var y: i32 = 0;
+        while (rows.next()) |row| : (y += 1) {
+            if (y == case.y or y == case.y + 2) try std.testing.expectEqualStrings(case.row, row);
+        }
+    };
 }
 
 test "OptimizedBuffer - drawBox transparent border preserves destination background metadata without trackers" {

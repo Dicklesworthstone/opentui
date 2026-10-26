@@ -571,13 +571,13 @@ inline fn isPrintableAscii(bytes: []const u8) bool {
     return bytes.len == 1 and bytes[0] >= 0x20 and bytes[0] < 0x7f;
 }
 
-/// Index of the first render cluster whose `key` is at least `value`; clusters are sorted by both keys.
-fn findRenderCluster(clusters: []const utf8.RenderClusterInfo, comptime key: enum { byte_start, col_start }, value: u32, comptime counter: std.meta.FieldEnum(text_work.Counts)) usize {
+/// Index of the first item whose field `key` is at least `value`; items are sorted by `key`.
+fn lowerBound(items: anytype, comptime key: []const u8, value: u32, comptime counter: std.meta.FieldEnum(text_work.Counts)) usize {
     var lo: usize = 0;
-    var hi = clusters.len;
+    var hi = items.len;
     while (lo < hi) : (text_work.add(counter, 1)) {
         const mid = lo + (hi - lo) / 2;
-        if (@field(clusters[mid], @tagName(key)) < value) lo = mid + 1 else hi = mid;
+        if (@field(items[mid], key) < value) lo = mid + 1 else hi = mid;
     }
     return lo;
 }
@@ -710,7 +710,6 @@ pub const OptimizedBuffer = struct {
 
     const BoxTitleLayout = struct {
         shouldDraw: bool = false,
-        x: i32 = 0,
         startX: i32 = 0,
         endX: i32 = 0,
     };
@@ -2358,7 +2357,6 @@ pub const OptimizedBuffer = struct {
             const vline_span_info = view.getVirtualLineSpans(vline_idx);
             const spans = vline_span_info.spans;
             const col_offset = vline_span_info.source_col_start;
-            var span_idx: usize = 0;
             var lineFg = text_defaults.fg orelse ansi.rgbColor(255, 255, 255, 255);
             var lineBg = text_defaults.bg orelse ansi.rgbColor(0, 0, 0, 0);
             var lineAttributes = text_defaults.attributes orelse 0;
@@ -2366,11 +2364,10 @@ pub const OptimizedBuffer = struct {
             const defaultBg = lineBg;
             const defaultAttributes = lineAttributes;
 
-            // Find the span that contains the starting render position (col_offset + horizontal_offset)
+            // Spans run from column 0 with rising columns, so span k ends after column k and the one
+            // that holds `start_col` has an index of at most `start_col`.
             const start_col = col_offset + horizontal_offset;
-            while (span_idx < spans.len and spans[span_idx].next_col <= start_col) {
-                span_idx += 1;
-            }
+            var span_idx = lowerBound(spans[0..@min(spans.len, start_col)], "next_col", start_col +| 1, .span_search_steps);
 
             var next_change_col: u32 = if (span_idx < spans.len)
                 spans[span_idx].next_col
@@ -2411,7 +2408,7 @@ pub const OptimizedBuffer = struct {
                 const byte_end = vchunk.byte_start_in_chunk + vchunk.byte_len;
 
                 // Cluster k starts at byte k or later, so the first one at `byte_offset` has an index of at most `byte_offset`.
-                var special_idx = findRenderCluster(render_clusters[0..@min(render_clusters.len, byte_offset)], .byte_start, byte_offset, .cluster_scan_steps);
+                var special_idx = lowerBound(render_clusters[0..@min(render_clusters.len, byte_offset)], "byte_start", byte_offset, .cluster_scan_steps);
 
                 // Left of the viewport nothing draws and marks have no base, so skip whole chunks by
                 // width and resume after the last cluster that starts left of the viewport. The loop
@@ -2424,7 +2421,7 @@ pub const OptimizedBuffer = struct {
                         continue;
                     }
                     const target_col = col + (horizontal_offset - rendered_col_in_vline);
-                    const lo = special_idx + findRenderCluster(render_clusters[special_idx..], .col_start, target_col, .left_skip_steps);
+                    const lo = special_idx + lowerBound(render_clusters[special_idx..], "col_start", target_col, .left_skip_steps);
                     if (lo > special_idx and render_clusters[lo - 1].byte_start + render_clusters[lo - 1].byte_len <= byte_end) {
                         byte_offset = render_clusters[lo - 1].byte_start + render_clusters[lo - 1].byte_len;
                         col = render_clusters[lo - 1].col_start + render_clusters[lo - 1].width_cols;
@@ -2602,10 +2599,7 @@ pub const OptimizedBuffer = struct {
                                 lineAttributes = defaultAttributes;
                                 next_change_col = std.math.maxInt(u32);
                             } else {
-                                var suffix_span_idx: usize = 0;
-                                while (suffix_span_idx < spans.len and spans[suffix_span_idx].next_col <= suffix_col_pos) {
-                                    suffix_span_idx += 1;
-                                }
+                                const suffix_span_idx = lowerBound(spans, "next_col", suffix_col_pos +| 1, .span_search_steps);
                                 if (suffix_span_idx < spans.len) {
                                     span_idx = suffix_span_idx;
                                 }
@@ -3176,8 +3170,8 @@ pub const OptimizedBuffer = struct {
         const isAtActualTop = startY == y;
         const isAtActualBottom = endY == y + @as(i32, @intCast(height)) - 1;
 
-        const titleLayout = self.computeBoxTitleLayout(title, borderSides.top, isAtActualTop, startX, endX, width, titleAlignment);
-        const bottomTitleLayout = self.computeBoxTitleLayout(bottomTitle, borderSides.bottom, isAtActualBottom, startX, endX, width, bottomTitleAlignment);
+        const titleLayout = self.computeBoxTitleLayout(title, borderSides.top, isAtActualTop, x, width, titleAlignment);
+        const bottomTitleLayout = self.computeBoxTitleLayout(bottomTitle, borderSides.bottom, isAtActualBottom, x, width, bottomTitleAlignment);
 
         if (shouldFill) {
             if (!borderSides.top and !borderSides.right and !borderSides.bottom and !borderSides.left) {
@@ -3341,9 +3335,9 @@ pub const OptimizedBuffer = struct {
         if (titleLayout.shouldDraw) {
             if (title) |titleText| {
                 if (checked_titles) {
-                    try self.drawTextChecked(titleText, titleLayout.x, startY, titleColor, backgroundColor, 0);
+                    try self.drawTextChecked(titleText, titleLayout.startX, startY, titleColor, backgroundColor, 0);
                 } else {
-                    try self.drawText(titleText, @intCast(titleLayout.x), @intCast(startY), titleColor, backgroundColor, 0);
+                    try self.drawTextClipped(titleText, titleLayout.startX, startY, titleColor, backgroundColor, 0);
                 }
             }
         }
@@ -3351,9 +3345,9 @@ pub const OptimizedBuffer = struct {
         if (bottomTitleLayout.shouldDraw) {
             if (bottomTitle) |titleText| {
                 if (checked_titles) {
-                    try self.drawTextChecked(titleText, bottomTitleLayout.x, endY, titleColor, backgroundColor, 0);
+                    try self.drawTextChecked(titleText, bottomTitleLayout.startX, endY, titleColor, backgroundColor, 0);
                 } else {
-                    try self.drawText(titleText, @intCast(bottomTitleLayout.x), @intCast(endY), titleColor, backgroundColor, 0);
+                    try self.drawTextClipped(titleText, bottomTitleLayout.startX, endY, titleColor, backgroundColor, 0);
                 }
             }
         }
@@ -3364,15 +3358,14 @@ pub const OptimizedBuffer = struct {
         titleText: ?[]const u8,
         borderSide: bool,
         isAtActualSide: bool,
-        startX: i32,
-        endX: i32,
+        boxX: i32,
         width: u32,
         alignment: u8,
     ) BoxTitleLayout {
-        const text = titleText orelse return .{ .x = startX };
+        const text = titleText orelse return .{};
 
         if (text.len == 0 or !borderSide or !isAtActualSide) {
-            return .{ .x = startX };
+            return .{};
         }
 
         const is_ascii = utf8.isAsciiOnly(text);
@@ -3380,23 +3373,22 @@ pub const OptimizedBuffer = struct {
         const minTitleSpace = 4;
 
         if (@as(i32, @intCast(width)) < titleLength + minTitleSpace) {
-            return .{ .x = startX };
+            return .{};
         }
 
         const padding = 2;
-        var titleX = startX + padding;
+        var titleX = boxX + padding;
 
         if (alignment == 1) {
-            titleX = startX + @max(padding, @divFloor(@as(i32, @intCast(width)) - titleLength, 2));
+            titleX = boxX + @divFloor(@as(i32, @intCast(width)) - titleLength, 2);
         } else if (alignment == 2) {
-            titleX = startX + @as(i32, @intCast(width)) - padding - titleLength;
+            titleX = boxX + @as(i32, @intCast(width)) - padding - titleLength;
         }
-
-        titleX = @max(startX + padding, @min(titleX, endX - titleLength));
+        assert(titleX >= boxX + padding);
+        assert(titleX + titleLength < boxX + @as(i32, @intCast(width)));
 
         return .{
             .shouldDraw = true,
-            .x = titleX,
             .startX = titleX,
             .endX = titleX + titleLength - 1,
         };
