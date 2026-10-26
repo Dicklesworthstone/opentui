@@ -1,7 +1,7 @@
 // Generated from packages/native/include/opentui.h and scripts/native-abi-pointers.ts.
 // Run `bun run generate:abi` in packages/core. Do not edit.
 // Inspect audit input: bun scripts/native-abi.ts --audit
-// ABI audit SHA-256: 17f402557267e7cd4621577ec5ef59697140103236861ebdfd7138b0436bce5e
+// ABI audit SHA-256: 7bcbefa5ef7abb67efc032d175b9deaa56624d7e4055db4ba8be5ea6233bc828
 
 export const nativeSymbols = {
   ot_scene_set_hooks: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
@@ -180,7 +180,7 @@ export const nativeSymbols = {
   ot_scene_set_text_view_paint: { args: ["ptr", "buffer", "u32"], returns: "i32" },
   ot_buffer_draw_text_view: { args: ["ptr", "buffer", "ptr", "buffer", "i32", "i32"], returns: "i32" },
   ot_buffer_draw_editor_view: { args: ["ptr", "buffer", "ptr", "buffer", "i32", "i32"], returns: "i32" },
-  ot_buffer_draw_scene_text: { args: ["ptr", "buffer", "ptr", "buffer", "i32", "i32"], returns: "i32" },
+  ot_buffer_draw_scene_body: { args: ["ptr", "buffer", "ptr", "buffer", "i32", "i32"], returns: "i32" },
   ot_scene_frame_acquire_buffer_lease: { args: ["ptr", "buffer", "buffer", "u32", "buffer"], returns: "i32" },
   ot_scene_frame_commit: { args: ["ptr", "buffer", "buffer", "u32", "buffer"], returns: "i32" },
   ot_context_abi_version: { args: [], returns: "u32" },
@@ -512,7 +512,7 @@ export const nativeLayouts = {
       full_path_reasons: { offset: 208, size: 4, alignment: 4, type: "u32" },
       host_requests: { offset: 212, size: 4, alignment: 4, type: "u32" },
       layout_rounds: { offset: 216, size: 4, alignment: 4, type: "u32" },
-      reserved: { offset: 220, size: 4, alignment: 4, type: "u32" },
+      damage_rows: { offset: 220, size: 4, alignment: 4, type: "u32" },
     },
   },
   ot_scene_cursor_state: {
@@ -1640,6 +1640,9 @@ export const nativeConstants = {
   OT_SCENE_FULL_PATH_FORCED: 1,
   OT_SCENE_FULL_PATH_SCREEN: 2,
   OT_SCENE_FULL_PATH_IMAGES: 4,
+  OT_SCENE_FULL_PATH_TAINTED: 8,
+  OT_SCENE_FULL_PATH_UNRETAINED: 16,
+  OT_SCENE_FULL_PATH_OPTIONS: 32,
   OT_SCENE_HOOK_UPDATE: 1,
   OT_SCENE_HOOK_RESIZE: 2,
   OT_SCENE_HOOK_LAYOUT_CHANGED: 4,
@@ -1670,6 +1673,7 @@ export const nativeConstants = {
   OT_SCENE_PROPERTY_RECORD_MAX: 88,
   OT_SCENE_PROPERTY_BYTES_MAX: 360448,
   OT_SCENE_DEBUG_FULL_FRAME: 1,
+  OT_SCENE_DEBUG_VERIFY: 2,
   OT_SESSION_OPEN: 0,
   OT_SESSION_CLOSING: 1,
   OT_SESSION_CLOSED_STATE: 2,
@@ -2059,7 +2063,7 @@ export const nativeConstants = {
   OT_SCENE_RECORD_COLOR_MATRIX: 7,
   OT_SCENE_RECORD_TEXT_VIEW: 8,
   OT_SCENE_RECORD_EDITOR_VIEW: 9,
-  OT_SCENE_RECORD_SCENE_TEXT: 10,
+  OT_SCENE_RECORD_SCENE_BODY: 10,
   OT_SCENE_RECORD_IMAGE: 11,
   OT_SCENE_RECORD_UNICODE: 12,
   OT_SCENE_RECORD_GRAYSCALE_FOREGROUND: 1,
