@@ -443,6 +443,13 @@ fn addContextABIHeader(
     module.addImport("context_abi_c", header.createModule());
 }
 
+/// Files that tests embed by module name, such as Core's input parser conformance vectors.
+fn addTestFixtures(b: *std.Build, module: *std.Build.Module) void {
+    module.addAnonymousImport("input_conformance", .{
+        .root_source_file = b.path("../core/src/lib/stdin-parser.conformance.json"),
+    });
+}
+
 /// Apply dependencies to a module
 fn applyDependencies(
     b: *std.Build,
@@ -580,6 +587,7 @@ pub fn build(b: *std.Build) void {
         .optimize = test_optimize,
     });
     applyDependencies(b, test_mod, test_optimize, native_target, build_options);
+    addTestFixtures(b, test_mod);
     const test_artifact = b.addTest(.{
         .root_module = test_mod,
         .filters = if (b.option([]const u8, "test-filter", "Skip tests that do not match filter")) |f| &.{f} else &.{},
@@ -607,6 +615,7 @@ pub fn build(b: *std.Build) void {
         .fuzz = true,
     });
     applyDependencies(b, cov_mod, .Debug, native_target, build_options);
+    addTestFixtures(b, cov_mod);
     const cov_artifact = b.addTest(.{
         .name = "test-cov",
         .root_module = cov_mod,
@@ -660,6 +669,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     applyDependencies(b, lifetime_mod, .Debug, native_target, lifetime_options);
+    addTestFixtures(b, lifetime_mod);
     const lifetime_artifact = b.addTest(.{
         .root_module = lifetime_mod,
         .filters = &.{ "measure", "NativeRenderable", "Context Yoga target" },
@@ -683,9 +693,19 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     bench_mod.link_libc = true;
-    addImageShim(b, bench_mod, native_target, macos_sdk_path);
+    // The scene bench drives a whole Context, which owns audio resources; this adds the image shim too.
+    addNativeAudioDependencies(b, bench_mod, native_target, macos_sdk_path);
     addYogaDependencies(b, bench_mod, false);
     if (native_target.result.os.tag == .macos) addMacOSSDKSearchPaths(b, bench_mod, macos_sdk_path.?);
+    // The benches in bench-isolated.zig compile as their own unit, so other benches cannot change their code.
+    const bench_isolated_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench-isolated.zig"),
+        .target = native_target,
+        .optimize = bench_optimize,
+        .link_libc = true,
+    });
+    applyDependencies(b, bench_isolated_mod, bench_optimize, native_target, build_options);
+    bench_mod.addObject(b.addObject(.{ .name = "opentui-bench-isolated", .root_module = bench_isolated_mod }));
     const run_bench = b.addRunArtifact(bench_exe);
     if (b.args) |args| {
         run_bench.addArgs(args);

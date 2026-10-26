@@ -13,6 +13,7 @@ const text_buffer_view = @import("text-buffer-view.zig");
 const utf8 = @import("utf8.zig");
 const image = @import("image.zig");
 const Context = @import("context.zig").Context;
+const nextPaintEpoch = @import("utils.zig").nextPaintEpoch;
 const scene_record = @import("scene-record.zig");
 const api = @import("context_abi_c");
 
@@ -54,6 +55,156 @@ pub const ArrowOptions = struct {
 
     pub fn deinit(self: ArrowOptions, allocator: std.mem.Allocator) void {
         if (self.text) |text| allocator.free(text);
+    }
+};
+
+pub const ScrollBarOptions = struct {
+    policy: u32 = api.OT_SCENE_SCROLL_BAR_AUTO,
+    overlay: bool = false,
+    thickness: u32 = 1,
+    gap: u32 = 0,
+    arrows: bool = false,
+    foreground: ansi.RGBA = (SliderOptions{}).foreground,
+    background: ansi.RGBA = (SliderOptions{}).background,
+};
+
+pub const ScrollOptions = struct {
+    axes: u32 = api.OT_SCENE_SCROLL_Y,
+    follow: u32 = api.OT_SCENE_SCROLL_FOLLOW_NONE,
+    culling: bool = false,
+    // Viewport padding in cells: left, top, right, bottom.
+    padding: [4]f32 = @splat(0),
+    // Wrapper, viewport, and content fills.
+    fills: [3]?ansi.RGBA = @splat(null),
+    // Horizontal, vertical.
+    bars: [2]ScrollBarOptions = @splat(.{}),
+};
+
+/// A scroll node's state. Axis 0 is x, axis 1 is y. The two Yoga nodes are owned and are
+/// never scene nodes: the viewport node is the box's only Yoga child, and the content node,
+/// the viewport node's only child, holds the box's scene children.
+pub const ScrollState = struct {
+    viewport_node: yoga.YGNodeRef,
+    content_node: yoga.YGNodeRef,
+    options: ScrollOptions = .{},
+    arrows: [2][2]ArrowOptions = @splat(@splat(.{})),
+    stuck: bool = true,
+    offset: [2]f64 = @splat(0),
+    max: [2]f64 = @splat(0),
+    extent: [2]f32 = @splat(0),
+    // The hidden viewport node's rect, local to the box.
+    viewport: Layout = .{},
+    // The content node's origin, local to the box.
+    content_origin: [2]f32 = @splat(0),
+    visible: [2]bool = @splat(false),
+    toggle_frame: u64 = 0,
+    toggles: u32 = 0,
+    reported: [6]f64 = @splat(0),
+    // The box's screen position, which the reported geometry follows.
+    screen: [2]f64 = @splat(0),
+    generation: u64 = 0,
+
+    fn deinit(self: *ScrollState, allocator: std.mem.Allocator) void {
+        for (self.arrows) |pair| for (pair) |arrow| arrow.deinit(allocator);
+        yoga.yogaNodeFree(self.content_node);
+        yoga.yogaNodeFree(self.viewport_node);
+        allocator.destroy(self);
+    }
+
+    fn followAxis(self: *const ScrollState) ?usize {
+        return switch (self.options.follow) {
+            api.OT_SCENE_SCROLL_FOLLOW_TOP, api.OT_SCENE_SCROLL_FOLLOW_BOTTOM => 1,
+            api.OT_SCENE_SCROLL_FOLLOW_LEFT, api.OT_SCENE_SCROLL_FOLLOW_RIGHT => 0,
+            else => null,
+        };
+    }
+
+    fn followEdge(self: *const ScrollState, axis: usize) f64 {
+        const far = self.options.follow == api.OT_SCENE_SCROLL_FOLLOW_BOTTOM or self.options.follow == api.OT_SCENE_SCROLL_FOLLOW_RIGHT;
+        return if (far) self.max[axis] else 0;
+    }
+
+    /// An explicit scroll or a follow change: the view is stuck at the follow edge when it
+    /// reached it, or when the range is noise (at most one cell).
+    pub fn restick(self: *ScrollState) void {
+        const axis = self.followAxis() orelse return;
+        self.stuck = self.max[axis] <= 1 or self.offset[axis] == self.followEdge(axis);
+    }
+
+    /// What a SCROLL request reports: offset, content size, viewport size.
+    pub fn observed(self: *const ScrollState) [6]f64 {
+        return .{ self.offset[0], self.offset[1], self.extent[0], self.extent[1], self.viewport.width, self.viewport.height };
+    }
+
+    fn gutter(self: *const ScrollState, axis: usize) f32 {
+        const bar = self.options.bars[axis];
+        return if (self.visible[axis] and !bar.overlay) @floatFromInt(bar.gap + bar.thickness) else 0;
+    }
+
+    /// Writes the gutters of visible inset bars as the box's right and bottom padding.
+    /// Returns whether a gutter changed.
+    pub fn applyGutters(self: *const ScrollState, box: yoga.YGNodeRef) !bool {
+        var changed = false;
+        for ([_]u32{ api.OT_EDGE_BOTTOM, api.OT_EDGE_RIGHT }, 0..) |edge, axis| {
+            var encoded: u64 = 0;
+            try yoga.check(yoga.yogaNodeStyleGetValueChecked(box, api.OT_STYLE_VALUE_PADDING, edge, &encoded));
+            const value = self.gutter(axis);
+            if (@as(u32, @truncate(encoded)) == api.OT_UNIT_POINT and @as(f32, @bitCast(@as(u32, @truncate(encoded >> 32)))) == value) continue;
+            try yoga.check(yoga.yogaNodeStyleSetValueChecked(box, api.OT_STYLE_VALUE_PADDING, edge, api.OT_UNIT_POINT, value));
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// A bar's track and arrow rects in screen cells, from the box's paint layout.
+    pub fn barRects(self: *const ScrollState, axis: usize, box: Layout, sides: u32) struct { bar: Layout, track: Layout, arrows: [2]Layout } {
+        const options = self.options.bars[axis];
+        const left: f32 = @floatFromInt(@intFromBool(sides & api.OT_BORDER_LEFT != 0));
+        const top: f32 = @floatFromInt(@intFromBool(sides & api.OT_BORDER_TOP != 0));
+        const right: f32 = @floatFromInt(@intFromBool(sides & api.OT_BORDER_RIGHT != 0));
+        const bottom: f32 = @floatFromInt(@intFromBool(sides & api.OT_BORDER_BOTTOM != 0));
+        const thickness: f32 = @floatFromInt(options.thickness);
+        var bar: Layout = .{ .screenX = box.screenX + left, .screenY = box.screenY + top, .width = @max(0, box.width - left - right), .height = @max(0, box.height - top - bottom) };
+        if (axis == 1) {
+            bar.screenX += @max(0, bar.width - thickness);
+            bar.width = @min(bar.width, thickness);
+        } else {
+            bar.width = @max(0, bar.width - self.gutter(1));
+            bar.screenY += @max(0, bar.height - thickness);
+            bar.height = @min(bar.height, thickness);
+        }
+        var track = bar;
+        var ends_at: [2]Layout = .{ .{}, .{} };
+        if (options.arrows) {
+            const along: [2]f32 = if (axis == 1) .{ 0, 1 } else .{ 1, 0 };
+            const length = if (axis == 1) bar.height else bar.width;
+            const ends = @min(2, length);
+            ends_at[0] = .{ .screenX = bar.screenX + @floor((bar.width - 1) / 2) * along[1], .screenY = bar.screenY + @floor((bar.height - 1) / 2) * along[0], .width = @min(1, bar.width), .height = @min(1, bar.height) };
+            ends_at[1] = ends_at[0];
+            ends_at[1].screenX += @max(0, length - 1) * along[0];
+            ends_at[1].screenY += @max(0, length - 1) * along[1];
+            if (axis == 1) {
+                track.screenY += @min(1, ends);
+                track.height -= ends;
+            } else {
+                track.screenX += @min(1, ends);
+                track.width -= ends;
+            }
+        }
+        return .{ .bar = bar, .track = track, .arrows = ends_at };
+    }
+
+    pub fn slider(self: *const ScrollState, axis: usize) SliderOptions {
+        const size = if (axis == 1) self.viewport.height else self.viewport.width;
+        const inner = size - self.options.padding[axis] - self.options.padding[axis + 2];
+        return .{
+            .max = self.max[axis],
+            .value = self.offset[axis],
+            .viewport_size = @max(1, inner),
+            .orientation = @intCast(axis),
+            .foreground = self.options.bars[axis].foreground,
+            .background = self.options.bars[axis].background,
+        };
     }
 };
 
@@ -131,8 +282,8 @@ pub const Paint = struct {
 // Field order is the partial-property wire order; bool occupies a u32 on the wire.
 pub const paint_fields = .{ "zIndex", "opacity", "translateX", "translateY", "borderSides", "shouldFill", "background", "borderColor", "borderStyle", "focusable", "focusedBorderColor" };
 pub const paint_fields_all: u32 = (1 << paint_fields.len) - 1;
-const scene_hook_flags_all: u32 = api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_RESIZE | api.OT_SCENE_HOOK_LAYOUT_CHANGED | api.OT_SCENE_HOOK_RENDER_BEFORE | api.OT_SCENE_HOOK_RENDER_AFTER | api.OT_SCENE_HOOK_RENDER_SELF | api.OT_SCENE_HOOK_IDLE_UPDATE;
-const scene_layout_hook_flags: u32 = api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_RESIZE | api.OT_SCENE_HOOK_LAYOUT_CHANGED;
+const scene_hook_flags_all: u32 = api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_RESIZE | api.OT_SCENE_HOOK_LAYOUT_CHANGED | api.OT_SCENE_HOOK_RENDER_BEFORE | api.OT_SCENE_HOOK_RENDER_AFTER | api.OT_SCENE_HOOK_RENDER_SELF | api.OT_SCENE_HOOK_IDLE_UPDATE | api.OT_SCENE_HOOK_SCROLL;
+const scene_layout_hook_flags: u32 = api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_RESIZE | api.OT_SCENE_HOOK_LAYOUT_CHANGED | api.OT_SCENE_HOOK_SCROLL;
 const scene_paint_hook_flags: u32 = api.OT_SCENE_HOOK_RENDER_BEFORE | api.OT_SCENE_HOOK_RENDER_AFTER | api.OT_SCENE_HOOK_RENDER_SELF;
 
 pub const FrameOptions = struct {
@@ -179,7 +330,36 @@ pub const BufferIdentity = struct {
 const Painted = struct {
     ticket: FrameRequest,
     destination: BufferIdentity,
+    work: renderer.FrameWork,
+    // Rows that may differ from the presented frame, or null for every row.
+    damage: ?*const std.DynamicBitSetUnmanaged,
 };
+
+/// What a member's cells depend on. Equal inputs paint equal cells in the same rows.
+const PaintInputs = struct {
+    layout: Layout,
+    clip: buffer.ClipRect,
+    opacity: f32,
+    // Position in paint order: an order change repaints both members it swaps.
+    rank: u32,
+    focused: bool,
+    node_epoch: u64,
+    resource_epoch: u64,
+    // A destroyed style unbinds its borrowers without a mutation gate.
+    styled: bool,
+};
+
+/// One painted member of a frame and the rows it paints.
+const Record = struct {
+    token: u32,
+    top: u32,
+    bottom: u32,
+    // Bodies native code cannot fingerprint (surfaces) always repaint.
+    stable: bool,
+    inputs: PaintInputs,
+};
+
+const Damage = enum { all, rows, none };
 
 const Attempt = struct {
     root: handles.Handle,
@@ -190,13 +370,8 @@ const Attempt = struct {
     requests: u32 = 0,
     request_id: u64 = 0,
     pending: ?FrameRequest = null,
-    remaining_work: u32,
-    bounded_work: bool,
-    // After a yielded mutation restarts preparation, the attempt never yields again.
-    restarted: bool = false,
-    preparing: enum { none, traversal, views } = .none,
-    prepare_depth: usize = 0,
-    prepare_cursor: usize = 0,
+    // Scene.visibility_epoch when this round stamped prepared_visible.
+    visibility_epoch: u64 = 0,
 };
 
 pub const ImageState = struct {
@@ -249,11 +424,16 @@ pub const Node = struct {
         needs_layout: bool = true,
         display_none: bool = false,
         clips_children: bool = false,
+        // Visible with every ancestor when this round prepared the node.
+        prepared_visible: bool = false,
     } = .{},
     paint: Paint = .{},
     layout: Layout = .{},
     observed_layout: Layout = .{},
     viewport: ?handles.Handle = null,
+    scroll: ?*ScrollState = null,
+    // A filtered parent's layout_epoch when every child last refreshed, refreshing while a batch runs, or 0.
+    children_observed: u64 = 0,
     focus_frame: u64 = 0,
     text: ?*Text = null,
     editor: ?*Editor = null,
@@ -274,6 +454,19 @@ pub const Node = struct {
     placement: u64 = 0,
     resize_width: f64 = 0,
     resize_height: f64 = 0,
+    // Changes with every setter of what the node itself paints.
+    paint_epoch: u64 = 0,
+    // The node's record in a frame's records: two slots, for the presented and the draft frame.
+    records: [2]struct { frame: u64 = 0, index: u32 = 0 } = .{ .{}, .{} },
+
+    /// The Yoga node that holds the scene children's Yoga nodes.
+    pub fn childYoga(self: *const Node, value: *const native.NativeRenderable) yoga.YGNodeRef {
+        return if (self.scroll) |state| state.content_node else value.yoga_node;
+    }
+
+    pub fn filtersChildren(self: *const Node) bool {
+        return self.viewport != null or (self.scroll != null and self.scroll.?.options.culling);
+    }
 };
 
 const Work = struct {
@@ -283,31 +476,26 @@ const Work = struct {
     opacity: f32,
     visible: bool,
     filtered: bool,
+    // A scroll node's bars, painted after its children.
+    bars: bool = false,
 };
 
-const Prepared = struct {
-    node: handles.Handle,
-    layout: Layout,
+const PreparationFrame = struct {
+    node: *native.NativeRenderable,
+    parent: Layout,
     clip: buffer.ClipRect,
     opacity: f32,
-    visible: bool,
-    filtered: bool,
+    child: usize = 0,
+    entered: bool = false,
+    filtered: bool = false,
+    filter: ?Filter = null,
+    // The node's work entry, which a scroll node's bars repeat after its children.
+    work_index: usize = 0,
 };
 
-fn PreparationFrame(comptime retained: bool) type {
-    return struct {
-        node: if (retained) handles.Handle else *native.NativeRenderable,
-        parent: Layout,
-        clip: buffer.ClipRect,
-        opacity: f32,
-        child: usize = 0,
-        entered: bool = false,
-        filtered: bool = false,
-        filter: ?Filter = null,
-    };
-}
-
 const no_slot = std.math.maxInt(u32);
+// A filtered parent's children_observed while its refresh batch runs; no layout_epoch reaches it.
+const children_refreshing = std.math.maxInt(u64);
 
 /// A prepared member of a recorded frame. Handles survive the host's record batch.
 const PaintMember = struct {
@@ -316,6 +504,7 @@ const PaintMember = struct {
     clip: buffer.ClipRect,
     opacity: f32,
     filtered: bool,
+    bars: bool,
     slot: u32,
 };
 
@@ -331,6 +520,21 @@ pub const PaintSlot = struct {
     opacity: f32,
 };
 
+/// A painted member's rect within its clip, in screen cells.
+pub const Hit = struct { x: u32, y: u32, width: u32, height: u32, token: u32 };
+
+/// The index of the last hit in paint order that covers a cell: what a grid that every
+/// member overwrote in paint order would hold there.
+pub fn topmostHit(hits: []const Hit, x: u32, y: u32) ?usize {
+    var index = hits.len;
+    while (index != 0) {
+        index -= 1;
+        const hit = hits[index];
+        if (x >= hit.x and y >= hit.y and x - hit.x < hit.width and y - hit.y < hit.height) return index;
+    }
+    return null;
+}
+
 const Filter = struct {
     viewport: Layout,
     row: bool,
@@ -338,7 +542,7 @@ const Filter = struct {
 
 const Feedback = struct {
     node: handles.Handle,
-    kind: enum { update, refresh, prepass, placed, children, filtered_refresh, select },
+    kind: enum { update, refresh, prepass, placed, children, filtered_refresh, select, scroll },
     placement: u64 = 0,
     parent: ?handles.Handle = null,
 };
@@ -354,6 +558,10 @@ pub const Scene = struct {
     hook_count: u32 = 0,
     layout_hook_count: u32 = 0,
     filter_count: u32 = 0,
+    // Scroll nodes: each may add a bars entry to the work list.
+    scroll_count: u32 = 0,
+    // A scroll node toggled a bar in this preparation: its round solves again before any hook.
+    scroll_toggled: bool = false,
     focus: ?handles.Handle = null,
     // Do not hide host-managed cursors in scenes that have not placed an editor cursor.
     editor_cursor_owned: bool = false,
@@ -364,18 +572,35 @@ pub const Scene = struct {
     token_tombstones: u32 = 0,
     style_node: yoga.YGNodeRef,
     work: std.ArrayListUnmanaged(Work) = .empty,
-    prepared: std.ArrayListUnmanaged(Prepared) = .empty,
-    preparation_stack: std.ArrayListUnmanaged(PreparationFrame(true)) = .empty,
-    // Incomplete frames retain only handles; completed unbudgeted frames may reuse work.
     feedback: std.ArrayListUnmanaged(Feedback) = .empty,
     paint_members: std.ArrayListUnmanaged(PaintMember) = .empty,
     paint_slots: std.ArrayListUnmanaged(PaintSlot) = .empty,
     segments: std.ArrayListUnmanaged(scene_record.Segments) = .empty,
+    // Hit rectangles in paint order: the draft frame's, and the presented frame's. A hit
+    // test walks the presented ones from the top, so no frame writes a screen-sized grid.
+    hits: std.ArrayListUnmanaged(Hit) = .empty,
+    presented_hits: std.ArrayListUnmanaged(Hit) = .empty,
+    hits_frame: u64 = 0,
+    hits_generation: u64 = 0,
+    presented_hits_frame: u64 = 0,
+    // Paint records of the draft frame and of the presented frame, which retained paint
+    // compares; the damaged rows of the draft.
+    records: std.ArrayListUnmanaged(Record) = .empty,
+    presented_records: std.ArrayListUnmanaged(Record) = .empty,
+    records_frame: u64 = 0,
+    presented_records_frame: u64 = 0,
+    records_options: FrameOptions = undefined,
+    presented_options: FrameOptions = undefined,
+    damage: std.DynamicBitSetUnmanaged = .{},
+    // The scratch buffer of a verified skip while it paints (OT_SCENE_DEBUG_VERIFY).
+    verify_target: ?*buffer.OptimizedBuffer = null,
     attempt: ?Attempt = null,
     painted: ?Painted = null,
     cancelled_paint: bool = false,
     last_frame_id: u64 = 0,
     layout_epoch: u64 = 0,
+    // Changes with any display or ancestry change, so stamped visibility goes stale mid-attempt.
+    visibility_epoch: u64 = 0,
     solve_frame: u64 = 0,
     solve_round: u32 = 0,
     layout_pending: bool = false,
@@ -384,13 +609,14 @@ pub const Scene = struct {
     preparation_dirty: bool = true,
     // Some node failed a custom measurement or ends a retry in the next retry pass.
     measure_failed: bool = false,
-    test_prepare_steps: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
-    test_geometry_reads: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
-    test_style_reads: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
-    test_visibility_steps: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    // The active attempt's work; it moves into the DONE draft and dies with a cancelled attempt.
+    frame_work: renderer.FrameWork = .{},
+    // OT_SCENE_DEBUG_* bits. Every shortcut that skips frame work tests FULL_FRAME.
+    debug_flags: u32 = 0,
     test_sort_steps: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
-    test_filtered_refresh_steps: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
-    test_paint_setups: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    test_hit_steps: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    // Editor cursor work: placements tried and releases written.
+    test_cursor_steps: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
 
     pub fn init(allocator: std.mem.Allocator, config: *yoga.Config, session: handles.Handle) !*Scene {
         const self = try allocator.create(Scene);
@@ -408,12 +634,15 @@ pub const Scene = struct {
         yoga.yogaNodeFree(self.style_node);
         self.tokens.deinit(self.allocator);
         self.work.deinit(self.allocator);
-        self.prepared.deinit(self.allocator);
-        self.preparation_stack.deinit(self.allocator);
         self.feedback.deinit(self.allocator);
         self.paint_members.deinit(self.allocator);
         self.paint_slots.deinit(self.allocator);
         self.segments.deinit(self.allocator);
+        self.hits.deinit(self.allocator);
+        self.presented_hits.deinit(self.allocator);
+        self.records.deinit(self.allocator);
+        self.presented_records.deinit(self.allocator);
+        self.damage.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -482,7 +711,7 @@ pub const Scene = struct {
                 try target.children.ensureUnusedCapacity(self.allocator, 1);
                 try target.paint_children.ensureUnusedCapacity(self.allocator, 1);
             }
-            try yoga.check(yoga.yogaNodeMoveChildChecked(parent.yoga_node, value.yoga_node, index));
+            try yoga.check(yoga.yogaNodeMoveChildChecked(target.childYoga(parent), value.yoga_node, index));
             const previous = node.parent;
             if (previous) |old| removeChild(&old.scene_node.?.children, value);
             target.children.insertAssumeCapacity(index, value);
@@ -498,7 +727,7 @@ pub const Scene = struct {
         } else {
             if (index != 0) return error.YogaInvalidArgument;
             if (node.parent) |old| {
-                try yoga.check(yoga.yogaNodeRemoveChildChecked(old.yoga_node, value.yoga_node));
+                try yoga.check(yoga.yogaNodeRemoveChildChecked(old.scene_node.?.childYoga(old), value.yoga_node));
                 removeChild(&old.scene_node.?.children, value);
                 removeChild(&old.scene_node.?.paint_children, value);
                 node.parent = null;
@@ -524,6 +753,7 @@ pub const Scene = struct {
             node.placement = self.last_placement;
         } else if (destination == null) node.placement = 0;
         node.layout_flags.needs_layout = true;
+        self.visibility_epoch +%= 1;
         self.preparation_dirty = true;
         self.work.clearRetainingCapacity();
     }
@@ -531,13 +761,20 @@ pub const Scene = struct {
     pub fn remove(self: *Scene, value: *native.NativeRenderable) native.NodeStorage {
         const node = value.scene_node.?;
         node.control.deinit(node.kind, self.allocator);
+        self.filter_count -= @intFromBool(node.filtersChildren());
         if (node.parent) |parent| {
-            yoga.yogaNodeRemoveChild(parent.yoga_node, value.yoga_node);
+            yoga.yogaNodeRemoveChild(parent.scene_node.?.childYoga(parent), value.yoga_node);
             removeChild(&parent.scene_node.?.children, value);
             removeChild(&parent.scene_node.?.paint_children, value);
         }
         // Bulk detachment avoids repeated shifting of a wide Yoga child vector.
-        yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(value.yoga_node)) catch unreachable;
+        yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(node.childYoga(value))) catch unreachable;
+        if (node.scroll) |state| {
+            yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(value.yoga_node)) catch unreachable;
+            state.deinit(self.allocator);
+            node.scroll = null;
+            self.scroll_count -= 1;
+        }
         for (node.children.items) |child| {
             child.scene_node.?.parent = null;
             child.scene_node.?.placement = 0;
@@ -555,10 +792,10 @@ pub const Scene = struct {
         self.count -= 1;
         self.hook_count -= @intFromBool(node.hook_flags & ~@as(u32, api.OT_SCENE_HOOK_IDLE_UPDATE) != 0);
         self.layout_hook_count -= @intFromBool(node.hook_flags & scene_layout_hook_flags != 0);
-        self.filter_count -= @intFromBool(node.viewport != null);
         if (self.focus) |focused| {
             if (std.meta.eql(focused, node.handle)) self.focus = null;
         }
+        self.visibility_epoch +%= 1;
         self.preparation_dirty = true;
         self.work.clearRetainingCapacity();
         const storage: native.NodeStorage = .{
@@ -578,7 +815,7 @@ pub const Scene = struct {
         self.cancelFrame();
         var cursor = self.head;
         while (cursor) |value| : (cursor = value.scene_node.?.next) {
-            yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(value.yoga_node)) catch unreachable;
+            yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(value.scene_node.?.childYoga(value))) catch unreachable;
             value.scene_node.?.parent = null;
             value.scene_node.?.placement = 0;
             value.scene_node.?.children.clearRetainingCapacity();
@@ -599,8 +836,8 @@ pub const Scene = struct {
         if (fields & api.OT_SCENE_PROPERTY_BORDER_COLOR != 0) try buffer.validateColor(patch.borderColor);
         if (fields & api.OT_SCENE_PROPERTY_FOCUSED_BORDER_COLOR != 0) try buffer.validateColor(patch.focusedBorderColor);
         if ((fields & api.OT_SCENE_PROPERTY_OPACITY != 0 and (!std.math.isFinite(patch.opacity) or patch.opacity < 0 or patch.opacity > 1)) or
-            (fields & api.OT_SCENE_PROPERTY_TRANSLATE_X != 0 and !std.math.isFinite(patch.translateX)) or
-            (fields & api.OT_SCENE_PROPERTY_TRANSLATE_Y != 0 and !std.math.isFinite(patch.translateY)) or
+            (fields & api.OT_SCENE_PROPERTY_TRANSLATE_X != 0 and !(@abs(patch.translateX) <= std.math.floatMax(f32))) or
+            (fields & api.OT_SCENE_PROPERTY_TRANSLATE_Y != 0 and !(@abs(patch.translateY) <= std.math.floatMax(f32))) or
             (fields & api.OT_SCENE_PROPERTY_BORDER != 0 and patch.borderSides > api.OT_BORDER_ALL) or
             (fields & api.OT_SCENE_PROPERTY_SHOULD_FILL != 0 and patch.shouldFill > 1) or
             (fields & api.OT_SCENE_PROPERTY_BORDER_STYLE != 0 and patch.borderStyle > api.OT_BORDER_HEAVY))
@@ -629,8 +866,8 @@ pub const Scene = struct {
             if (node.parent) |parent| parent.scene_node.?.sort_dirty = true;
         }
         if (self.attempt) |active| {
-            if ((active.filter_selected or active.preparing != .none) and (node.paint.translateX != paint.translateX or node.paint.translateY != paint.translateY)) {
-                // Restart retained geometry or refresh newly revealed descendants before paint.
+            if (active.filter_selected and (node.paint.translateX != paint.translateX or node.paint.translateY != paint.translateY)) {
+                // Refresh newly revealed descendants before paint.
                 self.preparation_dirty = true;
             }
         }
@@ -640,6 +877,7 @@ pub const Scene = struct {
         {
             self.work.clearRetainingCapacity();
         }
+        if (!std.meta.eql(node.paint, paint)) node.paint_epoch = nextPaintEpoch();
         node.paint = paint;
     }
 
@@ -680,7 +918,8 @@ pub const Scene = struct {
         if (flags & ~scene_hook_flags_all != 0 or generation == 0 or
             flags & (api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_IDLE_UPDATE) == api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_IDLE_UPDATE or
             (flags & scene_paint_hook_flags != 0 and node.kind == api.OT_SCENE_ROOT) or
-            (flags & api.OT_SCENE_HOOK_LAYOUT_CHANGED != 0 and node.kind != api.OT_SCENE_ROOT)) return error.InvalidOptions;
+            (flags & api.OT_SCENE_HOOK_LAYOUT_CHANGED != 0 and node.kind != api.OT_SCENE_ROOT) or
+            (flags & api.OT_SCENE_HOOK_SCROLL != 0 and node.scroll == null)) return error.InvalidOptions;
         for ([_]f64{ initial_width, initial_height }) |dimension| {
             if (!std.math.isFinite(dimension) or dimension < 0 or dimension > std.math.maxInt(i32)) return error.InvalidDimensions;
         }
@@ -696,8 +935,165 @@ pub const Scene = struct {
         self.layout_hook_count += @intFromBool(flags & scene_layout_hook_flags != 0);
         node.hook_flags = flags;
         node.hook_generation = generation;
+        self.invalidateObservation(value);
+    }
+
+    pub fn setScroll(self: *Scene, config: *yoga.Config, value: *native.NativeRenderable, options: ScrollOptions) !void {
+        const node = value.scene_node.?;
+        if (node.kind != api.OT_SCENE_BOX) return error.WrongKind;
+        if (options.axes > api.OT_SCENE_SCROLL_X | api.OT_SCENE_SCROLL_Y or options.follow > api.OT_SCENE_SCROLL_FOLLOW_RIGHT) return error.InvalidOptions;
+        for (options.padding) |padding| {
+            if (!(padding >= 0 and padding <= 65535) or @trunc(padding) != padding) return error.InvalidOptions;
+        }
+        for (options.fills) |fill| if (fill) |rgba| try buffer.validateColor(rgba);
+        for (options.bars) |bar| {
+            if (bar.policy > api.OT_SCENE_SCROLL_BAR_NEVER or bar.thickness == 0 or bar.thickness > 255 or bar.gap > 255) return error.InvalidOptions;
+            try buffer.validateColor(bar.foreground);
+            try buffer.validateColor(bar.background);
+        }
+        try checkWritable(value);
+        if (node.viewport != null or (node.scroll == null and node.children.items.len != 0)) return error.InvalidOptions;
+        const state = node.scroll orelse blk: {
+            const created = try self.allocator.create(ScrollState);
+            errdefer self.allocator.destroy(created);
+            const viewport_node = try config.createNode();
+            errdefer yoga.yogaNodeFree(viewport_node);
+            const content_node = try config.createNode();
+            errdefer yoga.yogaNodeFree(content_node);
+            for ([_]struct { yoga.YGNodeRef, u32, u32 }{
+                .{ viewport_node, api.OT_STYLE_ENUM_OVERFLOW, api.OT_OVERFLOW_HIDDEN },
+                .{ content_node, api.OT_STYLE_ENUM_ALIGN_SELF, api.OT_ALIGN_FLEX_START },
+            }) |entry| try yoga.check(yoga.yogaNodeStyleSetEnumChecked(entry[0], entry[1], entry[2]));
+            try yoga.check(yoga.yogaNodeStyleSetFloatChecked(viewport_node, api.OT_STYLE_FLOAT_FLEX_GROW, 1));
+            try yoga.check(yoga.yogaNodeStyleSetFloatChecked(viewport_node, api.OT_STYLE_FLOAT_FLEX_SHRINK, 1));
+            for ([_]u32{ api.OT_STYLE_VALUE_MIN_WIDTH, api.OT_STYLE_VALUE_MIN_HEIGHT }) |kind| {
+                try yoga.check(yoga.yogaNodeStyleSetValueChecked(content_node, kind, api.OT_EDGE_NONE, api.OT_UNIT_PERCENT, 100));
+            }
+            try yoga.check(yoga.yogaNodeInsertChildChecked(viewport_node, content_node, 0));
+            try yoga.check(yoga.yogaNodeInsertChildChecked(value.yoga_node, viewport_node, 0));
+            // Inverted axes write both content size limits below.
+            created.* = .{ .viewport_node = viewport_node, .content_node = content_node, .options = .{ .axes = ~options.axes } };
+            node.scroll = created;
+            self.scroll_count += 1;
+            break :blk created;
+        };
+        const previous = state.options;
+        for ([_]u32{ api.OT_SCENE_SCROLL_X, api.OT_SCENE_SCROLL_Y }, [_]u32{ api.OT_STYLE_VALUE_MAX_WIDTH, api.OT_STYLE_VALUE_MAX_HEIGHT }) |axis, kind| {
+            if ((previous.axes ^ options.axes) & axis == 0) continue;
+            const scrolls = options.axes & axis != 0;
+            try yoga.check(yoga.yogaNodeStyleSetValueChecked(state.content_node, kind, api.OT_EDGE_NONE, if (scrolls) api.OT_UNIT_UNDEFINED else api.OT_UNIT_PERCENT, if (scrolls) std.math.nan(f32) else 100));
+        }
+        for (options.padding, api.OT_EDGE_LEFT..) |padding, edge| {
+            try yoga.check(yoga.yogaNodeStyleSetValueChecked(state.viewport_node, api.OT_STYLE_VALUE_PADDING, @intCast(edge), api.OT_UNIT_POINT, padding));
+        }
+        self.filter_count -= @intFromBool(node.filtersChildren());
+        state.options = options;
+        self.filter_count += @intFromBool(node.filtersChildren());
+        // A changed policy applies now; the next solve corrects an auto bar's visibility.
+        for (options.bars, previous.bars, &state.visible, state.max) |bar, old, *visible, max| {
+            if (bar.policy != old.policy) visible.* = if (bar.policy == api.OT_SCENE_SCROLL_BAR_AUTO) max > 0 else bar.policy == api.OT_SCENE_SCROLL_BAR_ALWAYS;
+        }
+        _ = try state.applyGutters(value.yoga_node);
+        if (previous.follow != options.follow) state.restick();
+        state.generation += 1;
+        self.invalidateObservation(value);
+    }
+
+    pub fn setScrollArrow(self: *Scene, value: *native.NativeRenderable, axis: u32, end: u32, options: ArrowOptions) !void {
+        const state = value.scene_node.?.scroll orelse return error.WrongKind;
+        if (axis > 1 or end > 1 or options.direction != 0) return error.InvalidOptions;
+        try checkWritable(value);
+        var replacement = options;
+        if (options.text) |text| replacement.text = try self.allocator.dupe(u8, text);
+        state.arrows[axis][end].deinit(self.allocator);
+        state.arrows[axis][end] = replacement;
+        self.work.clearRetainingCapacity();
+    }
+
+    /// An explicit scroll: moves the offset in whole cells within the last solve's limits and
+    /// recomputes stuck.
+    pub fn scrollTo(self: *Scene, value: *native.NativeRenderable, target: [2]f64, relative: [2]bool) !void {
+        const node = value.scene_node.?;
+        const state = node.scroll orelse return error.WrongKind;
+        for (target) |coordinate| if (std.math.isNan(coordinate)) return error.InvalidOptions;
+        try checkWritable(value);
+        const before = .{ state.offset, state.stuck };
+        for (0..2) |axis| {
+            const position = if (relative[axis]) state.offset[axis] + target[axis] else target[axis];
+            state.offset[axis] = std.math.clamp(@floor(position + 0.5), 0, state.max[axis]);
+        }
+        state.restick();
+        // The host knows the offset it wrote, not a size change it has not been told of.
+        @memcpy(state.reported[0..2], &state.offset);
+        if (std.meta.eql(before, .{ state.offset, state.stuck })) return;
+        state.generation += 1;
+        if (std.meta.eql(before[0], state.offset)) return;
+        node.paint_epoch = nextPaintEpoch();
+        // Children move; in an attempt the next round prepares and culls at the new offset.
         self.preparation_dirty = true;
         self.work.clearRetainingCapacity();
+    }
+
+    /// After a solve: read the hidden nodes, follow the stuck edge, clamp, and toggle bars.
+    fn resolveScroll(self: *Scene, value: *native.NativeRenderable, state: *ScrollState) !void {
+        var viewport: yoga.ExternalYogaLayout = undefined;
+        var content: yoga.ExternalYogaLayout = undefined;
+        self.frame_work.geometry_reads += 2;
+        try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(state.viewport_node, &viewport));
+        try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(state.content_node, &content));
+        const before = .{ state.offset, state.max, state.extent, state.viewport, state.content_origin, state.visible };
+        state.viewport = .{ .left = viewport.left, .top = viewport.top, .width = viewport.width, .height = viewport.height };
+        state.content_origin = .{ viewport.left + content.left, viewport.top + content.top };
+        state.extent = .{ content.width, content.height };
+        const sizes = [2]f32{ viewport.width, viewport.height };
+        for (0..2) |axis| {
+            const range = @as(f64, state.extent[axis]) - (sizes[axis] - state.options.padding[axis] - state.options.padding[axis + 2]);
+            // NaN and negative ranges have nothing to scroll; huge ones stay within exact integers.
+            state.max[axis] = if (state.options.axes & (@as(u32, 1) << @intCast(axis)) != 0 and range > 0) @min(@ceil(range), std.math.maxInt(i32)) else 0;
+        }
+        // A stuck view moves only when its range changed, so a solve elsewhere keeps a reader
+        // who scrolled within a noise range where they are.
+        const moved = !std.meta.eql(.{ before[1], before[2], before[3] }, .{ state.max, state.extent, state.viewport });
+        if (state.followAxis()) |axis| {
+            if (state.stuck and moved) state.offset[axis] = state.followEdge(axis);
+        }
+        for (0..2) |axis| state.offset[axis] = std.math.clamp(state.offset[axis], 0, state.max[axis]);
+        const frame_id = self.attempt.?.frame_id;
+        if (state.toggle_frame != frame_id) {
+            state.toggle_frame = frame_id;
+            state.toggles = 0;
+        }
+        var toggled = false;
+        for (state.options.bars, &state.visible, state.max) |bar, *visible, max| {
+            const wanted = switch (bar.policy) {
+                api.OT_SCENE_SCROLL_BAR_AUTO => max > 0,
+                else => bar.policy == api.OT_SCENE_SCROLL_BAR_ALWAYS,
+            };
+            // Past two toggles a bar may still appear but not hide, so wrapping content cannot oscillate.
+            if (wanted == visible.* or (state.toggles >= 2 and !wanted)) continue;
+            visible.* = wanted;
+            state.toggles += 1;
+            toggled = true;
+        }
+        // An overlay bar's toggle changes no layout.
+        if (toggled and try state.applyGutters(value.yoga_node)) self.scroll_toggled = true;
+        if (!std.meta.eql(before, .{ state.offset, state.max, state.extent, state.viewport, state.content_origin, state.visible })) {
+            state.generation += 1;
+            value.scene_node.?.paint_epoch = nextPaintEpoch();
+        }
+    }
+
+    /// The node's next refresh may differ although its layout did not change: its filtered
+    /// parent refreshes every child in the next round.
+    pub fn markObservationStale(value: *native.NativeRenderable) void {
+        const parent = (value.scene_node orelse return).parent orelse return;
+        parent.scene_node.?.children_observed = 0;
+    }
+
+    pub fn invalidateObservation(self: *Scene, value: *native.NativeRenderable) void {
+        self.preparation_dirty = true;
+        self.work.clearRetainingCapacity();
+        markObservationStale(value);
     }
 
     pub fn cancelFrame(self: *Scene) void {
@@ -709,8 +1105,6 @@ pub const Scene = struct {
         self.paint_slots.clearRetainingCapacity();
         self.segments.clearRetainingCapacity();
         self.work.clearRetainingCapacity();
-        self.prepared.clearRetainingCapacity();
-        self.preparation_stack.clearRetainingCapacity();
     }
 
     pub fn checkPainted(self: *Scene, ticket: FrameRequest) error{ WrongContext, WrongSession, StaleFrame }!*Painted {
@@ -730,28 +1124,25 @@ pub const Scene = struct {
         return self.paint_slots.items;
     }
 
+    fn forcesFullFrame(self: *const Scene) bool {
+        return self.debug_flags & api.OT_SCENE_DEBUG_FULL_FRAME != 0;
+    }
+
     pub fn requalifyPainted(self: *Scene, cli: *renderer.CliRenderer) void {
         if (self.painted) |*painted| painted.destination = BufferIdentity.init(cli.getNextBuffer());
     }
 
-    pub fn isYielded(self: *const Scene) bool {
-        const active = self.attempt orelse return false;
-        const pending = active.pending orelse return false;
-        return pending.kind == api.OT_SCENE_FRAME_YIELD;
+    fn verifiesRetained(self: *const Scene) bool {
+        return self.debug_flags & api.OT_SCENE_DEBUG_VERIFY != 0;
     }
 
     /// Limits stay fixed; paint options can change on a checked acknowledgement.
     /// Validate the complete ticket before resolving any ticket node or consuming work.
-    pub fn frameStep(self: *Scene, owner: *Context, cli: *renderer.CliRenderer, previous: ?FrameRequest, options: FrameOptions, allow_host: bool) !FrameRequest {
-        return self.frameStepWorkBudgeted(owner, cli, previous, options, allow_host, std.math.maxInt(u32), null);
-    }
-
     /// recording acknowledges a RECORD request and must be null for every other step.
-    pub fn frameStepWorkBudgeted(self: *Scene, owner: *Context, cli: *renderer.CliRenderer, previous: ?FrameRequest, options: FrameOptions, allow_host: bool, max_work_items: u32, recording: ?[]const u8) !FrameRequest {
+    pub fn frameStep(self: *Scene, owner: *Context, cli: *renderer.CliRenderer, previous: ?FrameRequest, options: FrameOptions, allow_host: bool, recording: ?[]const u8) !FrameRequest {
         const objects = &owner.objects;
         errdefer self.work.clearRetainingCapacity();
         try buffer.validateColor(options.background);
-        if (max_work_items == 0) return error.InvalidOptions;
         // Reject before solving: a rejected one-call paint must not consume layout notifications.
         if (!allow_host and self.hook_count != 0) return error.UnsupportedResource;
         if (previous) |reply| {
@@ -763,14 +1154,12 @@ pub const Scene = struct {
             if (options.max_layout_rounds != active.options.max_layout_rounds or
                 options.max_host_requests != active.options.max_host_requests or
                 (reply.kind == api.OT_SCENE_FRAME_RECORD) != (recording != null)) return error.InvalidOptions;
-            self.attempt.?.remaining_work = if (active.restarted) std.math.maxInt(u32) else if (reply.kind == api.OT_SCENE_FRAME_YIELD) max_work_items else @min(active.remaining_work, max_work_items);
-            self.attempt.?.bounded_work = !active.restarted and (max_work_items != std.math.maxInt(u32) or (reply.kind != api.OT_SCENE_FRAME_YIELD and active.bounded_work));
             self.attempt.?.options = options;
             self.attempt.?.pending = null;
         } else {
             if (self.attempt != null or self.painted != null) return error.FrameBusy;
             // Every attempt ends in cancelFrame, so no attempt state survives into the next one.
-            std.debug.assert(self.feedback.items.len == 0 and self.prepared.items.len == 0 and self.preparation_stack.items.len == 0);
+            std.debug.assert(self.feedback.items.len == 0);
             std.debug.assert(self.paint_members.items.len == 0 and self.paint_slots.items.len == 0 and self.segments.items.len == 0);
             if (options.max_layout_rounds == 0 or options.max_host_requests == 0 or recording != null) return error.InvalidOptions;
             const frame_id = std.math.add(u64, self.last_frame_id, 1) catch return error.RequestLimit;
@@ -778,8 +1167,10 @@ pub const Scene = struct {
                 .root = if (self.root) |root| root.scene_node.?.handle else std.mem.zeroes(handles.Handle),
                 .frame_id = frame_id,
                 .options = options,
-                .remaining_work = max_work_items,
-                .bounded_work = max_work_items != std.math.maxInt(u32),
+            };
+            self.frame_work = .{
+                .work_frame_id = frame_id,
+                .full_path_reasons = if (self.forcesFullFrame()) renderer.FrameWork.full_path_forced else 0,
             };
             self.last_frame_id = frame_id;
             self.retryFailedMeasures();
@@ -787,29 +1178,19 @@ pub const Scene = struct {
         errdefer {
             self.releaseEditorCursor(cli);
             self.cancelFrame();
+            // A failed frame is never retained, and keeps the reasons it consumed.
+            cli.taint(renderer.FrameWork.full_path_unretained);
         }
         defer if (self.attempt != null) self.work.clearRetainingCapacity();
         const active = &self.attempt.?;
-        const reusable_work = active.request_id == 0 and !active.bounded_work and
-            self.hook_count == 0 and self.filter_count == 0;
+        const reusable_work = active.request_id == 0 and self.hook_count == 0 and self.filter_count == 0 and !self.forcesFullFrame();
         const root = if (active.root.context_id != 0) blk: {
             const value = objects.get(active.root, .native_renderable, native.NativeRenderable) catch return error.StaleFrame;
             if (self.root != value or value.scene_node == null or value.scene_node.?.owner != self) return error.StaleFrame;
             break :blk value;
         } else null;
         if (recording) |bytes| return self.paintRecorded(owner, cli, root, bytes);
-        const yielded = previous != null and previous.?.kind == api.OT_SCENE_FRAME_YIELD;
-        if (yielded and (self.preparation_dirty or try self.needsSolve(cli, root))) {
-            // A mutation accepted at a yield restarts preparation once. The restarted work
-            // runs without further yields, so steady mutations cannot starve the frame.
-            active.bounded_work = false;
-            active.remaining_work = std.math.maxInt(u32);
-            active.restarted = true;
-        }
-        // A restart during feedback finishes the queued feedback, then the dirty check below starts the round.
-        if (active.rounds == 0 or active.preparing != .none) {
-            if (!try self.prepareRound(objects, cli, root, reusable_work)) return self.request(root.?.scene_node.?, api.OT_SCENE_FRAME_YIELD);
-        }
+        if (active.rounds == 0) try self.prepareRound(objects, cli, root, reusable_work);
         while (true) {
             if (self.layout_pending) {
                 if (root) |value| {
@@ -824,10 +1205,9 @@ pub const Scene = struct {
             // No host call or scene mutation intervenes while this proof is reused.
             var visible_member: ?*native.NativeRenderable = null;
             while (self.feedback.items.len != 0) {
-                if (active.remaining_work == 0) return self.request(root.?.scene_node.?, api.OT_SCENE_FRAME_YIELD);
-                active.remaining_work -= 1;
                 const operation = self.feedback.pop().?;
-                if (builtin.is_test and operation.kind == .filtered_refresh) self.test_filtered_refresh_steps += 1;
+                self.frame_work.feedback_operations += 1;
+                if (operation.kind == .filtered_refresh) self.frame_work.viewport_child_refreshes += 1;
                 const value = objects.get(operation.node, .native_renderable, native.NativeRenderable) catch continue;
                 if (value.scene_node == null or value.scene_node.?.owner != self) continue;
                 const node = value.scene_node.?;
@@ -850,6 +1230,7 @@ pub const Scene = struct {
                         node.feedback_state = .started;
                         self.feedback.appendAssumeCapacity(.{ .node = node.handle, .kind = .children });
                         self.feedback.appendAssumeCapacity(.{ .node = node.handle, .kind = .prepass });
+                        if (node.hook_flags & api.OT_SCENE_HOOK_SCROLL != 0) self.feedback.appendAssumeCapacity(.{ .node = node.handle, .kind = .scroll });
                         self.feedback.appendAssumeCapacity(.{ .node = node.handle, .kind = .refresh });
                         if (node.hook_flags & (api.OT_SCENE_HOOK_UPDATE | api.OT_SCENE_HOOK_IDLE_UPDATE) != 0 and node.update_frame != active.frame_id) {
                             if (node.hook_flags & api.OT_SCENE_HOOK_UPDATE != 0) result = try self.request(node, api.OT_SCENE_FRAME_UPDATE);
@@ -860,9 +1241,21 @@ pub const Scene = struct {
                         result = try self.refresh(value, member != value);
                         if (operation.kind == .placed) node.placement = 0;
                     },
+                    .scroll => {
+                        // After the node's own refresh, so a reply reads this round's layout.
+                        const state = node.scroll.?;
+                        const current = state.observed();
+                        if (!std.meta.eql(current, state.reported)) {
+                            state.reported = current;
+                            result = try self.request(node, api.OT_SCENE_FRAME_SCROLL);
+                        }
+                    },
                     .prepass => {
+                        // The batch starts before placed children refresh, so their replies' stale marks survive it.
+                        if (operation.placement == 0 and node.filtersChildren() and
+                            (node.children_observed != self.layout_epoch or self.forcesFullFrame())) node.children_observed = children_refreshing;
                         // A resize callback can append to the live placement Set.
-                        self.feedback.appendAssumeCapacity(operation);
+                        self.feedback.appendAssumeCapacity(.{ .node = operation.node, .kind = .prepass, .placement = 1 });
                         const start = self.feedback.items.len;
                         for (node.children.items) |child| {
                             const state = child.scene_node.?;
@@ -884,11 +1277,14 @@ pub const Scene = struct {
                         if (operation.kind == .children) {
                             // Capture child order after the parent's callbacks, never midway through siblings.
                             sortChildren(node, active.frame_id);
-                            if (node.viewport != null) {
+                            if (node.filtersChildren()) {
                                 self.feedback.appendAssumeCapacity(.{ .node = node.handle, .kind = .select });
+                                // Refresh repeats its last result until a solve or a stale mark changes an input.
+                                if (node.children_observed == self.layout_epoch and !self.forcesFullFrame()) continue;
                                 for (node.paint_children.items, 0..) |child, index| {
                                     const state = child.scene_node.?;
                                     if (state.prepared_frame != active.frame_id or state.prepared_round != active.rounds) continue;
+                                    self.frame_work.viewport_child_refreshes += 1;
                                     if (try self.refresh(child, true)) |request_value| {
                                         // Snapshot the remaining batch before a host callback can change siblings.
                                         var remaining = node.paint_children.items.len;
@@ -906,8 +1302,12 @@ pub const Scene = struct {
                         }
                         // Drain every direct refresh before selecting a fixed update batch.
                         const filter = try self.childFilter(objects, value);
-                        const parent_layout = if (filter != null) try composedLayout(value, false) else Layout{};
-                        if (node.viewport != null) active.filter_selected = true;
+                        const origin = if (filter != null) childOrigin(node, try composedLayout(value, false)) else [2]f64{ 0, 0 };
+                        if (node.filtersChildren()) {
+                            active.filter_selected = true;
+                            // A stale mark during the batch keeps it unobserved for the next round.
+                            if (node.children_observed == children_refreshing) node.children_observed = self.layout_epoch;
+                        }
                         var index = node.paint_children.items.len;
                         while (index != 0) {
                             index -= 1;
@@ -915,9 +1315,9 @@ pub const Scene = struct {
                             if (state.prepared_frame != active.frame_id or state.prepared_round != active.rounds or state.feedback_state != .unseen) continue;
                             if (filter) |bounds| {
                                 var layout = state.layout;
-                                layout.screenX = parent_layout.screenX + @as(f64, layout.left) + state.paint.translateX;
-                                layout.screenY = parent_layout.screenY + @as(f64, layout.top) + state.paint.translateY;
-                                try validateLayout(layout);
+                                layout.screenX = origin[0] + @as(f64, layout.left) + state.paint.translateX;
+                                layout.screenY = origin[1] + @as(f64, layout.top) + state.paint.translateY;
+                                self.frame_work.overlap_tests += 1;
                                 if (!overlaps(bounds, layout)) continue;
                             }
                             self.feedback.appendAssumeCapacity(.{ .node = state.handle, .kind = .update });
@@ -928,14 +1328,14 @@ pub const Scene = struct {
                 if (result) |request_value| return request_value;
             }
             if (self.preparation_dirty or try self.needsSolve(cli, root)) {
-                if (!try self.prepareRound(objects, cli, root, reusable_work)) return self.request(root.?.scene_node.?, api.OT_SCENE_FRAME_YIELD);
+                try self.prepareRound(objects, cli, root, reusable_work);
                 continue;
             }
             // Resumed calls rebuild transient paint pointers from current accepted topology.
             if (self.work.items.len == 0 or self.hook_count != 0 or self.filter_count != 0) {
                 self.work.clearRetainingCapacity();
-                try self.work.ensureTotalCapacity(self.allocator, self.count);
-                if (root) |value| _ = try self.prepare(objects, value, cli.width, cli.height, .paint, false);
+                try self.work.ensureTotalCapacity(self.allocator, self.count + self.scroll_count);
+                if (root) |value| try self.prepare(objects, value, cli.width, cli.height, .paint);
                 // Paint layout reports where this frame paints, including transforms accepted after preparation.
                 for (self.work.items) |entry| {
                     entry.node.scene_node.?.layout.screenX = entry.layout.screenX;
@@ -944,20 +1344,31 @@ pub const Scene = struct {
             }
             if (self.hook_count != 0) {
                 for (self.work.items) |entry| {
-                    if (entry.node.scene_node.?.kind != api.OT_SCENE_ROOT and
+                    if (entry.node.scene_node.?.kind != api.OT_SCENE_ROOT and !entry.bars and
                         entry.node.scene_node.?.hook_flags & scene_paint_hook_flags != 0) return self.requestRecord(cli, root.?);
                 }
             }
             try self.markFocus(objects);
-            try self.paintFrame(owner, cli, active.options, null, false);
-            return self.finishPaint(cli, reusable_work);
+            const damage = try self.planPaint(objects, cli, active.options);
+            const verify = damage != .all and self.verifiesRetained();
+            // Next still holds the presented frame, unless a lease may have written current.
+            if (verify and !cli.current_written) try self.verifyRows(cli.getNextBuffer(), cli.getCurrentBuffer(), false);
+            if (damage == .none) {
+                try self.skipPaint(cli);
+                if (verify) try self.verifySkip(owner, cli, active.options);
+            } else {
+                try self.paintFrame(owner, cli, active.options, null, false);
+                if (verify and !cli.current_written) try self.verifyRows(cli.getNextBuffer(), cli.getCurrentBuffer(), true);
+            }
+            return self.finishPaint(cli, reusable_work, damage);
         }
     }
 
-    fn finishPaint(self: *Scene, cli: *renderer.CliRenderer, retain_work: bool) FrameRequest {
+    fn finishPaint(self: *Scene, cli: *renderer.CliRenderer, retain_work: bool, damage: Damage) FrameRequest {
         const active = self.attempt.?;
         std.debug.assert(self.painted == null);
         std.debug.assert(!retain_work or active.request_id == 0);
+        cli.retained_lost = 0;
         const done: FrameRequest = .{
             .session = self.session,
             .root = active.root,
@@ -977,9 +1388,13 @@ pub const Scene = struct {
         self.cancelFrame();
         self.work.items = work;
         self.cancelled_paint = false;
+        self.frame_work.host_requests = active.requests;
+        self.frame_work.layout_rounds = active.rounds;
         self.painted = .{
             .ticket = done,
             .destination = BufferIdentity.init(cli.getNextBuffer()),
+            .work = self.frame_work,
+            .damage = if (damage == .all) null else &self.damage,
         };
         return done;
     }
@@ -987,14 +1402,11 @@ pub const Scene = struct {
     fn request(self: *Scene, node: *Node, kind: u32) !FrameRequest {
         const active = &self.attempt.?;
         std.debug.assert(active.pending == null);
-        std.debug.assert(kind >= api.OT_SCENE_FRAME_UPDATE and kind <= api.OT_SCENE_FRAME_YIELD);
-        std.debug.assert(kind != api.OT_SCENE_FRAME_YIELD or !active.restarted);
-        // YIELD and RECORD name the root without describing it.
-        const whole_frame = kind == api.OT_SCENE_FRAME_YIELD or kind == api.OT_SCENE_FRAME_RECORD;
-        if (kind != api.OT_SCENE_FRAME_YIELD) {
-            if (active.requests == active.options.max_host_requests) return error.FrameRequestLimit;
-            active.requests += 1;
-        }
+        std.debug.assert(kind >= api.OT_SCENE_FRAME_UPDATE and kind <= api.OT_SCENE_FRAME_SCROLL);
+        // RECORD names the root without describing it.
+        const whole_frame = kind == api.OT_SCENE_FRAME_RECORD;
+        if (active.requests == active.options.max_host_requests) return error.FrameRequestLimit;
+        active.requests += 1;
         active.request_id = std.math.add(u64, active.request_id, 1) catch return error.RequestLimit;
         const result: FrameRequest = .{
             .session = self.session,
@@ -1006,8 +1418,8 @@ pub const Scene = struct {
             .hook_generation = if (whole_frame) 0 else node.hook_generation,
             .kind = kind,
             .num = if (whole_frame) 0 else node.num,
-            .width = if (whole_frame) 0 else @intFromFloat(node.layout.width),
-            .height = if (whole_frame) 0 else @intFromFloat(node.layout.height),
+            .width = if (whole_frame) 0 else cellSize(node.layout.width),
+            .height = if (whole_frame) 0 else cellSize(node.layout.height),
         };
         active.pending = result;
         return result;
@@ -1025,7 +1437,7 @@ pub const Scene = struct {
             try yoga.check(yoga.yogaNodeStyleGetEnumChecked(value.yoga_node, api.OT_STYLE_ENUM_DISPLAY, &display));
             visible = display != api.OT_DISPLAY_NONE;
         }
-        if (visible) try prepareView(node, node.layout);
+        if (visible) try prepareView(&self.frame_work, node, node.layout);
         const result = if (changed and node.hook_flags & api.OT_SCENE_HOOK_RESIZE != 0 and visible)
             try self.request(node, api.OT_SCENE_FRAME_RESIZE)
         else
@@ -1040,12 +1452,17 @@ pub const Scene = struct {
     }
 
     fn isVisibleMember(self: *Scene, value: *native.NativeRenderable) !bool {
+        const node = value.scene_node.?;
+        const active = self.attempt.?;
+        // Preparation enters only visible nodes, so its stamp answers until a display or ancestry change.
+        if (node.prepared_frame == active.frame_id and node.prepared_round == active.rounds and
+            active.visibility_epoch == self.visibility_epoch and !self.forcesFullFrame()) return node.layout_flags.prepared_visible;
         var cursor: ?*native.NativeRenderable = value;
         var depth: u32 = 0;
         while (cursor) |current| : (cursor = current.scene_node.?.parent) {
             if (depth == yoga.depth_max) return error.YogaDepthLimit;
             depth += 1;
-            if (builtin.is_test) self.test_visibility_steps += 1;
+            self.frame_work.visibility_steps += 1;
             var display: u32 = 0;
             try yoga.check(yoga.yogaNodeStyleGetEnumChecked(current.yoga_node, api.OT_STYLE_ENUM_DISPLAY, &display));
             if (display == api.OT_DISPLAY_NONE) return false;
@@ -1097,6 +1514,8 @@ pub const Scene = struct {
         if (!try self.needsSolve(cli, root)) return;
         const epoch = std.math.add(u64, self.layout_epoch, 1) catch return error.RequestLimit;
         try yoga.check(yoga.yogaNodeCalculateLayoutChecked(root.yoga_node, @floatFromInt(cli.width), @floatFromInt(cli.height), 1));
+        // A measurement outside a frame counts into work that the next attempt resets.
+        self.frame_work.yoga_solves += 1;
         self.layout_epoch = epoch;
         // A measurement-only solve must invalidate locals before the next prepared frame.
         self.solve_frame = frame_id;
@@ -1106,7 +1525,7 @@ pub const Scene = struct {
         self.layout_pending = true;
     }
 
-    fn prepareRound(self: *Scene, objects: *const handles.Table, cli: *renderer.CliRenderer, root: ?*native.NativeRenderable, reusable_work: bool) !bool {
+    fn prepareRound(self: *Scene, objects: *const handles.Table, cli: *renderer.CliRenderer, root: ?*native.NativeRenderable, reusable_work: bool) !void {
         const active = &self.attempt.?;
         const phases = self.layout_hook_count != 0 or self.filter_count != 0;
         const root_node = if (root) |value| value.scene_node.? else null;
@@ -1114,75 +1533,46 @@ pub const Scene = struct {
             self.work.items.len != 0 and !self.preparation_dirty and !try self.needsSolve(cli, root) and
             (root_node.?.prepared_frame > self.solve_frame or
                 (root_node.?.prepared_frame == self.solve_frame and root_node.?.prepared_round >= self.solve_round));
-        // Mutations accepted between preparation yields require another bounded round.
-        if (active.preparing != .none and (self.preparation_dirty or try self.needsSolve(cli, root))) {
-            active.preparing = .none;
-        }
-        if (active.preparing == .none) {
-            if (active.rounds == active.options.max_layout_rounds) return error.LayoutLimit;
-            if (!reuse) self.work.clearRetainingCapacity();
-            self.prepared.clearRetainingCapacity();
-            self.preparation_stack.clearRetainingCapacity();
-            self.feedback.clearRetainingCapacity();
-            try self.work.ensureTotalCapacity(self.allocator, self.count);
-            if (root) |value| try self.solveLayout(cli, value, active.frame_id, active.rounds + 1);
-            active.rounds += 1;
-            active.filter_selected = false;
-            self.preparation_dirty = false;
-            if (root != null and active.bounded_work) {
-                try self.prepared.ensureTotalCapacity(self.allocator, self.count);
-                try self.preparation_stack.resize(self.allocator, @min(self.count, yoga.depth_max));
-                self.preparation_stack.items[0] = .{
-                    .node = root.?.scene_node.?.handle,
-                    .parent = .{},
-                    .clip = .{ .x = 0, .y = 0, .width = cli.width, .height = cli.height },
-                    .opacity = 1,
-                };
-                active.prepare_depth = 1;
-                active.prepare_cursor = 0;
-                active.preparing = .traversal;
-            } else if (root) |value| {
-                if (!reuse) _ = try self.prepare(objects, value, cli.width, cli.height, .candidates, false);
+        if (active.rounds == active.options.max_layout_rounds) return error.LayoutLimit;
+        if (!reuse) self.work.clearRetainingCapacity();
+        self.feedback.clearRetainingCapacity();
+        try self.work.ensureTotalCapacity(self.allocator, self.count + self.scroll_count);
+        if (root) |value| try self.solveLayout(cli, value, active.frame_id, active.rounds + 1);
+        active.rounds += 1;
+        active.filter_selected = false;
+        self.preparation_dirty = false;
+        if (root) |value| {
+            self.scroll_toggled = false;
+            if (!reuse) try self.prepare(objects, value, cli.width, cli.height, .candidates);
+            // Hooks never see the layout a bar toggle replaces.
+            while (self.scroll_toggled) {
+                self.scroll_toggled = false;
+                if (active.rounds == active.options.max_layout_rounds) return error.LayoutLimit;
+                self.work.clearRetainingCapacity();
+                try self.solveLayout(cli, value, active.frame_id, active.rounds + 1);
+                active.rounds += 1;
+                try self.prepare(objects, value, cli.width, cli.height, .candidates);
             }
         }
-        if (active.preparing == .traversal) {
-            if (!try self.prepare(objects, root.?, cli.width, cli.height, .candidates, true)) return false;
-            active.preparing = .views;
-        }
-        if (active.preparing == .views) {
-            while (active.prepare_cursor < self.prepared.items.len) {
-                if (active.remaining_work == 0) return false;
-                active.remaining_work -= 1;
-                const entry = self.prepared.items[active.prepare_cursor];
-                active.prepare_cursor += 1;
-                const value = objects.get(entry.node, .native_renderable, native.NativeRenderable) catch continue;
-                if (!entry.filtered) try prepareView(value.scene_node.?, entry.layout);
-            }
-            // Publish only after every candidate and view has validated. Raw pointers never survive a yield.
-            for (self.prepared.items) |entry| {
-                const value = objects.get(entry.node, .native_renderable, native.NativeRenderable) catch continue;
-                self.work.appendAssumeCapacity(.{ .node = value, .layout = entry.layout, .clip = entry.clip, .opacity = entry.opacity, .visible = entry.visible, .filtered = entry.filtered });
-            }
-        } else {
-            for (self.work.items) |entry| {
-                if (reuse and !entry.visible) continue;
-                // Yoga measurement is observational; culled text keeps its last refreshed viewport.
-                if (!entry.filtered) try prepareView(entry.node.scene_node.?, entry.layout);
-            }
+        for (self.work.items) |entry| {
+            if ((reuse and !entry.visible) or entry.bars) continue;
+            // Yoga measurement is observational; culled text keeps its last refreshed viewport.
+            if (!entry.filtered) try prepareView(&self.frame_work, entry.node.scene_node.?, entry.layout);
         }
         if (phases) {
             // Prepass, filtered refresh, and selected updates never hold simultaneous batches for one parent.
-            const capacity = std.math.mul(usize, self.work.items.len, 4) catch return error.ObjectLimit;
+            const capacity = std.math.mul(usize, self.work.items.len, 5) catch return error.ObjectLimit;
             try self.feedback.ensureTotalCapacity(self.allocator, capacity);
         }
         for (self.work.items) |entry| {
             // Newly placed hidden nodes were observed by the producer, not subsequent frames.
-            if (reuse and !entry.visible) continue;
+            if ((reuse and !entry.visible) or entry.bars) continue;
             const node = entry.node.scene_node.?;
             node.layout = entry.layout;
             node.prepared_frame = active.frame_id;
             node.prepared_round = active.rounds;
             node.feedback_state = .unseen;
+            node.layout_flags.prepared_visible = entry.visible;
             if (!phases) {
                 if (entry.visible and node.hook_flags & api.OT_SCENE_HOOK_IDLE_UPDATE != 0) node.update_frame = active.frame_id;
                 // With hooks, hidden roots never enter refresh; placed hidden children still do.
@@ -1196,35 +1586,79 @@ pub const Scene = struct {
                 node.layout_flags.needs_layout = false;
             }
         }
-        self.prepared.clearRetainingCapacity();
-        self.preparation_stack.clearRetainingCapacity();
+        active.visibility_epoch = self.visibility_epoch;
         if (phases and self.work.items.len != 0) {
             const node = self.work.items[0].node.scene_node.?;
             self.feedback.appendAssumeCapacity(.{ .node = node.handle, .kind = .update });
             node.feedback_state = .queued;
         }
-        if (active.preparing == .views) self.work.clearRetainingCapacity();
-        active.preparing = .none;
-        return true;
     }
 
     fn releaseEditorCursor(self: *Scene, cli: *renderer.CliRenderer) void {
         if (!self.editor_cursor_owned) return;
+        if (builtin.is_test) self.test_cursor_steps += 1;
         cli.terminal.setCursorPosition(1, 1, false);
         self.editor_cursor_owned = false;
     }
 
-    fn beginPaint(self: *Scene, cli: *renderer.CliRenderer, options: FrameOptions) !void {
-        self.releaseEditorCursor(cli);
+    fn beginPaint(self: *Scene, cli: *renderer.CliRenderer, options: FrameOptions, members: usize) !void {
         const target = cli.getNextBuffer();
         target.clearScissorRects();
         target.clearOpacity();
-        cli.hitGridClearScissorRects();
         try target.scissor_stack.ensureTotalCapacity(self.allocator, 1);
         try target.opacity_stack.ensureTotalCapacity(self.allocator, 1);
         cli.setBackgroundColor(options.background);
         target.clear(options.background, if (options.preserve_unwritten) 0 else null);
-        @import("utils.zig").fillU32(cli.nextHitGrid, 0);
+        // The draft replaces the retained frame until its presentation; raw users then see the
+        // draft's cells, as before.
+        cli.next_scene_retained = false;
+        cli.retained_frame_id = 0;
+        self.frame_work.cells_cleared += @as(u64, target.width) * target.height;
+        self.settleHits(cli);
+        self.hits.clearRetainingCapacity();
+        // A bars entry adds a second hit.
+        try self.hits.ensureTotalCapacity(self.allocator, members + self.scroll_count);
+        self.hits_frame = self.attempt.?.frame_id;
+        self.hits_generation = cli.hits_generation;
+    }
+
+    /// The draft's hits become the presented ones once the renderer published its frame.
+    fn settleHits(self: *Scene, cli: *const renderer.CliRenderer) void {
+        if (self.hits_frame == 0 or self.hits_frame != cli.presented_hits_frame or self.hits_generation != cli.hits_generation) return;
+        std.mem.swap(std.ArrayListUnmanaged(Hit), &self.hits, &self.presented_hits);
+        self.presented_hits_frame = self.hits_frame;
+        self.hits_frame = 0;
+    }
+
+    /// The token of the topmost presented hit rectangle at a cell, or 0.
+    pub fn hitToken(self: *Scene, cli: *const renderer.CliRenderer, x: u32, y: u32) u32 {
+        self.settleHits(cli);
+        // Every hit lies inside the screen.
+        if (x >= cli.width or y >= cli.height or self.presented_hits_frame != cli.presented_hits_frame) return 0;
+        const hits = self.presented_hits.items;
+        const index = topmostHit(hits, x, y);
+        if (builtin.is_test) self.test_hit_steps += hits.len - (index orelse 0);
+        return if (index) |found| hits[found].token else 0;
+    }
+
+    /// Paint a box body at a host-chosen cell with the node's paint size and the current focus.
+    /// A node no frame has prepared has no cells and draws nothing.
+    pub fn paintBody(self: *const Scene, objects: *const handles.Table, target: *buffer.OptimizedBuffer, value: *const native.NativeRenderable, x: i32, y: i32) !void {
+        const node = value.scene_node.?;
+        std.debug.assert(node.kind == api.OT_SCENE_BOX);
+        var layout = try getPaintLayout(value);
+        layout.screenX = @floatFromInt(x);
+        layout.screenY = @floatFromInt(y);
+        layout = cellLayout(layout);
+        if (layout.width < 1 or layout.height < 1) return;
+        var focused = if (self.focus) |handle| try objects.get(handle, .native_renderable, native.NativeRenderable) else null;
+        var depth: u32 = 0;
+        const within = while (focused) |cursor| : (focused = cursor.scene_node.?.parent) {
+            if (cursor == value) break true;
+            if (depth == yoga.depth_max) return error.YogaDepthLimit;
+            depth += 1;
+        } else false;
+        try paintBox(target, node.paint, layout, within, node.control.box);
     }
 
     fn markFocus(self: *Scene, objects: *const handles.Table) !void {
@@ -1238,6 +1672,200 @@ pub const Scene = struct {
         }
     }
 
+    /// Counts every row as damaged and returns why the frame cannot compare its members with
+    /// the presented frame's. A recorded frame calls only this: hooks may draw anywhere in their
+    /// clip, so it keeps no records, and the frame after it has none to compare with.
+    fn fullPathReasons(self: *Scene, cli: *renderer.CliRenderer, options: FrameOptions) u32 {
+        if (self.records_frame != 0 and self.records_frame == cli.retained_frame_id) {
+            std.mem.swap(std.ArrayListUnmanaged(Record), &self.records, &self.presented_records);
+            self.presented_records_frame = self.records_frame;
+            self.presented_options = self.records_options;
+        }
+        // finishPaint consumes the reasons, so a failed frame keeps them.
+        var reasons = cli.retained_lost;
+        // Writes before this frame's paint are repainted; writes after it taint this frame.
+        cli.encode_all_rows = false;
+        if (self.forcesFullFrame()) reasons |= renderer.FrameWork.full_path_forced;
+        if (self.presented_records_frame == 0 or self.presented_records_frame != cli.retained_frame_id) reasons |= renderer.FrameWork.full_path_unretained;
+        if (reasons & renderer.FrameWork.full_path_unretained == 0 and
+            (!std.meta.eql(options.background, self.presented_options.background) or options.use_mouse != self.presented_options.use_mouse or
+                options.excluded_hit_num != self.presented_options.excluded_hit_num or options.preserve_unwritten != self.presented_options.preserve_unwritten))
+        {
+            reasons |= renderer.FrameWork.full_path_options;
+        }
+        if (cli.currentImages.items.len != 0 or cli.nextRenderBuffer.image_placements.items.len != 0) reasons |= renderer.FrameWork.full_path_images;
+        self.frame_work.full_path_reasons |= reasons;
+        self.frame_work.damage_rows = cli.height;
+        return reasons;
+    }
+
+    /// Records the frame's members and decides which rows can differ from the presented frame.
+    fn planPaint(self: *Scene, objects: *const handles.Table, cli: *renderer.CliRenderer, options: FrameOptions) !Damage {
+        const frame_id = self.attempt.?.frame_id;
+        var reasons = self.fullPathReasons(cli, options);
+        self.records.clearRetainingCapacity();
+        self.records_frame = frame_id;
+        self.records_options = options;
+        try self.records.ensureTotalCapacity(self.allocator, self.work.items.len);
+        for (self.work.items) |entry| {
+            // A scroll node's record covers its bars: their inputs change its paint epoch.
+            if (entry.node.scene_node.?.kind == api.OT_SCENE_ROOT or !entry.visible or entry.bars) continue;
+            self.record(entry, &reasons);
+        }
+        self.frame_work.full_path_reasons |= reasons;
+        if (reasons != 0) return .all;
+        try self.damage.resize(self.allocator, cli.height, false);
+        self.damage.unsetAll();
+        // Rows of every member whose inputs changed, before and after, and of every member that left.
+        for (self.records.items) |entry| {
+            const node = self.recordNode(objects, entry.token).?;
+            const old = self.recordOf(node, self.presented_records_frame, self.presented_records.items);
+            if (old != null and entry.stable and old.?.stable and std.meta.eql(old.?.inputs, entry.inputs)) continue;
+            self.damage.setRangeValue(.{ .start = entry.top, .end = entry.bottom }, true);
+            if (old) |previous| self.damageRows(previous);
+        }
+        for (self.presented_records.items) |previous| {
+            const node = self.recordNode(objects, previous.token) orelse {
+                self.damageRows(previous);
+                continue;
+            };
+            if (self.recordOf(node, frame_id, self.records.items) == null) self.damageRows(previous);
+        }
+        const rows = self.damage.count();
+        self.frame_work.damage_rows = @intCast(rows);
+        return if (rows == 0) .none else .rows;
+    }
+
+    fn damageRows(self: *Scene, previous: Record) void {
+        // A resize takes the full path, so presented rows fit the screen.
+        self.damage.setRangeValue(.{ .start = previous.top, .end = @min(previous.bottom, self.damage.bit_length) }, true);
+    }
+
+    fn recordNode(self: *const Scene, objects: *const handles.Table, token: u32) ?*Node {
+        const handle = self.tokens.get(token) orelse return null;
+        const value = objects.get(handle, .native_renderable, native.NativeRenderable) catch return null;
+        return value.scene_node;
+    }
+
+    fn recordOf(_: *const Scene, node: *const Node, frame: u64, records: []const Record) ?Record {
+        std.debug.assert(frame != 0);
+        for (node.records) |slot| {
+            if (slot.frame == frame) return records[slot.index];
+        }
+        return null;
+    }
+
+    fn record(self: *Scene, entry: Work, reasons: *u32) void {
+        const node = entry.node.scene_node.?;
+        if (node.kind == api.OT_SCENE_IMAGE) reasons.* |= renderer.FrameWork.full_path_images;
+        const cells = cellLayout(entry.layout);
+        const x: i32 = @intFromFloat(cells.screenX);
+        const y: i32 = @intFromFloat(cells.screenY);
+        var painted = intersection(.{ .x = x, .y = y, .width = @intFromFloat(cells.width), .height = @intFromFloat(cells.height) }, entry.clip);
+        // A surface draws at its own size, which can pass the node's rows.
+        if (entry.node.surface) |source| {
+            if (source.image_placements.items.len != 0) reasons.* |= renderer.FrameWork.full_path_images;
+            const drawn = intersection(.{ .x = x, .y = y, .width = source.width, .height = source.height }, entry.clip);
+            if (drawn.height > painted.height) painted = drawn;
+        }
+        var resource_epoch: u64 = 0;
+        var styled = false;
+        if (node.kind == api.OT_SCENE_TEXT_VIEW) {
+            if (node.control.text_view.view) |view| {
+                resource_epoch = view.paint_epoch;
+                styled = view.text.buffer.getSyntaxStyle() != null;
+            }
+        } else if (node.editor) |editor| {
+            resource_epoch = editor.paint_epoch;
+            styled = editor.edit.buffer.tb.getSyntaxStyle() != null;
+        }
+        const slot: usize = @intFromBool(node.records[0].frame == self.presented_records_frame and self.presented_records_frame != 0);
+        node.records[slot] = .{ .frame = self.records_frame, .index = @intCast(self.records.items.len) };
+        self.records.appendAssumeCapacity(.{
+            .token = node.token,
+            .top = @intCast(painted.y),
+            .bottom = @intCast(painted.y + @as(i64, painted.height)),
+            .stable = entry.node.surface == null,
+            .inputs = .{
+                .layout = entry.layout,
+                .clip = entry.clip,
+                .opacity = entry.opacity,
+                .rank = @intCast(self.records.items.len),
+                .focused = node.focus_frame == self.attempt.?.frame_id,
+                .node_epoch = node.paint_epoch,
+                .resource_epoch = resource_epoch,
+                .styled = styled,
+            },
+        });
+    }
+
+    /// The presented frame stays: no cells, hits, or rows change. The cursor follows the
+    /// focused editor as on every frame.
+    fn skipPaint(self: *Scene, cli: *renderer.CliRenderer) !void {
+        self.settleHits(cli);
+        self.hits.clearRetainingCapacity();
+        try self.hits.appendSlice(self.allocator, self.presented_hits.items);
+        self.hits_frame = self.attempt.?.frame_id;
+        self.hits_generation = cli.hits_generation;
+        var cursor: ?Work = null;
+        for (self.work.items) |entry| {
+            if (entry.node.scene_node.?.kind != api.OT_SCENE_ROOT and entry.visible and self.focusedEditor(entry.node.scene_node.?)) cursor = entry;
+        }
+        self.maintainCursor(cli, cursor);
+    }
+
+    /// OT_SCENE_DEBUG_VERIFY: every row of two buffers, or every row outside the damage, holds
+    /// the same cells.
+    fn verifyRows(self: *const Scene, first: *const buffer.OptimizedBuffer, second: *const buffer.OptimizedBuffer, outside_damage: bool) !void {
+        const width = first.width;
+        for (0..first.height) |row| {
+            if (outside_damage and self.damage.isSet(row)) continue;
+            const start = row * width;
+            const end = start + width;
+            const a = first.buffer;
+            const b = second.buffer;
+            if (!std.mem.eql(u32, a.char[start..end], b.char[start..end]) or !std.mem.eql(u32, a.attributes[start..end], b.attributes[start..end]) or
+                !std.mem.eql(u8, std.mem.sliceAsBytes(a.fg[start..end]), std.mem.sliceAsBytes(b.fg[start..end])) or
+                !std.mem.eql(u8, std.mem.sliceAsBytes(a.bg[start..end]), std.mem.sliceAsBytes(b.bg[start..end]))) return error.RetainedMismatch;
+        }
+    }
+
+    /// OT_SCENE_DEBUG_VERIFY on a skipped frame: a full repaint into a scratch buffer equals the
+    /// kept cells, and its hits the kept hits. It changes no view, cursor, counter, hit, or
+    /// buffer the frame keeps.
+    fn verifySkip(self: *Scene, owner: *Context, cli: *renderer.CliRenderer, options: FrameOptions) !void {
+        const next = cli.getNextBuffer();
+        const scratch = try buffer.OptimizedBuffer.init(self.allocator, next.width, next.height, .{ .pool = next.pool, .link_pool = next.link_pool, .logger = next.logger, .width_method = next.width_method, .id = "verify buffer" });
+        defer scratch.deinit();
+        scratch.respectAlpha = next.respectAlpha;
+        scratch.blendBackdropColor = next.blendBackdropColor;
+        try scratch.scissor_stack.ensureTotalCapacity(self.allocator, 1);
+        try scratch.opacity_stack.ensureTotalCapacity(self.allocator, 1);
+        scratch.clear(options.background, if (options.preserve_unwritten) 0 else null);
+        const kept = self.hits;
+        self.hits = .empty;
+        defer {
+            self.hits.deinit(self.allocator);
+            self.hits = kept;
+        }
+        try self.hits.ensureTotalCapacity(self.allocator, self.work.items.len + self.scroll_count);
+        const work = self.frame_work;
+        defer self.frame_work = work;
+        self.verify_target = scratch;
+        defer self.verify_target = null;
+        for (self.work.items) |entry| {
+            if (entry.node.scene_node.?.kind == api.OT_SCENE_ROOT or !entry.visible) continue;
+            try self.paintMember(owner, cli, entry, options, .{});
+        }
+        try self.verifyRows(scratch, next, false);
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(self.hits.items), std.mem.sliceAsBytes(kept.items))) return error.RetainedMismatch;
+    }
+
+    /// Where paint draws: next, or the scratch buffer of a verified skip.
+    fn paintTarget(self: *const Scene, cli: *renderer.CliRenderer) *buffer.OptimizedBuffer {
+        return self.verify_target orelse cli.getNextBuffer();
+    }
+
     /// Snapshot prepared membership and return one request for every paint hook.
     fn requestRecord(self: *Scene, cli: *renderer.CliRenderer, root: *native.NativeRenderable) !FrameRequest {
         std.debug.assert(self.paint_members.items.len == 0 and self.paint_slots.items.len == 0);
@@ -1249,7 +1877,7 @@ pub const Scene = struct {
             std.debug.assert(entry.visible);
             if (node.kind == api.OT_SCENE_ROOT) continue;
             member_count += 1;
-            slot_count += @intFromBool(node.hook_flags & scene_paint_hook_flags != 0);
+            slot_count += @intFromBool(!entry.bars and node.hook_flags & scene_paint_hook_flags != 0);
         }
         std.debug.assert(slot_count != 0);
         try self.paint_members.ensureTotalCapacityPrecise(self.allocator, member_count);
@@ -1258,7 +1886,7 @@ pub const Scene = struct {
         for (self.work.items) |entry| {
             const node = entry.node.scene_node.?;
             if (node.kind == api.OT_SCENE_ROOT) continue;
-            const hooks = node.hook_flags & scene_paint_hook_flags;
+            const hooks = if (entry.bars) 0 else node.hook_flags & scene_paint_hook_flags;
             var slot: u32 = no_slot;
             if (hooks != 0) {
                 slot = @intCast(self.paint_slots.items.len);
@@ -1267,7 +1895,7 @@ pub const Scene = struct {
                     .num = node.num,
                     .hooks = hooks,
                     .hook_generation = node.hook_generation,
-                    .layout = entry.layout,
+                    .layout = cellLayout(entry.layout),
                     .public_layout = composedLayout(entry.node, true) catch null,
                     .clip = entry.clip,
                     .opacity = entry.opacity,
@@ -1279,6 +1907,7 @@ pub const Scene = struct {
                 .clip = entry.clip,
                 .opacity = entry.opacity,
                 .filtered = entry.filtered,
+                .bars = entry.bars,
                 .slot = slot,
             });
         }
@@ -1294,8 +1923,9 @@ pub const Scene = struct {
         try self.markFocus(&owner.objects);
         // Hooks may change text or views after preparation; refresh them before drawing.
         const refresh_views = self.preparation_dirty or try self.needsSolve(cli, root);
+        _ = self.fullPathReasons(cli, self.attempt.?.options);
         try self.paintFrame(owner, cli, self.attempt.?.options, recording, refresh_views);
-        return self.finishPaint(cli, false);
+        return self.finishPaint(cli, false, .all);
     }
 
     const Phases = struct {
@@ -1308,52 +1938,64 @@ pub const Scene = struct {
     /// the visible paint list with native bodies only.
     fn paintFrame(self: *Scene, owner: *Context, cli: *renderer.CliRenderer, options: FrameOptions, recording: ?[]const u8, refresh_views: bool) !void {
         const target = cli.getNextBuffer();
-        errdefer {
-            target.clear(cli.backgroundColor, null);
-            @memset(cli.nextHitGrid, 0);
-        }
+        errdefer target.clear(cli.backgroundColor, null);
         defer target.clearScissorRects();
         defer target.clearOpacity();
-        try self.beginPaint(cli, options);
-        const bytes = recording orelse {
-            for (self.work.items) |entry| {
-                if (entry.node.scene_node.?.kind == api.OT_SCENE_ROOT or !entry.visible) continue;
-                try self.paintMember(owner, cli, entry, options, .{});
-            }
-            return;
+        try self.beginPaint(cli, options, if (recording == null) self.work.items.len else self.paint_members.items.len);
+        // The focused editor among the painted members owns the cursor, wherever it paints.
+        var cursor: ?Work = null;
+        if (recording == null) for (self.work.items) |entry| {
+            if (entry.node.scene_node.?.kind == api.OT_SCENE_ROOT or !entry.visible) continue;
+            try self.paintMember(owner, cli, entry, options, .{});
+            if (self.focusedEditor(entry.node.scene_node.?)) cursor = entry;
         };
-        for (self.paint_members.items) |member| {
+        if (recording) |bytes| for (self.paint_members.items) |member| {
             const value = owner.objects.get(member.node, .native_renderable, native.NativeRenderable) catch continue;
             std.debug.assert(value.scene_node.?.owner == self);
-            try validateLayout(member.layout);
-            const entry: Work = .{ .node = value, .layout = member.layout, .clip = member.clip, .opacity = member.opacity, .visible = true, .filtered = member.filtered or refresh_views };
+            const entry: Work = .{ .node = value, .layout = member.layout, .clip = member.clip, .opacity = member.opacity, .visible = true, .filtered = member.filtered or refresh_views, .bars = member.bars };
             const phases: Phases = if (member.slot == no_slot) .{} else .{
                 .recording = bytes,
                 .segments = self.segments.items[member.slot],
                 .hooks = self.paint_slots.items[member.slot].hooks,
             };
             try self.paintMember(owner, cli, entry, options, phases);
-        }
+            if (self.focusedEditor(value.scene_node.?)) cursor = entry;
+        };
+        self.maintainCursor(cli, cursor);
+    }
+
+    fn focusedEditor(self: *const Scene, node: *const Node) bool {
+        return node.editor != null and self.focus != null and std.meta.eql(self.focus.?, node.handle);
     }
 
     fn paintMember(self: *Scene, owner: *Context, cli: *renderer.CliRenderer, entry: Work, options: FrameOptions, phases: Phases) !void {
         const node = entry.node.scene_node.?;
-        if (phases.hooks != 0 or node.kind != api.OT_SCENE_BOX or hasBoxPaint(&node.paint)) {
-            if (builtin.is_test) self.test_paint_setups += 1;
-            const target = cli.getNextBuffer();
+        if (entry.bars) return self.paintBars(cli, entry, options);
+        const cells = cellLayout(entry.layout);
+        const painted = intersection(.{
+            .x = @intFromFloat(cells.screenX),
+            .y = @intFromFloat(cells.screenY),
+            .width = @intFromFloat(cells.width),
+            .height = @intFromFloat(cells.height),
+        }, entry.clip);
+        if (phases.hooks != 0 or node.kind != api.OT_SCENE_BOX or hasBoxPaint(&node.paint) or hasFills(node)) {
+            self.frame_work.member_cells += @as(u64, painted.width) * painted.height;
+            const target = self.paintTarget(cli);
             // A natively composed image buffer receives its node's hook drawing, like its body.
             const surface = if (node.kind == api.OT_SCENE_IMAGE) node.control.image.buffer else null;
             try enterMember(target, entry);
-            if (node.kind == api.OT_SCENE_IMAGE) try beginImagePaint(node.control.image, entry.layout);
+            if (node.kind == api.OT_SCENE_IMAGE) try beginImagePaint(node.control.image, cells);
             try playPhase(owner, target, surface, entry, phases, api.OT_SCENE_RECORD_PHASE_BEFORE);
             if (phases.hooks & api.OT_SCENE_HOOK_RENDER_SELF != 0) {
                 try playPhase(owner, target, surface, entry, phases, api.OT_SCENE_RECORD_PHASE_SELF);
-            } else try self.paintNode(cli, entry);
-            if (node.kind == api.OT_SCENE_EDITOR) try self.paintEditorCursor(cli, node, entry.layout);
+            } else try self.paintNode(cli, entry, cells);
             try playPhase(owner, target, surface, entry, phases, api.OT_SCENE_RECORD_PHASE_AFTER);
-            if (node.kind == api.OT_SCENE_IMAGE) try finishImagePaint(target, node.control.image, entry.layout);
+            if (node.kind == api.OT_SCENE_IMAGE) try finishImagePaint(target, node.control.image, cells);
         }
-        addHit(cli, entry.layout, entry.clip, node.num, node.token, options);
+        self.frame_work.members_painted += 1;
+        if (!options.use_mouse or node.num == options.excluded_hit_num) return;
+        // The clip lies inside the screen, so hit coordinates are never negative.
+        if (painted.width != 0 and painted.height != 0) self.hits.appendAssumeCapacity(.{ .x = @intCast(painted.x), .y = @intCast(painted.y), .width = painted.width, .height = painted.height, .token = node.token });
     }
 
     /// Each phase starts with only the member's inherited clip and opacity.
@@ -1379,34 +2021,75 @@ pub const Scene = struct {
         try scene_record.play(owner, local, 0, phases.recording, segment);
     }
 
-    fn paintNode(self: *Scene, cli: *renderer.CliRenderer, entry: Work) !void {
-        const target = cli.getNextBuffer();
+    fn paintNode(self: *Scene, cli: *renderer.CliRenderer, entry: Work, cells: Layout) !void {
+        const target = self.paintTarget(cli);
         const node = entry.node.scene_node.?;
-        const x: i32 = @intFromFloat(entry.layout.screenX);
-        const y: i32 = @intFromFloat(entry.layout.screenY);
-        const width: u32 = @intFromFloat(entry.layout.width);
-        const height: u32 = @intFromFloat(entry.layout.height);
+        const x: i32 = @intFromFloat(cells.screenX);
+        const y: i32 = @intFromFloat(cells.screenY);
+        const width: u32 = @intFromFloat(cells.width);
+        const height: u32 = @intFromFloat(cells.height);
         if (node.text) |text| {
-            if (entry.filtered) try prepareView(node, entry.layout);
+            if (entry.filtered and self.verify_target == null) try prepareView(&self.frame_work, node, entry.layout);
             const hit = intersection(.{ .x = x, .y = y, .width = width, .height = height }, entry.clip);
             if (hit.width != 0 and hit.height != 0) try target.drawTextBufferChecked(text.view, x, y);
         } else if (node.kind == api.OT_SCENE_TEXT_VIEW) {
             const view = node.control.text_view.view orelse return;
-            if (entry.filtered or self.preparation_dirty) try prepareView(node, entry.layout);
+            if ((entry.filtered or self.preparation_dirty) and self.verify_target == null) try prepareView(&self.frame_work, node, entry.layout);
             if (!node.control.text_view.paint) return;
             const hit = intersection(.{ .x = x, .y = y, .width = width, .height = height }, entry.clip);
             if (hit.width != 0 and hit.height != 0) try target.drawTextBufferChecked(view.view, x, y);
         } else if (node.kind == api.OT_SCENE_EDITOR) {
             const editor = node.editor orelse return;
-            if (entry.filtered or self.preparation_dirty) try prepareView(node, entry.layout);
+            if ((entry.filtered or self.preparation_dirty) and self.verify_target == null) try prepareView(&self.frame_work, node, entry.layout);
             const hit = intersection(.{ .x = x, .y = y, .width = width, .height = height }, entry.clip);
             if (hit.width != 0 and hit.height != 0) try target.drawEditorViewChecked(editor.view, x, y);
         } else if (node.kind == api.OT_SCENE_IMAGE) {
-            try paintImage(cli, node.control.image, entry.layout);
+            try paintImage(cli, node.control.image, cells);
         } else if (entry.node.surface) |source| {
             try Context.drawContextBuffer(target, source, x, y, .{});
         } else {
-            try paintControl(target, node.kind, node.control, node.paint, entry.layout, entry.clip, node.focus_frame == self.attempt.?.frame_id);
+            try paintControl(target, node.kind, node.control, node.paint, cells, entry.clip, node.focus_frame == self.attempt.?.frame_id);
+            if (node.scroll != null) paintScrollFills(target, node, cells);
+        }
+    }
+
+    /// The wrapper, viewport, and content fills, in that order, under the children.
+    fn paintScrollFills(target: *buffer.OptimizedBuffer, node: *const Node, box: Layout) void {
+        const state = node.scroll.?;
+        const sides = node.paint.borderSides;
+        const viewport = cellClip(scrollViewport(state, box));
+        // The inner rect minus the vertical gutter: the horizontal bar's columns, the vertical bar's rows.
+        const columns = state.barRects(0, box, sides).bar;
+        const rows = state.barRects(1, box, sides).bar;
+        const wrapper: Layout = .{ .screenX = columns.screenX, .screenY = rows.screenY, .width = columns.width, .height = rows.height };
+        const origin = childOrigin(node, box);
+        const content = intersection(viewport, cellClip(.{ .screenX = origin[0], .screenY = origin[1], .width = state.extent[0], .height = state.extent[1] }));
+        for (state.options.fills, [_]buffer.ClipRect{ cellClip(wrapper), viewport, content }) |fill, area| {
+            if (fill) |rgba| target.fillRectClipped(area.x, area.y, area.width, area.height, rgba);
+        }
+    }
+
+    /// A scroll node's visible bars and arrows, after its children; their cells hit the node.
+    fn paintBars(self: *Scene, cli: *renderer.CliRenderer, entry: Work, options: FrameOptions) !void {
+        const node = entry.node.scene_node.?;
+        const state = node.scroll.?;
+        const target = self.paintTarget(cli);
+        const box = cellLayout(entry.layout);
+        try enterMember(target, entry);
+        for (0..2) |axis| {
+            if (!state.visible[axis]) continue;
+            const rects = state.barRects(axis, box, node.paint.borderSides);
+            if (rects.track.width >= 1 and rects.track.height >= 1) try paintSlider(target, state.slider(axis), rects.track, entry.clip);
+            if (state.options.bars[axis].arrows) for (rects.arrows, 0..) |arrow, end| {
+                if (arrow.width < 1 or arrow.height < 1) continue;
+                const glyph = state.arrows[axis][end];
+                const direction = if (axis == 1) end else 2 + end;
+                try target.drawTextChecked(glyph.text orelse arrows[direction], @intFromFloat(arrow.screenX), @intFromFloat(arrow.screenY), glyph.foreground, glyph.background, glyph.attributes);
+            };
+            const hit = intersection(cellClip(rects.bar), entry.clip);
+            if (options.use_mouse and node.num != options.excluded_hit_num and hit.width != 0 and hit.height != 0) {
+                self.hits.appendAssumeCapacity(.{ .x = @intCast(hit.x), .y = @intCast(hit.y), .width = hit.width, .height = hit.height, .token = node.token });
+            }
         }
     }
 
@@ -1452,35 +2135,32 @@ pub const Scene = struct {
         }
         const x = (if (state.buffer != null) @as(f64, 0) else layout.screenX) + @floor((layout.width - width) / 2);
         const y = (if (state.buffer != null) @as(f64, 0) else layout.screenY) + @floor((layout.height - height) / 2);
-        const pixel_width = if (has_resolution) @max(1, @round(width * cell_width)) else 0;
-        const pixel_height = if (has_resolution) @max(1, @round(height * cell_height)) else 0;
-        if (x < std.math.minInt(i32) or x > std.math.maxInt(i32) or y < std.math.minInt(i32) or y > std.math.maxInt(i32) or
-            pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) return error.InvalidDimensions;
+        // Pixel sizes saturate like cell geometry; the terminal only shows the visible part.
+        const pixel_width = if (has_resolution) std.math.clamp(@round(width * cell_width), 1, std.math.maxInt(u32)) else 0;
+        const pixel_height = if (has_resolution) std.math.clamp(@round(height * cell_height), 1, std.math.maxInt(u32)) else 0;
+        // Paint geometry fits i32 cells, and the image stays within its node.
+        std.debug.assert(x >= std.math.minInt(i32) and x <= std.math.maxInt(i32) and y >= std.math.minInt(i32) and y <= std.math.maxInt(i32));
         const target = state.buffer orelse cli.getNextBuffer();
         _ = try target.drawImage(source, source.render_id, @intFromFloat(x), @intFromFloat(y), @intFromFloat(width), @intFromFloat(height), @intFromFloat(pixel_width), @intFromFloat(pixel_height), source_x, source_y, source_width, source_height, state.protocol);
     }
 
-    fn paintEditorCursor(self: *Scene, cli: *renderer.CliRenderer, node: *const Node, layout: Layout) !void {
-        // Cursor maintenance follows self drawing even when a host hook replaces the body.
-        const editor = node.editor orelse return;
-        if (self.focus == null or !std.meta.eql(self.focus.?, node.handle)) return;
+    /// Once per painted frame: place the cursor for the focused editor member, or release it.
+    /// The cursor follows the editor even when a host hook replaces its body.
+    fn maintainCursor(self: *Scene, cli: *renderer.CliRenderer, focused: ?Work) void {
+        const entry = focused orelse return self.releaseEditorCursor(cli);
+        if (builtin.is_test) self.test_cursor_steps += 1;
+        const node = entry.node.scene_node.?;
+        const layout = cellLayout(entry.layout);
         if (node.control.editor.mouse_pointer < std.meta.tags(@import("terminal.zig").MousePointerStyle).len) cli.terminal.setMousePointerStyle(@enumFromInt(node.control.editor.mouse_pointer));
-        if (!node.control.editor.show_cursor) return;
-        const cursor = editor.view.getVisualCursor();
-        const cursor_x = @max(1, layout.screenX + @as(f64, @floatFromInt(cursor.visual_col)) + 1);
-        const cursor_y = @max(1, layout.screenY + @as(f64, @floatFromInt(cursor.visual_row)) + 1);
+        if (!node.control.editor.show_cursor) return self.releaseEditorCursor(cli);
+        const cursor = node.editor.?.view.getVisualCursor();
         // Terminal keeps zero-based row/column in u16 alongside its public position.
         const position_max = @as(f64, std.math.maxInt(u16)) + 1;
-        if (cursor_x > position_max or cursor_y > position_max) return error.InvalidDimensions;
-        const style: @import("terminal.zig").CursorStyle = switch (node.control.editor.style) {
-            0 => .block,
-            1 => .line,
-            2 => .underline,
-            3 => .default,
-            else => return error.InvalidOptions,
-        };
+        const cursor_x = std.math.clamp(layout.screenX + @as(f64, @floatFromInt(cursor.visual_col)) + 1, 1, position_max);
+        const cursor_y = std.math.clamp(layout.screenY + @as(f64, @floatFromInt(cursor.visual_row)) + 1, 1, position_max);
         cli.terminal.setCursorPosition(@intFromFloat(cursor_x), @intFromFloat(cursor_y), true);
-        cli.terminal.setCursorStyle(style, node.control.editor.blinking);
+        // Styles 0 to 3 are the enum's order; sceneSetEditorOptions rejects others.
+        cli.terminal.setCursorStyle(@enumFromInt(node.control.editor.style), node.control.editor.blinking);
         cli.terminal.setCursorColor(node.control.editor.color);
         self.editor_cursor_owned = true;
     }
@@ -1503,6 +2183,11 @@ pub const Scene = struct {
         }
     }
 
+    fn hasFills(node: *const Node) bool {
+        const state = node.scroll orelse return false;
+        return state.options.fills[0] != null or state.options.fills[1] != null or state.options.fills[2] != null;
+    }
+
     fn hasBoxPaint(paint_options: *const Paint) bool {
         return paint_options.borderSides != api.OT_BORDER_NONE or (paint_options.shouldFill != 0 and paint_options.background[3] != 0);
     }
@@ -1521,17 +2206,6 @@ pub const Scene = struct {
         }
     }
 
-    fn addHit(cli: *renderer.CliRenderer, layout: Layout, clip: buffer.ClipRect, num: u32, token: u32, options: FrameOptions) void {
-        if (!options.use_mouse or num == options.excluded_hit_num) return;
-        const hit = intersection(.{
-            .x = @intFromFloat(layout.screenX),
-            .y = @intFromFloat(layout.screenY),
-            .width = @intFromFloat(layout.width),
-            .height = @intFromFloat(layout.height),
-        }, clip);
-        cli.addToHitGrid(hit.x, hit.y, hit.width, hit.height, token);
-    }
-
     fn viewportNode(self: *Scene, objects: *const handles.Table, handle: handles.Handle) !*native.NativeRenderable {
         const value = try objects.get(handle, .native_renderable, native.NativeRenderable);
         const node = value.scene_node orelse return error.WrongKind;
@@ -1542,48 +2216,41 @@ pub const Scene = struct {
 
     fn childFilter(self: *Scene, objects: *const handles.Table, value: *native.NativeRenderable) !?Filter {
         const node = value.scene_node.?;
-        const viewport = try self.viewportNode(objects, node.viewport orelse return null);
-        const layout = try composedLayout(viewport, false);
-        try validateLayout(layout);
+        if (!node.filtersChildren()) return null;
+        const layout = if (node.scroll) |state|
+            scrollViewport(state, try composedLayout(value, false))
+        else
+            try composedLayout(try self.viewportNode(objects, node.viewport.?), false);
         // The cutoff includes hidden children and changes selection, not refresh ordering.
         if (node.children.items.len < 16 and layout.width > 0 and layout.height > 0) return null;
         var direction: u32 = 0;
-        try yoga.check(yoga.yogaNodeStyleGetEnumChecked(value.yoga_node, api.OT_STYLE_ENUM_FLEX_DIRECTION, &direction));
+        try yoga.check(yoga.yogaNodeStyleGetEnumChecked(node.childYoga(value), api.OT_STYLE_ENUM_FLEX_DIRECTION, &direction));
         return .{ .viewport = layout, .row = direction == api.OT_FLEX_DIRECTION_ROW or direction == api.OT_FLEX_DIRECTION_ROW_REVERSE };
     }
 
-    fn prepare(self: *Scene, objects: *const handles.Table, root: *native.NativeRenderable, width: u32, height: u32, mode: enum { candidates, paint }, comptime retained: bool) !bool {
-        var local_stack: [if (retained) 0 else yoga.depth_max]PreparationFrame(false) = undefined;
-        const stack = if (retained) self.preparation_stack.items else &local_stack;
-        if (!retained) stack[0] = .{ .node = root, .parent = .{}, .clip = .{ .x = 0, .y = 0, .width = width, .height = height }, .opacity = 1 };
-        var depth: usize = if (retained) self.attempt.?.prepare_depth else 1;
-        defer if (retained) {
-            self.attempt.?.prepare_depth = depth;
-        };
+    fn prepare(self: *Scene, objects: *const handles.Table, root: *native.NativeRenderable, width: u32, height: u32, mode: enum { candidates, paint }) !void {
+        var stack: [yoga.depth_max]PreparationFrame = undefined;
+        stack[0] = .{ .node = root, .parent = .{}, .clip = .{ .x = 0, .y = 0, .width = width, .height = height }, .opacity = 1 };
+        var depth: usize = 1;
         while (depth != 0) {
             const frame = &stack[depth - 1];
-            const value = if (retained) objects.get(frame.node, .native_renderable, native.NativeRenderable) catch {
-                depth -= 1;
-                continue;
-            } else frame.node;
+            const value = frame.node;
             const node = value.scene_node.?;
             if (!frame.entered) {
-                if (retained) {
-                    if (self.attempt.?.remaining_work == 0) return false;
-                    self.attempt.?.remaining_work -= 1;
+                switch (mode) {
+                    .candidates => self.frame_work.candidate_visits += 1,
+                    .paint => self.frame_work.paint_visits += 1,
                 }
-                if (builtin.is_test) self.test_prepare_steps += 1;
                 // Yoga style changes dirty layout; the completed preparation stamps qualify both caches.
                 const refresh_layout = mode == .candidates and (node.prepared_frame == 0 or node.prepared_frame < self.solve_frame or
                     (node.prepared_frame == self.solve_frame and node.prepared_round < self.solve_round));
                 if (refresh_layout) {
                     var display: u32 = 0;
-                    if (builtin.is_test) self.test_style_reads += 1;
                     try yoga.check(yoga.yogaNodeStyleGetEnumChecked(value.yoga_node, api.OT_STYLE_ENUM_DISPLAY, &display));
                     node.layout_flags.display_none = display == api.OT_DISPLAY_NONE;
                 }
                 const visible = !node.layout_flags.display_none;
-                const filtered_child = if (node.parent) |parent| parent.scene_node.?.viewport != null else false;
+                const filtered_child = if (node.parent) |parent| parent.scene_node.?.filtersChildren() else false;
                 if (!visible and (mode == .paint or (!node.layout_flags.needs_layout and !filtered_child))) {
                     depth -= 1;
                     continue;
@@ -1591,9 +2258,8 @@ pub const Scene = struct {
                 var layout = node.layout;
                 if (refresh_layout) {
                     var computed: yoga.ExternalYogaLayout = undefined;
-                    if (builtin.is_test) self.test_geometry_reads += 1;
+                    self.frame_work.geometry_reads += 1;
                     try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(value.yoga_node, &computed));
-                    if (!std.math.isFinite(computed.width) or !std.math.isFinite(computed.height)) return error.InvalidDimensions;
                     layout = .{
                         .left = computed.left,
                         .top = computed.top,
@@ -1609,61 +2275,74 @@ pub const Scene = struct {
                 }
                 // Image paint and hit geometry rely on at least one cell per dimension.
                 std.debug.assert(layout.width >= 1 and layout.height >= 1);
+                if (node.scroll) |state| {
+                    if (refresh_layout and visible) try self.resolveScroll(value, state);
+                }
                 layout.screenX = frame.parent.screenX + @as(f64, layout.left) + node.paint.translateX;
                 layout.screenY = frame.parent.screenY + @as(f64, layout.top) + node.paint.translateY;
-                try validateLayout(layout);
+                if (node.scroll) |state| if (!std.meta.eql(state.screen, .{ layout.screenX, layout.screenY })) {
+                    state.screen = .{ layout.screenX, layout.screenY };
+                    state.generation += 1;
+                };
+                const cells = cellLayout(layout);
                 if (frame.filter) |filter| {
+                    self.frame_work.overlap_tests += 1;
                     if (!overlaps(filter, layout)) {
                         depth -= 1;
                         continue;
                     }
                 }
-                if (node.kind == api.OT_SCENE_SLIDER) _ = try sliderThumb(node.control.slider, layout.width, layout.height);
+                if (node.kind == api.OT_SCENE_SLIDER) _ = try sliderThumb(node.control.slider, cells.width, cells.height);
                 frame.opacity *= node.paint.opacity;
-                if (retained) {
-                    self.prepared.appendAssumeCapacity(.{ .node = node.handle, .layout = layout, .clip = frame.clip, .opacity = frame.opacity, .visible = visible, .filtered = frame.filtered });
-                } else {
-                    self.work.appendAssumeCapacity(.{ .node = value, .layout = layout, .clip = frame.clip, .opacity = frame.opacity, .visible = visible, .filtered = frame.filtered });
-                }
+                frame.work_index = self.work.items.len;
+                self.work.appendAssumeCapacity(.{ .node = value, .layout = layout, .clip = frame.clip, .opacity = frame.opacity, .visible = visible, .filtered = frame.filtered });
                 if (node.viewport) |handle| _ = try self.viewportNode(objects, handle);
-                if (!visible or (node.paint_children.items.len == 0 and node.viewport == null)) {
+                if (!visible or (node.paint_children.items.len == 0 and node.viewport == null and node.scroll == null)) {
                     depth -= 1;
                     continue;
                 }
                 frame.parent = layout;
                 if (refresh_layout) {
                     var overflow: u32 = 0;
-                    if (builtin.is_test) self.test_style_reads += 1;
                     try yoga.check(yoga.yogaNodeStyleGetEnumChecked(value.yoga_node, api.OT_STYLE_ENUM_OVERFLOW, &overflow));
                     node.layout_flags.clips_children = overflow != api.OT_OVERFLOW_VISIBLE;
                 }
-                if (node.layout_flags.clips_children) {
+                if (node.scroll) |state| {
+                    const origin = childOrigin(node, layout);
+                    frame.parent.screenX = origin[0];
+                    frame.parent.screenY = origin[1];
+                    frame.clip = intersection(frame.clip, cellClip(scrollViewport(state, layout)));
+                } else if (node.layout_flags.clips_children) {
                     const left: u32 = @intFromBool(node.paint.borderSides & api.OT_BORDER_LEFT != 0);
                     const top: u32 = @intFromBool(node.paint.borderSides & api.OT_BORDER_TOP != 0);
                     const horizontal = left + @as(u32, @intFromBool(node.paint.borderSides & api.OT_BORDER_RIGHT != 0));
                     const vertical = top + @as(u32, @intFromBool(node.paint.borderSides & api.OT_BORDER_BOTTOM != 0));
                     frame.clip = intersection(frame.clip, .{
-                        .x = @intFromFloat(layout.screenX + @as(f64, @floatFromInt(left))),
-                        .y = @intFromFloat(layout.screenY + @as(f64, @floatFromInt(top))),
-                        .width = @as(u32, @intFromFloat(layout.width)) -| horizontal,
-                        .height = @as(u32, @intFromFloat(layout.height)) -| vertical,
+                        .x = @intFromFloat(cells.screenX + @as(f64, @floatFromInt(left))),
+                        .y = @intFromFloat(cells.screenY + @as(f64, @floatFromInt(top))),
+                        .width = @as(u32, @intFromFloat(cells.width)) -| horizontal,
+                        .height = @as(u32, @intFromFloat(cells.height)) -| vertical,
                     });
                 }
                 if (mode == .paint) frame.filter = try self.childFilter(objects, value);
-                if (mode == .paint or (!retained and self.hook_count == 0 and self.filter_count == 0)) sortChildren(node, self.attempt.?.frame_id);
+                if (mode == .paint or (self.hook_count == 0 and self.filter_count == 0)) sortChildren(node, self.attempt.?.frame_id);
                 frame.entered = true;
             }
             if (frame.child == node.paint_children.items.len) {
+                if (node.scroll) |state| if (state.visible[0] or state.visible[1]) {
+                    var bars = self.work.items[frame.work_index];
+                    bars.bars = true;
+                    self.work.appendAssumeCapacity(bars);
+                };
                 depth -= 1;
                 continue;
             }
             if (depth == stack.len) return error.YogaDepthLimit;
             const child = node.paint_children.items[frame.child];
             frame.child += 1;
-            stack[depth] = .{ .node = if (retained) child.scene_node.?.handle else child, .parent = frame.parent, .clip = frame.clip, .opacity = frame.opacity, .filtered = frame.filtered or node.viewport != null, .filter = frame.filter };
+            stack[depth] = .{ .node = child, .parent = frame.parent, .clip = frame.clip, .opacity = frame.opacity, .filtered = frame.filtered or node.filtersChildren(), .filter = frame.filter };
             depth += 1;
         }
-        return true;
     }
 };
 
@@ -1673,9 +2352,10 @@ pub fn sliderThumb(options: SliderOptions, width: f64, height: f64) !SliderThumb
         if (!std.math.isFinite(value)) return error.InvalidOptions;
     }
     for ([_]f64{ width, height }) |dimension| {
-        if (!std.math.isFinite(dimension) or dimension < 0 or dimension > std.math.maxInt(i32)) return error.InvalidDimensions;
+        if (std.math.isNan(dimension) or dimension < 0) return error.InvalidDimensions;
     }
-    const track_size = (if (options.orientation == 0) width else height) * 2;
+    // A track beyond the i32 cell range saturates, like paint geometry.
+    const track_size = @min(if (options.orientation == 0) width else height, std.math.maxInt(i32)) * 2;
     const range = options.max - options.min;
     if (!std.math.isFinite(range)) return error.InvalidOptions;
     if (range == 0) return .{ .size = track_size, .start = 0 };
@@ -1748,6 +2428,35 @@ fn paintSlider(target: *buffer.OptimizedBuffer, options: SliderOptions, layout: 
     }
 }
 
+fn rect(layout: Layout) [4]f64 {
+    return .{ layout.screenX, layout.screenY, layout.width, layout.height };
+}
+
+/// A copy of a scroll node's state, with screen geometry from its last prepared frame.
+pub fn scrollReport(value: *const native.NativeRenderable) !api.ot_scene_scroll_state {
+    const node = value.scene_node.?;
+    const state = node.scroll orelse return error.WrongKind;
+    const box = cellLayout(node.layout);
+    var report: api.ot_scene_scroll_state = .{
+        .struct_size = @sizeOf(api.ot_scene_scroll_state),
+        .abi_version = api.OT_CONTEXT_ABI_VERSION,
+        .stuck = @intFromBool(state.stuck),
+        .reserved = 0,
+        .generation = state.generation,
+        .offset = state.offset,
+        .max = state.max,
+        .content = .{ state.content_origin[0], state.content_origin[1], state.extent[0], state.extent[1] },
+        .viewport = rect(scrollViewport(state, box)),
+        .bars = undefined,
+    };
+    for (&report.bars, 0..) |*bar, axis| {
+        const rects = state.barRects(axis, box, node.paint.borderSides);
+        const thumb = sliderThumb(state.slider(axis), rects.track.width, rects.track.height) catch SliderThumb{ .size = 0, .start = 0 };
+        bar.* = .{ .visible = @intFromBool(state.visible[axis]), .reserved = 0, .track = rect(rects.track), .start_arrow = rect(rects.arrows[0]), .end_arrow = rect(rects.arrows[1]), .thumb_start = thumb.start, .thumb_size = thumb.size };
+    }
+    return report;
+}
+
 /// Public geometry advances at legacy preparation points, separately from completed
 /// paint layout. Accepted transforms and ancestry still compose immediately.
 pub fn getLayout(value: *const native.NativeRenderable) !Layout {
@@ -1755,9 +2464,7 @@ pub fn getLayout(value: *const native.NativeRenderable) !Layout {
 }
 
 pub fn getPaintLayout(value: *const native.NativeRenderable) !Layout {
-    const layout = value.scene_node.?.layout;
-    try validateLayout(layout);
-    return layout;
+    return cellLayout(value.scene_node.?.layout);
 }
 
 fn composedLayout(value: *const native.NativeRenderable, comptime observed: bool) !Layout {
@@ -1778,24 +2485,49 @@ fn composedLayout(value: *const native.NativeRenderable, comptime observed: bool
         const layout = if (observed) node.observed_layout else node.layout;
         result.screenX = result.screenX + @as(f64, layout.left) + node.paint.translateX;
         result.screenY = result.screenY + @as(f64, layout.top) + node.paint.translateY;
-        if (!std.math.isFinite(result.screenX) or !std.math.isFinite(result.screenY)) return error.InvalidDimensions;
+        if (count != 0) {
+            const origin = childOrigin(node, .{});
+            result.screenX += origin[0];
+            result.screenY += origin[1];
+        }
     }
     return result;
 }
 
-fn prepareView(node: *Node, layout: Layout) !void {
+/// Where a parent's children compose from: its screen position, plus a scroll node's viewport
+/// and content origins minus its offset.
+fn childOrigin(node: *const Node, parent: Layout) [2]f64 {
+    const state = node.scroll orelse return .{ parent.screenX, parent.screenY };
+    return .{ parent.screenX + state.content_origin[0] - state.offset[0], parent.screenY + state.content_origin[1] - state.offset[1] };
+}
+
+/// A scroll node's viewport rect in screen cells, from the node's prepared layout.
+fn scrollViewport(state: *const ScrollState, box: Layout) Layout {
+    var viewport = state.viewport;
+    viewport.screenX = box.screenX + viewport.left;
+    viewport.screenY = box.screenY + viewport.top;
+    return viewport;
+}
+
+fn cellClip(layout: Layout) buffer.ClipRect {
+    const cells = cellLayout(layout);
+    return .{ .x = @intFromFloat(cells.screenX), .y = @intFromFloat(cells.screenY), .width = @intFromFloat(@max(0, cells.width)), .height = @intFromFloat(@max(0, cells.height)) };
+}
+
+fn prepareView(work: *renderer.FrameWork, node: *Node, layout: Layout) !void {
+    work.view_preparations += 1;
     if (node.kind == api.OT_SCENE_TEXT_VIEW) {
         const text_view = node.control.text_view.view orelse return;
         var viewport = text_view.view.getViewport() orelse text_buffer_view.Viewport{ .x = 0, .y = 0, .width = 0, .height = 0 };
-        viewport.width = @intFromFloat(layout.width);
-        viewport.height = @intFromFloat(layout.height);
+        viewport.width = cellSize(layout.width);
+        viewport.height = cellSize(layout.height);
         text_view.view.setViewport(viewport);
         try text_view.prepareView();
         return;
     }
     if (node.editor) |editor| {
-        const width: u32 = @intFromFloat(layout.width);
-        const height: u32 = @intFromFloat(layout.height);
+        const width = cellSize(layout.width);
+        const height = cellSize(layout.height);
         const viewport = editor.view.getViewport();
         if (viewport == null or viewport.?.width != width or viewport.?.height != height) {
             editor.view.setViewportSize(width, height);
@@ -1809,8 +2541,8 @@ fn prepareView(node: *Node, layout: Layout) !void {
     }
     const text = node.text orelse return;
     var viewport: text_buffer_view.Viewport = text.view.getViewport() orelse text.initial_viewport orelse .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    viewport.width = @intFromFloat(layout.width);
-    viewport.height = @intFromFloat(layout.height);
+    viewport.width = cellSize(layout.width);
+    viewport.height = cellSize(layout.height);
     text.view.setViewport(viewport);
     try text.prepareView();
     text.initial_viewport = null;
@@ -1861,17 +2593,29 @@ fn placementGreaterThan(_: void, left: Feedback, right: Feedback) bool {
     return left.placement > right.placement;
 }
 
-fn validateLayout(layout: Layout) !void {
-    const min: f64 = std.math.minInt(i32);
-    const max: f64 = std.math.maxInt(i32);
-    inline for (std.meta.fields(Layout)) |field| {
-        if (!std.math.isFinite(@field(layout, field.name))) return error.InvalidDimensions;
-    }
-    if (layout.screenX < min or layout.screenY < min or layout.width > max or layout.height > max or
-        layout.screenX + @as(f64, layout.width) > max or layout.screenY + @as(f64, layout.height) > max)
-    {
-        return error.InvalidDimensions;
-    }
+/// Paint, clip, and hit geometry use i32 cells. An axis outside them keeps the truncated cells that paint covers
+/// within 2^22 of the origin, at least one, so no node moves onto a terminal and every visible edge stays exact.
+/// NaN, Yoga's f32 overflow, lands off screen with its subtree.
+pub fn cellLayout(layout: Layout) Layout {
+    var cells = layout;
+    cellAxis(&cells.screenX, &cells.width);
+    cellAxis(&cells.screenY, &cells.height);
+    return cells;
+}
+
+fn cellAxis(start: *f64, size: *f32) void {
+    const end = start.* + size.*;
+    if (start.* >= std.math.minInt(i32) and end <= std.math.maxInt(i32) and @as(f64, size.*) <= std.math.maxInt(i32)) return;
+    // f32 holds every integer up to 2^24, so the clamped size is exact.
+    const bound: f64 = 1 << 22;
+    const first = @trunc(start.*);
+    start.* = @min(@max(first, -bound), bound - 1);
+    size.* = @floatCast(@min(@max(first + @trunc(@as(f64, size.*)), start.* + 1), bound) - start.*);
+}
+
+/// A view or request size in cells; Yoga sizes can exceed u32.
+fn cellSize(size: f32) u32 {
+    return @intFromFloat(@min(size, 0x7fff_ff80));
 }
 
 fn intersection(a: buffer.ClipRect, b: buffer.ClipRect) buffer.ClipRect {

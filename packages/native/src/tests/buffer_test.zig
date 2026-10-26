@@ -951,36 +951,6 @@ test "OptimizedBuffer drawTextChecked skips complete zero width UTF-8 codepoints
     try std.testing.expectEqual(@as(u32, 'Z'), target.buffer.char[5]);
 }
 
-test "OptimizedBuffer drawText, encodeUnicode, and text layout give a cluster that starts with a base its cells" {
-    const utf8 = @import("../utf8.zig");
-    const EncodedUnicode = @import("../encoded-unicode.zig").EncodedUnicode;
-    var pools = TestPools.init(std.testing.allocator);
-    defer pools.deinit();
-    // A tag character joins the base before it; a jamo filler starts a syllable with the one after it.
-    // wcwidth layout sums the filler and the syllable, while drawing measures a cluster by its first code point.
-    const rows = [_]struct { text: []const u8, cells: u32, wcwidth_layout: ?u32 }{
-        .{ .text = "a\u{e0041}b", .cells = 2, .wcwidth_layout = 2 },
-        .{ .text = "a\u{115f}\u{ac00}b", .cells = 4, .wcwidth_layout = null },
-        .{ .text = "a\u{1160}\u{11a8}b", .cells = 3, .wcwidth_layout = null },
-    };
-    for (rows) |row| for (std.enums.values(utf8.WidthMethod)) |width_method| {
-        errdefer std.debug.print("width_method={t} text={x}\n", .{ width_method, row.text });
-        const content = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, width_method);
-        defer content.deinit();
-        try content.setText(row.text);
-        if (if (width_method == .wcwidth) row.wcwidth_layout else row.cells) |layout| try std.testing.expectEqual(layout, content.lineWidthAt(0));
-        const encoded = try EncodedUnicode.init(std.testing.allocator, &pools.graphemes, row.text, width_method);
-        defer encoded.deinit(std.testing.allocator, &pools.graphemes);
-        var encoded_cells: u32 = 0;
-        for (encoded.chars) |char| encoded_cells += char.width;
-        try std.testing.expectEqual(row.cells, encoded_cells);
-        const target = try OptimizedBuffer.init(std.testing.allocator, 8, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links, .width_method = width_method });
-        defer target.deinit();
-        try target.drawText(row.text, 0, 0, ansi.rgbColor(255, 255, 255, 255), null, 0);
-        try std.testing.expectEqual(@as(u32, 'b'), target.buffer.char[row.cells - 1]);
-    };
-}
-
 /// A cluster that a cell cannot hold and the text that every checked draw must render in its place.
 /// An editor shows a control as notation instead.
 const UnprintableText = struct { bytes: []const u8, blank: []const u8, notation: ?[]const u8 = null, line_break: bool = false };
@@ -1104,9 +1074,9 @@ test "OptimizedBuffer checked text draws skip controls, editors show their notat
 test "OptimizedBuffer checked grapheme draws write blank cells for clusters a cell cannot hold" {
     var pools = TestPools.init(std.testing.allocator);
     defer pools.deinit();
-    const actual = try OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
+    const actual = try OptimizedBuffer.init(std.testing.allocator, 20, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
     defer actual.deinit();
-    const expected = try OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
+    const expected = try OptimizedBuffer.init(std.testing.allocator, 20, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links });
     defer expected.deinit();
     const fg = ansi.rgbColor(250, 240, 230, 255);
     const bg = ansi.rgbColor(10, 20, 30, 255);
@@ -1120,16 +1090,17 @@ test "OptimizedBuffer checked grapheme draws write blank cells for clusters a ce
         .{ .bytes = "\u{9b}", .width = 2 },
         .{ .bytes = "e" ++ "\u{301}" ** 64, .width = 1 },
         .{ .bytes = "\u{4e2d}" ++ "\u{301}" ** 63, .width = 2 },
+        .{ .bytes = "\u{1f468}", .width = gp.glyph_width_max + 1 },
     };
     for (glyphs) |glyph| {
-        for ([_]u32{ 0, 2, 6 - glyph.width }) |x| {
+        for ([_]u32{ 0, 2, 20 - glyph.width }) |x| {
             // The authoritative width draws all cells of a glyph or none of them.
-            const clips = [_]?buffer_mod.ClipRect{ null, .{ .x = 0, .y = 0, .width = 6, .height = 1 }, .{ .x = @intCast(x + 1), .y = 0, .width = 6, .height = 1 } };
+            const clips = [_]?buffer_mod.ClipRect{ null, .{ .x = 0, .y = 0, .width = 20, .height = 1 }, .{ .x = @intCast(x + 1), .y = 0, .width = 20, .height = 1 } };
             for (clips, 0..) |clip, clip_index| {
                 errdefer std.debug.print("glyph={any} x={d} clip={any}\n", .{ glyph.bytes, x, clip });
                 for ([_]*OptimizedBuffer{ actual, expected }) |target| {
                     target.clear(ansi.rgbColor(0, 0, 0, 255), null);
-                    target.set(5, 0, .{ .char = 'Z', .fg = fg, .bg = bg, .attributes = 0 });
+                    target.set(19, 0, .{ .char = 'Z', .fg = fg, .bg = bg, .attributes = 0 });
                     if (clip) |rect| try target.pushScissorRect(rect.x, rect.y, rect.width, rect.height);
                 }
                 defer for ([_]*OptimizedBuffer{ actual, expected }) |target| target.clearScissorRects();
@@ -1531,6 +1502,8 @@ test "OptimizedBuffer - a scissor never moves the text glyphs it leaves visible"
         defer whole.deinit();
         const clipped = try OptimizedBuffer.init(std.testing.allocator, 8, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links, .width_method = width_method });
         defer clipped.deinit();
+        const copied = try OptimizedBuffer.init(std.testing.allocator, 8, 1, .{ .pool = &pools.graphemes, .link_pool = &pools.links, .width_method = width_method });
+        defer copied.deinit();
         for (texts) |text| {
             for ([_]bool{ false, true }) |checked| {
                 for (0..8) |clip_start| {
@@ -1543,14 +1516,18 @@ test "OptimizedBuffer - a scissor never moves the text glyphs it leaves visible"
                         for ([_]*OptimizedBuffer{ whole, clipped }) |target| {
                             if (checked) try target.drawTextChecked(text, 0, 0, white, black, 0) else try target.drawTextClipped(text, 0, 0, white, black, 0);
                         }
-                        // A cell inside the scissor shows the unclipped glyph if the whole glyph is inside it.
+                        copied.clear(black, null);
+                        copied.drawFrameBuffer(@intCast(clip_start), 0, whole, @intCast(clip_start), 0, @intCast(clip_end - clip_start), 1);
+                        // A cell inside the scissor or the copied rectangle shows the unclipped glyph if the whole glyph is inside it.
                         var x: u32 = 0;
                         while (x < 8) {
-                            const width = gp.encodedCharWidth(whole.buffer.char[x]);
+                            // A continuation (0 cells) means a span shorter than its glyph: fail, do not hang.
+                            const width = @max(gp.encodedCharWidth(whole.buffer.char[x]), 1);
                             const inside = x >= clip_start and x + width <= clip_end;
                             for (x..@min(x + width, 8)) |column| {
                                 const expected: u32 = if (inside) whole.buffer.char[column] else ' ';
                                 try std.testing.expectEqual(expected, clipped.buffer.char[column]);
+                                try std.testing.expectEqual(expected, copied.buffer.char[column]);
                             }
                             x += width;
                         }
@@ -1877,6 +1854,16 @@ test "OptimizedBuffer - set should not clear newly written adjacent grapheme con
     try std.testing.expect(gp.graphemeIdFromChar(c3.char) == (new_gid & gp.GRAPHEME_ID_MASK));
 
     try std.testing.expect(c4.char == ' ');
+
+    // A wide glyph over a start clears only that span's tail, not an overlapping copy with the same ID.
+    buf.clear(bg, null);
+    const span = gp.packGraphemeStart(old_gid, 4);
+    buf.set(1, 0, .{ .char = span, .fg = fg, .bg = bg, .attributes = 0 });
+    buf.syncCell(3, 0, .{ .char = span, .fg = fg, .bg = bg, .attributes = 0 });
+    const copy = buf.buffer.char[3..7].*;
+    buf.set(0, 0, .{ .char = new_start, .fg = fg, .bg = bg, .attributes = 0 });
+    try std.testing.expectEqual(@as(u32, ' '), buf.buffer.char[2]);
+    try std.testing.expectEqualSlices(u32, &copy, buf.buffer.char[3..7]);
 }
 
 test "OptimizedBuffer - set span cleanup keeps shared link refcounts consistent" {

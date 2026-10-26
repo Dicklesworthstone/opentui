@@ -35,14 +35,6 @@ pub const WordLayoutInfo = struct {
     },
 };
 
-const CachedMeasure = struct {
-    wrap_width: u32,
-    first_width: u32,
-    tab_width: u8,
-    width_method: utf8.WidthMethod,
-    result: WordMeasureSummary,
-};
-
 /// Cached layout is keyed by tab width and width method. A chunk belongs to one text buffer,
 /// whose control display never changes, so the keys omit it.
 pub const TextChunkColdState = struct {
@@ -59,7 +51,6 @@ pub const TextChunkColdState = struct {
     next_layout_cache: ?*TextChunkColdState = null,
     layout_used: bool = false,
     line_breaks_ready: bool = false,
-    measure_word: ?CachedMeasure = null,
 };
 
 /// Layout arrays are disposable; the cold states and rope history remain arena-owned.
@@ -67,8 +58,14 @@ pub const TextChunkColdState = struct {
 pub const ChunkLayoutCache = struct {
     allocator: Allocator,
     first: ?*TextChunkColdState = null,
+    /// Every arena reset or swap of the owning buffer clears the cache first, so views use
+    /// this count to tell that rope nodes they kept may be gone.
+    clears: u64 = 0,
+    /// Freed entries. Word-break storage borrows entry slices and must not outlive one.
+    releases: u64 = 0,
 
     pub fn clear(self: *ChunkLayoutCache) void {
+        self.clears +%= 1;
         self.release(false);
     }
 
@@ -89,6 +86,7 @@ pub const ChunkLayoutCache = struct {
                 continue;
             }
             entry.* = cold.next_layout_cache;
+            self.releases +%= 1;
             self.allocator.free(cold.wrap_breaks.?.ptr[0..cold.wrap_breaks_capacity]);
             cold.cjk_breaks.deinit(self.allocator);
             cold.wrap_breaks = null;
@@ -100,11 +98,6 @@ pub const ChunkLayoutCache = struct {
             cold.line_breaks_ready = false;
         }
     }
-};
-
-pub const WordMeasureSummary = struct {
-    line_count: u32,
-    width_max: u32,
 };
 
 /// A chunk represents a contiguous sequence of UTF-8 bytes from a specific memory buffer
@@ -175,41 +168,6 @@ pub const TextChunk = struct {
             .wrap_breaks = cached,
             .cjk_breaks = cold.cjk_breaks.items,
             .word_classes = cold.word_classes,
-        };
-    }
-
-    pub fn getWordMeasureSummary(
-        self: *const TextChunk,
-        wrap_width: u32,
-        first_width: u32,
-        tab_width: u8,
-        width_method: utf8.WidthMethod,
-    ) ?WordMeasureSummary {
-        const cold = self.cold orelse return null;
-        const cached = cold.measure_word orelse return null;
-        if (cached.wrap_width != wrap_width or
-            cached.first_width != first_width or
-            cached.tab_width != tab_width or
-            cached.width_method != width_method) return null;
-        return cached.result;
-    }
-
-    pub fn setWordMeasureSummary(
-        self: *const TextChunk,
-        allocator: Allocator,
-        wrap_width: u32,
-        first_width: u32,
-        tab_width: u8,
-        width_method: utf8.WidthMethod,
-        summary: WordMeasureSummary,
-    ) TextBufferError!void {
-        const cold = try self.getOrCreateCold(allocator);
-        cold.measure_word = .{
-            .wrap_width = wrap_width,
-            .first_width = first_width,
-            .tab_width = tab_width,
-            .width_method = width_method,
-            .result = summary,
         };
     }
 
@@ -378,9 +336,6 @@ pub const Segment = union(enum) {
     brk: void,
     linestart: void,
 
-    /// Define which union tags are markers (for O(1) line lookup)
-    pub const MarkerTypes = &[_]std.meta.Tag(Segment){ .brk, .linestart };
-
     /// Metrics for aggregation in the rope tree
     /// These enable O(log n) row/col coordinate mapping and efficient line queries
     pub const Metrics = struct {
@@ -388,21 +343,43 @@ pub const Segment = union(enum) {
         total_bytes: u32 = 0,
         linestart_count: u32 = 0,
         newline_count: u32 = 0,
-        max_line_width_cols: u32 = 0,
+        /// Cells before the first break, after the last break, and of the widest line between
+        /// two breaks. Lines can span leaves, so the widest line needs all three to combine.
+        line_width_first: u32 = 0,
+        line_width_last: u32 = 0,
+        line_width_inner_max: u32 = 0,
         /// Whether all text segments in subtree are ASCII-only (for fast wrapping paths)
         ascii_only: bool = true,
         has_tabs: bool = false,
 
         pub fn add(self: *Metrics, other: Metrics) void {
+            // Combine the line widths before the totals change.
+            if (other.newline_count == 0) {
+                self.line_width_last += other.total_width_cols;
+                if (self.newline_count == 0) self.line_width_first += other.total_width_cols;
+            } else if (self.newline_count == 0) {
+                self.line_width_first += other.line_width_first;
+                self.line_width_last = other.line_width_last;
+                self.line_width_inner_max = other.line_width_inner_max;
+            } else {
+                self.line_width_inner_max = @max(
+                    @max(self.line_width_inner_max, other.line_width_inner_max),
+                    self.line_width_last + other.line_width_first,
+                );
+                self.line_width_last = other.line_width_last;
+            }
+
             self.total_width_cols += other.total_width_cols;
             self.total_bytes += other.total_bytes;
             self.linestart_count += other.linestart_count;
             self.newline_count += other.newline_count;
 
-            self.max_line_width_cols = @max(self.max_line_width_cols, other.max_line_width_cols);
-
             self.ascii_only = self.ascii_only and other.ascii_only;
             self.has_tabs = self.has_tabs or other.has_tabs;
+        }
+
+        pub fn lineWidthMax(self: *const Metrics) u32 {
+            return @max(@max(self.line_width_first, self.line_width_last), self.line_width_inner_max);
         }
 
         /// Get the balancing weight for the rope
@@ -424,7 +401,8 @@ pub const Segment = union(enum) {
                     .total_bytes = byte_len,
                     .linestart_count = 0,
                     .newline_count = 0,
-                    .max_line_width_cols = chunk.width_cols,
+                    .line_width_first = chunk.width_cols,
+                    .line_width_last = chunk.width_cols,
                     .ascii_only = is_ascii,
                     .has_tabs = chunk.hasTab(),
                 };
@@ -434,7 +412,6 @@ pub const Segment = union(enum) {
                 .total_bytes = 0,
                 .linestart_count = 0,
                 .newline_count = 1,
-                .max_line_width_cols = 0,
                 .ascii_only = true,
             },
             .linestart => Metrics{
@@ -442,7 +419,6 @@ pub const Segment = union(enum) {
                 .total_bytes = 0,
                 .linestart_count = 1,
                 .newline_count = 0,
-                .max_line_width_cols = 0,
                 .ascii_only = true,
             },
         };

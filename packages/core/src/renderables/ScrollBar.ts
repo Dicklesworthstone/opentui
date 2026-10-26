@@ -1,7 +1,12 @@
 import type { OptimizedBuffer } from "../buffer.js"
 import { parseColor, RGBA, type ColorInput } from "../lib/index.js"
 import type { KeyEvent } from "../lib/KeyHandler.js"
-import { Renderable, RenderableEvents, type RenderableOptions } from "../Renderable.js"
+import {
+  Renderable,
+  RenderableEvents,
+  type RenderableOptions,
+  type NativeRenderableIntegration,
+} from "../Renderable.js"
 import type { RenderContext, Timeout } from "../types.js"
 import type { NativeSceneArrowOptions } from "../zig.js"
 import { type BoxOptions } from "./Box.js"
@@ -18,11 +23,10 @@ export interface ScrollBarOptions extends RenderableOptions<ScrollBarRenderable>
 export type ScrollUnit = "absolute" | "viewport" | "content" | "step"
 
 export class ScrollBarRenderable extends Renderable {
-  static override readonly nativeIntegration = this.defineNativeIntegration({
+  static override readonly nativeIntegration: NativeRenderableIntegration = {
     ...Renderable.nativeIntegration,
     kind: "box",
-    construction: "prototype",
-  })
+  }
 
   public readonly slider: SliderRenderable
   public readonly startArrow: ArrowRenderable
@@ -92,7 +96,7 @@ export class ScrollBarRenderable extends Renderable {
   set scrollPosition(value: number) {
     if (this.isDestroyed) return
     this.assertMutable()
-    const newPosition = Math.round(Math.min(Math.max(0, value ?? 0), this.scrollSize - this.viewportSize))
+    const newPosition = Math.round(Math.max(0, Math.min(value ?? 0, this.scrollSize - this.viewportSize)))
     if (!Number.isFinite(newPosition)) {
       throw new RangeError("Scene scroll positions must be finite numbers")
     }
@@ -381,11 +385,10 @@ const defaultArrowForeground = RGBA.fromValues(1, 1, 1, 1)
 const defaultArrowBackground = RGBA.fromValues(0, 0, 0, 0)
 
 export class ArrowRenderable extends Renderable {
-  static override readonly nativeIntegration = this.defineNativeIntegration({
+  static override readonly nativeIntegration: NativeRenderableIntegration = {
     kind: "arrow",
     body: { native: this.prototype.renderSelf },
-    construction: "prototype",
-  })
+  }
 
   private _direction: "up" | "down" | "left" | "right"
   private _foregroundColor: RGBA
