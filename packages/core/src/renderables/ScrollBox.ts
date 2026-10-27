@@ -1,7 +1,7 @@
 import { type KeyEvent } from "../lib/index.js"
 import { LinearScrollAccel, type ScrollAcceleration } from "../lib/scroll-acceleration.js"
 import { scrollOnce, wheelDirection } from "../lib/scroll-chain.js"
-import type { NativeRenderableIntegration } from "../Renderable.js"
+import type { NativeRenderableIntegration, Renderable } from "../Renderable.js"
 import type { MouseEvent } from "../renderer.js"
 import type { TimerHandle } from "../lib/clock.js"
 import type { RenderContext } from "../types.js"
@@ -124,6 +124,9 @@ export class ScrollBoxRenderable extends BoxRenderable {
   private scrollHook = false
   private configured = false
   private barPress?: BarPress
+  // Each callback with the renderer frame it was asked in; it runs in a later frame.
+  private layoutCallbacks: { frame: number; callback: () => void }[] = []
+  private anchorToken?: object
 
   get stickyScroll(): boolean {
     return this._stickyScroll
@@ -323,16 +326,23 @@ export class ScrollBoxRenderable extends BoxRenderable {
     return { ...viewport, height: viewport.height + Math.max(0, gutter) }
   }
 
-  /** @internal An explicit scroll on one axis; `"change"` reaches listeners at once. */
-  _scrollAxis(axis: number, value: number, relative: boolean): void {
+  /** @internal An explicit scroll on one axis; `"change"` reaches listeners at once. With `reapply` it applies again
+   * after the next frame's layout. */
+  _scrollAxis(axis: number, value: number, relative: boolean, reapply = false): void {
     if (this.isFreed()) return
     this.assertMutable()
     value ??= 0
     if (Number.isNaN(value)) throw new RangeError("Scene scroll positions must be finite numbers")
     const x = axis === 0 ? value : 0
     const y = axis === 1 ? value : 0
+    this.commitScroll(() =>
+      this._ctx.nativeScene.scrollTo(this, x, y, axis !== 0 || relative, axis !== 1 || relative, reapply),
+    )
+  }
+
+  private commitScroll(scroll: () => NativeSceneScrollState): void {
     const before = this._scrollState().offset
-    const state = this._ctx.nativeScene.scrollTo(this, x, y, axis !== 0 || relative, axis !== 1 || relative)
+    const state = scroll()
     this.state = state
     this.stateRevision = this._ctx.nativeScene.observedLayoutRevision
     const moved = (state.offset[0] !== before[0] ? 1 : 0) | (state.offset[1] !== before[1] ? 2 : 0)
@@ -355,7 +365,7 @@ export class ScrollBoxRenderable extends BoxRenderable {
       this.horizontalScrollBar?._listening() ||
       this.content?._listening() ||
       this.viewport?._listening() ||
-      false
+      this.layoutCallbacks.length > 0
     )
   }
 
@@ -369,12 +379,59 @@ export class ScrollBoxRenderable extends BoxRenderable {
     this.refreshNativeSceneHooks()
   }
 
-  /** A SCROLL request: offsets first, as a sticky follow inside a resize hook did, then sizes. */
+  /** A SCROLL request: offsets first, as a sticky follow inside a resize hook did, then sizes, then the callbacks
+   * waiting for layout. */
   private notifyScroll(): void {
     const state = this._scrollState()
     this.notifyOffsets(state, state.changes)
     if (!this.isDestroyed && state.changes & 8) this.viewport._emitResize()
     if (!this.isDestroyed && state.changes & 4) this.content._emitResize()
+    if (this.isDestroyed || !(state.changes & 16)) return
+    const frame = this._ctx.frameId
+    const due = this.layoutCallbacks.filter((entry) => entry.frame < frame)
+    this.layoutCallbacks = this.layoutCallbacks.filter((entry) => entry.frame >= frame)
+    if (this.layoutCallbacks.length > 0) this._ctx.nativeScene.scrollRequest(this, "layout", null)
+    // Every due callback runs; the first error is thrown after them.
+    let failure: { error: unknown } | undefined
+    for (const { callback } of due) {
+      if (this.isDestroyed) break
+      try {
+        callback()
+      } catch (error) {
+        failure ??= { error }
+      }
+    }
+    this._refreshScrollHook()
+    if (failure) throw failure.error
+  }
+
+  /** Runs `callback` once in the next frame, after its layout and before it paints: layout reads in it are current,
+   * and a scroll it makes shows in that frame. Asked during a frame, it runs in the frame after. It waits while the box
+   * is hidden; destroying the box drops it. */
+  public afterLayout(callback: () => void): void {
+    if (this.isFreed()) return
+    this.assertMutable()
+    this.layoutCallbacks.push({ frame: this._ctx.frameId, callback })
+    this._refreshScrollHook()
+    this._ctx.nativeScene.scrollRequest(this, "layout", null)
+    this.requestRender()
+  }
+
+  /** Keeps `node`, a descendant, at its place in the viewport through layout changes, over sticky follow, until the
+   * returned function runs or the node leaves the box. A scroll moves the place it keeps; a scroll to the end or a later
+   * anchor ends it. Release takes effect at once: to keep the place through a change made just before, release in
+   * `afterLayout`. */
+  public anchor(node: Renderable): () => void {
+    if (this.isFreed()) return () => {}
+    this.assertMutable()
+    this._ctx.nativeScene.scrollRequest(this, "anchor", node)
+    const token = {}
+    this.anchorToken = token
+    return () => {
+      if (this.anchorToken !== token || this.isFreed()) return
+      this._ctx.nativeScene.scrollRequest(this, "anchor", null)
+      this.anchorToken = undefined
+    }
   }
 
   public override get primaryAxis(): "row" | "column" {
@@ -395,62 +452,27 @@ export class ScrollBoxRenderable extends BoxRenderable {
     }
   }
 
-  public scrollChildIntoView(childId: string): void {
-    const child = this.findDescendantById(childId)
-    if (!child) return
-
-    const getNearestDelta = (
-      elementStart: number,
-      elementEnd: number,
-      viewportStart: number,
-      viewportEnd: number,
-    ): number => {
-      const elementSize = elementEnd - elementStart
-      const viewportSize = viewportEnd - viewportStart
-      const elementStartOutside = elementStart < viewportStart
-      const elementEndOutside = elementEnd > viewportEnd
-
-      if (elementStartOutside && elementEndOutside) {
-        return 0
-      }
-
-      if ((elementStartOutside && elementSize < viewportSize) || (elementEndOutside && elementSize > viewportSize)) {
-        return elementStart - viewportStart
-      }
-
-      if ((elementStartOutside && elementSize > viewportSize) || (elementEndOutside && elementSize < viewportSize)) {
-        return elementEnd - viewportEnd
-      }
-
-      return 0
-    }
-
-    const childTop = child.y
-    const childBottom = child.y + child.height
-    const viewportTop = this.viewport.y
-    const viewportBottom = this.viewport.y + this.viewport.height
-
-    const dy = getNearestDelta(childTop, childBottom, viewportTop, viewportBottom)
-
-    const childLeft = child.x
-    const childRight = child.x + child.width
-    const viewportLeft = this.viewport.x
-    const viewportRight = this.viewport.x + this.viewport.width
-
-    const dx = getNearestDelta(childLeft, childRight, viewportLeft, viewportRight)
-
-    if (dx !== 0 || dy !== 0) {
-      this.scrollBy({ x: dx, y: dy })
-    }
+  /** Scrolls a descendant (by id, or the node) into view now, and again after the next frame's layout. `"nearest"`
+   * moves the least; `"start"` and `"end"` put that edge of the node at the viewport's, `inset` cells inside. */
+  public scrollChildIntoView(
+    child: string | Renderable,
+    options: { align?: "nearest" | "start" | "end"; inset?: number } = {},
+  ): void {
+    const node = typeof child === "string" ? this.findDescendantById(child) : child
+    if (!node || this.isFreed()) return
+    this.assertMutable()
+    this.commitScroll(() => this._ctx.nativeScene.scrollRequest(this, "into-view", node, options.align, options.inset))
   }
 
+  /** Scrolls now, and again after the next frame's layout, so a position past the current range lands there once the
+   * content grows, and one at or past the end (`scrollHeight`, `Infinity`) stays at the end. */
   public scrollTo(position: number | { x: number; y: number }): void {
     if (typeof position === "number") {
-      this.scrollTop = position
+      this._scrollAxis(1, position, false, true)
     } else {
-      this.scrollTop = position.y
+      this._scrollAxis(1, position.y, false, true)
       if (this.isDestroyed) return
-      this.scrollLeft = position.x
+      this._scrollAxis(0, position.x, false, true)
     }
   }
 
@@ -770,6 +792,7 @@ export class ScrollBoxRenderable extends BoxRenderable {
     if (!this.isFreed()) this._scrollState()
     const selectionListener = this.selectionListener
     this.selectionListener = undefined
+    this.layoutCallbacks = []
     this.endBarPress()
     this.runCleanup((run) => {
       if (selectionListener) run(() => this._ctx.off("selection", selectionListener))

@@ -105,6 +105,20 @@ pub const ScrollState = struct {
     // The box's screen position, which the reported geometry follows.
     screen: [2]f64 = @splat(0),
     generation: u64 = 0,
+    // Requests that the solves of frames from `request_frame` apply again until one of those
+    // frames paints: per-axis targets (+inf is the end) or a node to reveal.
+    target: [2]?f64 = @splat(null),
+    reveal: ?Reveal = null,
+    request_frame: u64 = 0,
+    anchor: ?Anchor = null,
+    // The first frame that delivers a LAYOUT request, or 0.
+    layout_frame: u64 = 0,
+    // The layout epoch of the last resolution.
+    resolved_epoch: u64 = 0,
+
+    pub const Reveal = struct { node: handles.Handle, alignment: u32, inset: f64 };
+    // `row` is the node's position minus the offset, per axis; null until the node is laid out.
+    pub const Anchor = struct { node: handles.Handle, row: ?[2]f64 };
 
     fn deinit(self: *ScrollState, allocator: std.mem.Allocator) void {
         for (self.arrows) |pair| for (pair) |arrow| arrow.deinit(allocator);
@@ -131,6 +145,41 @@ pub const ScrollState = struct {
     pub fn restick(self: *ScrollState) void {
         const axis = self.followAxis() orelse return;
         self.stuck = self.max[axis] <= 1 or self.offset[axis] == self.followEdge(axis);
+    }
+
+    /// A REAPPLY target in whole cells, as offsets round: +inf, or a position at or past a positive
+    /// max once the node was laid out, is the end, which lands at the new max.
+    fn targetOf(self: *const ScrollState, axis: usize, position: f64) f64 {
+        const end = position > 0 and position >= self.max[axis] and self.extent[axis] > 0;
+        return if (end) std.math.inf(f64) else @floor(position + 0.5);
+    }
+
+    /// The viewport size along an axis without its padding.
+    fn innerSize(self: *const ScrollState, axis: usize) f64 {
+        const size = if (axis == 1) self.viewport.height else self.viewport.width;
+        return size - self.options.padding[axis] - self.options.padding[axis + 2];
+    }
+
+    /// The offsets that bring a content rect into the viewport inset by `reveal.inset`.
+    fn revealOffsets(self: *const ScrollState, reveal: Reveal, bounds: [4]f64) [2]f64 {
+        var positions: [2]f64 = undefined;
+        for (0..2) |axis| {
+            const start = bounds[axis] - reveal.inset;
+            const end = bounds[axis] + bounds[axis + 2] + reveal.inset - self.innerSize(axis);
+            positions[axis] = switch (reveal.alignment) {
+                api.OT_SCENE_SCROLL_ALIGN_START => start,
+                api.OT_SCENE_SCROLL_ALIGN_END => end,
+                // The browser's nearest rule: move the least that shows the rect, and not at all
+                // when it already covers the viewport, is inside it, or is as large as it.
+                else => blk: {
+                    const offset = self.offset[axis];
+                    const before = start < offset;
+                    if (before == (end > offset) or end == start) break :blk offset;
+                    break :blk if (before == (end < start)) start else end;
+                },
+            };
+        }
+        return positions;
     }
 
     /// What a SCROLL request reports: offset, content size, viewport size.
@@ -197,12 +246,10 @@ pub const ScrollState = struct {
     }
 
     pub fn slider(self: *const ScrollState, axis: usize) SliderOptions {
-        const size = if (axis == 1) self.viewport.height else self.viewport.width;
-        const inner = size - self.options.padding[axis] - self.options.padding[axis + 2];
         return .{
             .max = self.max[axis],
             .value = self.offset[axis],
-            .viewport_size = @max(1, inner),
+            .viewport_size = @max(1, self.innerSize(axis)),
             .orientation = @intCast(axis),
             .foreground = self.options.bars[axis].foreground,
             .background = self.options.bars[axis].background,
@@ -660,6 +707,10 @@ pub const Scene = struct {
     filter_count: u32 = 0,
     // Scroll nodes: each may add a bars entry to the work list.
     scroll_count: u32 = 0,
+    // Scroll nodes with a LAYOUT request pending.
+    layout_callbacks: u32 = 0,
+    // The last frame that painted; requests made for it or earlier frames are spent.
+    finished_frame: u64 = 0,
     // A scroll node toggled a bar in this preparation: its round solves again before any hook.
     scroll_toggled: bool = false,
     focus: ?handles.Handle = null,
@@ -753,7 +804,7 @@ pub const Scene = struct {
     pub fn deinit(self: *Scene) void {
         std.debug.assert(self.head == null and self.count == 0 and self.tokens.count() == 0);
         std.debug.assert(self.hook_count == 0 and self.filter_count == 0 and self.attempt == null);
-        std.debug.assert(self.layout_hook_count == 0);
+        std.debug.assert(self.layout_hook_count == 0 and self.scroll_count == 0 and self.layout_callbacks == 0);
         std.debug.assert(self.painted == null);
         std.debug.assert(self.focus == null);
         yoga.yogaNodeFree(self.style_node);
@@ -1071,6 +1122,7 @@ pub const Scene = struct {
         yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(node.childYoga(value))) catch unreachable;
         if (node.scroll) |state| {
             yoga.check(yoga.yogaNodeRemoveAllChildrenChecked(value.yoga_node)) catch unreachable;
+            self.layout_callbacks -= @intFromBool(state.layout_frame != 0);
             state.deinit(self.allocator);
             node.scroll = null;
             self.scroll_count -= 1;
@@ -1352,18 +1404,90 @@ pub const Scene = struct {
     }
 
     /// An explicit scroll: moves the offset in whole cells within the last solve's limits and
-    /// recomputes stuck.
-    pub fn scrollTo(self: *Scene, value: *native.NativeRenderable, target: [2]f64, relative: [2]bool) !void {
-        const node = value.scene_node.?;
-        const state = node.scroll orelse return error.WrongKind;
+    /// recomputes stuck. With `reapply` each axis it sets keeps its target for the next frame.
+    pub fn scrollTo(self: *Scene, value: *native.NativeRenderable, target: [2]f64, relative: [2]bool, reapply: bool) !void {
+        const state = value.scene_node.?.scroll orelse return error.WrongKind;
         for (target) |coordinate| if (std.math.isNan(coordinate)) return error.InvalidOptions;
         try checkWritable(value);
-        const before = .{ state.offset, state.stuck };
+        if (!reapply or state.request_frame <= self.finished_frame) state.target = @splat(null);
+        state.reveal = null;
+        var positions: [2]f64 = undefined;
         for (0..2) |axis| {
-            const position = if (relative[axis]) state.offset[axis] + target[axis] else target[axis];
-            state.offset[axis] = std.math.clamp(@floor(position + 0.5), 0, state.max[axis]);
+            // A relative delta adds to a pending target; the end stands for the last max.
+            const pending = state.target[axis] orelse state.offset[axis];
+            const base = if (pending == std.math.inf(f64)) state.max[axis] else pending;
+            positions[axis] = if (relative[axis]) base + target[axis] else target[axis];
+            if (reapply and !(relative[axis] and target[axis] == 0)) state.target[axis] = state.targetOf(axis, positions[axis]);
+            // A scroll to the end ends a held anchor, so the view reaches the end.
+            if (state.target[axis] == std.math.inf(f64)) state.anchor = null;
         }
+        if (reapply) self.aim(value, positions) else self.moveTo(value, positions);
+    }
+
+    /// INTO_VIEW, ANCHOR, and LAYOUT requests; see ot_scene_scroll_request.
+    pub fn requestScroll(self: *Scene, objects: *const handles.Table, value: *native.NativeRenderable, kind: u32, target: ?*native.NativeRenderable, alignment: u32, inset: u32) !void {
+        const state = value.scene_node.?.scroll orelse return error.WrongKind;
+        const target_valid = switch (kind) {
+            api.OT_SCENE_SCROLL_REQUEST_INTO_VIEW => target != null,
+            api.OT_SCENE_SCROLL_REQUEST_ANCHOR => true,
+            api.OT_SCENE_SCROLL_REQUEST_LAYOUT => target == null,
+            else => false,
+        };
+        const placed = alignment != 0 or inset != 0;
+        if (!target_valid or alignment > api.OT_SCENE_SCROLL_ALIGN_END or
+            (placed and kind != api.OT_SCENE_SCROLL_REQUEST_INTO_VIEW)) return error.InvalidOptions;
+        try checkWritable(value);
+        const bounds = if (target) |node| (try self.contentRect(objects, value, node)) orelse return error.InvalidOptions else null;
+        // A node that was never laid out has no position yet: its first solve decides.
+        const placed_node = if (bounds) |at| !std.math.isNan(at[2]) else false;
+        switch (kind) {
+            api.OT_SCENE_SCROLL_REQUEST_INTO_VIEW => {
+                const reveal: ScrollState.Reveal = .{ .node = target.?.scene_node.?.handle, .alignment = alignment, .inset = @floatFromInt(inset) };
+                state.target = @splat(null);
+                state.reveal = reveal;
+                if (placed_node) self.aim(value, state.revealOffsets(reveal, bounds.?)) else state.request_frame = self.nextFrame();
+            },
+            api.OT_SCENE_SCROLL_REQUEST_ANCHOR => state.anchor = if (bounds) |at| .{
+                .node = target.?.scene_node.?.handle,
+                .row = if (placed_node) .{ at[0] - state.offset[0], at[1] - state.offset[1] } else null,
+            } else null,
+            else => if (state.layout_frame == 0) {
+                // Asked during a frame, it runs in the next one, so a callback cannot ask forever.
+                state.layout_frame = self.last_frame_id +| 1;
+                self.layout_callbacks += 1;
+            },
+        }
+    }
+
+    /// Scrolls to a request's positions now and stamps it for the next frame's solves. A request
+    /// that the view reached and that left it stuck, at its follow edge or in a noise range, is
+    /// the sticky rule's: it keeps no target on the follow axis.
+    fn aim(self: *Scene, value: *native.NativeRenderable, positions: [2]f64) void {
+        const state = value.scene_node.?.scroll.?;
+        state.request_frame = self.nextFrame();
+        self.moveTo(value, positions);
+        const axis = state.followAxis() orelse return;
+        if (!state.stuck or @floor(positions[axis] + 0.5) != state.offset[axis]) return;
+        state.target[axis] = null;
+        state.reveal = null;
+    }
+
+    /// The frame whose solves apply a request made now.
+    fn nextFrame(self: *const Scene) u64 {
+        return if (self.attempt) |active| active.frame_id else self.last_frame_id +| 1;
+    }
+
+    /// Moves the offset to `positions` in whole cells within the last solve's limits, recomputes
+    /// stuck, and moves a held anchor's row with the offset.
+    fn moveTo(self: *Scene, value: *native.NativeRenderable, positions: [2]f64) void {
+        const node = value.scene_node.?;
+        const state = node.scroll.?;
+        const before = .{ state.offset, state.stuck };
+        for (0..2) |axis| state.offset[axis] = std.math.clamp(@floor(positions[axis] + 0.5), 0, state.max[axis]);
         state.restick();
+        if (state.anchor) |*anchor| if (anchor.row) |*row| {
+            for (0..2) |axis| row[axis] += before[0][axis] - state.offset[axis];
+        };
         // The host knows the offset it wrote, not a size change it has not been told of.
         @memcpy(state.reported[0..2], &state.offset);
         if (std.meta.eql(before, .{ state.offset, state.stuck })) return;
@@ -1376,11 +1500,46 @@ pub const Scene = struct {
         self.clearPreparation();
     }
 
+    /// `target`'s rect in the content coordinates of the scroll node `box`, from the last solve,
+    /// or null when `target` is not in the box's subtree.
+    fn contentRect(self: *Scene, objects: *const handles.Table, box: *native.NativeRenderable, target: *native.NativeRenderable) yoga.Error!?[4]f64 {
+        var computed: yoga.ExternalYogaLayout = undefined;
+        self.frame_work.geometry_reads += 1;
+        try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(target.yoga_node, &computed));
+        var bounds: [4]f64 = .{ computed.left, computed.top, computed.width, computed.height };
+        var cursor = target.scene_node.?.parent;
+        var depth: u32 = 0;
+        while (cursor) |parent| : (cursor = parent.scene_node.?.parent) {
+            if (parent == box) return bounds;
+            if (depth == yoga.depth_max) return error.YogaDepthLimit;
+            depth += 1;
+            self.frame_work.geometry_reads += 1;
+            try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(parent.yoga_node, &computed));
+            bounds[0] += computed.left;
+            bounds[1] += computed.top;
+            // Inside a nested scroll node, through its hidden nodes and offset, resolved for this
+            // layout first: the walk reaches it after the box that asks.
+            if (parent.scene_node.?.scroll) |nested| {
+                if (self.attempt != null and nested.resolved_epoch != self.layout_epoch and !parent.scene_node.?.layout_flags.display_none) try self.resolveScroll(objects, parent, nested);
+                for (0..2) |axis| bounds[axis] += nested.content_origin[axis] - nested.offset[axis];
+            }
+        }
+        return null;
+    }
+
+    /// A stored request's node rect, or null when the node is gone or left the box's subtree.
+    fn heldRect(self: *Scene, objects: *const handles.Table, box: *native.NativeRenderable, handle: handles.Handle) yoga.Error!?[4]f64 {
+        const target = objects.get(handle, .native_renderable, native.NativeRenderable) catch return null;
+        if (target.scene_node == null) return null;
+        return self.contentRect(objects, box, target);
+    }
+
     /// After a solve: read the hidden nodes, follow the stuck edge, clamp, and toggle bars.
-    fn resolveScroll(self: *Scene, value: *native.NativeRenderable, state: *ScrollState) !void {
+    fn resolveScroll(self: *Scene, objects: *const handles.Table, value: *native.NativeRenderable, state: *ScrollState) yoga.Error!void {
         var viewport: yoga.ExternalYogaLayout = undefined;
         var content: yoga.ExternalYogaLayout = undefined;
         self.frame_work.geometry_reads += 2;
+        state.resolved_epoch = self.layout_epoch;
         try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(state.viewport_node, &viewport));
         try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(state.content_node, &content));
         const before = .{ state.offset, state.max, state.extent, state.viewport, state.content_origin, state.visible };
@@ -1396,11 +1555,31 @@ pub const Scene = struct {
         // A stuck view moves only when its range changed, so a solve elsewhere keeps a reader
         // who scrolled within a noise range where they are.
         const moved = !std.meta.eql(.{ before[1], before[2], before[3] }, .{ state.max, state.extent, state.viewport });
-        if (state.followAxis()) |axis| {
-            if (state.stuck and moved) state.offset[axis] = state.followEdge(axis);
-        }
-        for (0..2) |axis| state.offset[axis] = std.math.clamp(state.offset[axis], 0, state.max[axis]);
         const frame_id = self.attempt.?.frame_id;
+        // A held anchor decides the offset over requests and sticky follow.
+        const anchored = if (state.anchor) |anchor| try self.heldRect(objects, value, anchor.node) else null;
+        if (anchored == null) state.anchor = null;
+        const pending = state.reveal != null or state.target[0] != null or state.target[1] != null;
+        const requested = anchored == null and pending and state.request_frame <= frame_id and state.request_frame > self.finished_frame;
+        if (anchored) |bounds| {
+            // A node anchored before its first layout holds the place that layout gives it.
+            const row = state.anchor.?.row orelse [2]f64{ bounds[0] - state.offset[0], bounds[1] - state.offset[1] };
+            state.anchor.?.row = row;
+            for (0..2) |axis| state.offset[axis] = bounds[axis] - row[axis];
+        } else if (requested) {
+            if (state.reveal) |reveal| {
+                if (try self.heldRect(objects, value, reveal.node)) |bounds| state.offset = state.revealOffsets(reveal, bounds);
+            }
+            for (state.target, &state.offset) |target, *offset| offset.* = target orelse offset.*;
+        }
+        for (0..2) |axis| state.offset[axis] = std.math.clamp(@floor(state.offset[axis] + 0.5), 0, state.max[axis]);
+        if (state.followAxis()) |axis| {
+            // The sticky rule holds on the follow axis unless an anchor or a request set it.
+            const aimed = anchored != null or (requested and (state.reveal != null or state.target[axis] != null));
+            if (aimed) {
+                state.restick();
+            } else if (state.stuck and moved) state.offset[axis] = state.followEdge(axis);
+        }
         if (state.toggle_frame != frame_id) {
             state.toggle_frame = frame_id;
             state.toggles = 0;
@@ -1635,15 +1814,7 @@ pub const Scene = struct {
                     .scroll => {
                         // After the node's own refresh, so a reply reads this round's layout.
                         const state = node.scroll.?;
-                        const current = state.observed();
-                        if (!std.meta.eql(current, state.reported)) {
-                            state.changes = 0;
-                            for (current, state.reported, [_]u32{ api.OT_SCENE_SCROLL_CHANGED_OFFSET_X, api.OT_SCENE_SCROLL_CHANGED_OFFSET_Y, api.OT_SCENE_SCROLL_CHANGED_CONTENT, api.OT_SCENE_SCROLL_CHANGED_CONTENT, api.OT_SCENE_SCROLL_CHANGED_VIEWPORT, api.OT_SCENE_SCROLL_CHANGED_VIEWPORT }) |now, was, bit| {
-                                if (now != was) state.changes |= bit;
-                            }
-                            state.reported = current;
-                            result = try self.request(node, api.OT_SCENE_FRAME_SCROLL);
-                        }
+                        if (!std.meta.eql(state.observed(), state.reported)) result = try self.scrollRequest(node, 0);
                     },
                     .prepass => {
                         // A resize callback can append to the live placement Set.
@@ -1713,6 +1884,10 @@ pub const Scene = struct {
             if (self.preparation_dirty or try self.needsSolve(cli, root)) {
                 try self.prepareRound(objects, cli, root);
                 continue;
+            }
+            // After the layout settled and before paint; a reply that changes it starts a round.
+            if (self.layout_callbacks != 0) {
+                if (try self.deliverLayout(active.frame_id)) |result| return result;
             }
             if (self.members.items.len == 0) try self.prepareMembers(objects, cli, root);
             if (self.verifiesRetained()) try self.verifyObservations();
@@ -1867,6 +2042,7 @@ pub const Scene = struct {
         };
         // Every change to what the lists hold cleared them, so they match the accepted scene.
         if (active.walked) self.compactCandidates();
+        self.finished_frame = active.frame_id;
         self.endAttempt();
         self.cancelled_paint = false;
         self.frame_work.host_requests = active.requests;
@@ -1892,6 +2068,36 @@ pub const Scene = struct {
             } else node.prepared_gen = 0;
         }
         self.candidates.items.len = kept;
+    }
+
+    /// A SCROLL request naming what changed since the last report, plus `extra` change bits.
+    /// The report changes only once the request is issued.
+    fn scrollRequest(self: *Scene, node: *Node, extra: u32) !FrameRequest {
+        const state = node.scroll.?;
+        const current = state.observed();
+        var changes = extra;
+        for (current, state.reported, [_]u32{ api.OT_SCENE_SCROLL_CHANGED_OFFSET_X, api.OT_SCENE_SCROLL_CHANGED_OFFSET_Y, api.OT_SCENE_SCROLL_CHANGED_CONTENT, api.OT_SCENE_SCROLL_CHANGED_CONTENT, api.OT_SCENE_SCROLL_CHANGED_VIEWPORT, api.OT_SCENE_SCROLL_CHANGED_VIEWPORT }) |now, was, bit| {
+            if (now != was) changes |= bit;
+        }
+        const result = try self.request(node, api.OT_SCENE_FRAME_SCROLL);
+        state.changes = changes;
+        state.reported = current;
+        return result;
+    }
+
+    /// One due LAYOUT request of a visible scroll node that listens for SCROLL.
+    fn deliverLayout(self: *Scene, frame_id: u64) !?FrameRequest {
+        for (self.candidates.items) |entry| {
+            const node = entry.node.scene_node.?;
+            const state = node.scroll orelse continue;
+            if (!entry.visible or entry.bars or node.hook_flags & api.OT_SCENE_HOOK_SCROLL == 0) continue;
+            if (state.layout_frame == 0 or state.layout_frame > frame_id) continue;
+            const result = try self.scrollRequest(node, api.OT_SCENE_SCROLL_CHANGED_LAYOUT);
+            state.layout_frame = 0;
+            self.layout_callbacks -= 1;
+            return result;
+        }
+        return null;
     }
 
     fn request(self: *Scene, node: *Node, kind: u32) !FrameRequest {
@@ -2945,7 +3151,7 @@ pub const Scene = struct {
                 // Image paint and hit geometry rely on at least one cell per dimension.
                 std.debug.assert(layout.width >= 1 and layout.height >= 1);
                 if (node.scroll) |state| {
-                    if (refresh_layout and visible) try self.resolveScroll(value, state);
+                    if (refresh_layout and visible and state.resolved_epoch != self.layout_epoch) try self.resolveScroll(objects, value, state);
                 }
                 layout.screenX = frame.parent.screenX + @as(f64, layout.left) + node.paint.translateX;
                 layout.screenY = frame.parent.screenY + @as(f64, layout.top) + node.paint.translateY;

@@ -29,7 +29,7 @@ import {
 } from "../zig.js"
 import type { BoxOptions } from "./Box.js"
 import type { VNode } from "./composition/vnode.js"
-import { ScrollBarRenderable, type ArrowOptions, type ScrollUnit } from "./ScrollBar.js"
+import { ScrollBarRenderable, scrollUnitSize, type ArrowOptions, type ScrollUnit } from "./ScrollBar.js"
 import type { ScrollBoxRenderable } from "./ScrollBox.js"
 
 export type SceneStyleNode = { _getSceneHandle(owner: NativeScene): SceneNodeHandle }
@@ -544,9 +544,9 @@ export class ScrollBoxBar extends ScrollBoxPart {
     this.box._scrollAxis(this.axis, value, false)
   }
 
-  // Units and keys are the standalone scrollbar's; both scroll through `scrollPosition`.
+  // Units and keys are the standalone scrollbar's. A delta adds to a pending target and applies again after layout.
   scrollBy(delta: number, unit: ScrollUnit = "absolute"): void {
-    ScrollBarRenderable.prototype.scrollBy.call(this as unknown as ScrollBarRenderable, delta, unit)
+    this.box._scrollAxis(this.axis, scrollUnitSize(this, unit) * delta, true, true)
   }
 
   handleKeyPress(key: KeyEvent): boolean {
