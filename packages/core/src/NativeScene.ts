@@ -34,6 +34,8 @@ import {
   type ContextEditorViewHandle,
   type ContextTextBufferViewHandle,
   type SceneNodeHandle,
+  type NativeContextHandle,
+  type RenderLib,
   type SessionHandle,
 } from "./zig.js"
 
@@ -451,6 +453,18 @@ export class NativeScene {
       protocol,
       buffer?._getSceneHandle(this) ?? null,
     )
+  }
+
+  setVideo(renderable: Renderable, fit: ImageFit, buffer: OptimizedBuffer | null): void {
+    this.flushStaged()
+    const { renderLib: lib, context } = this.driver
+    lib.sceneSetVideo(context, renderable._getSceneHandle(this), fit, buffer?._getSceneHandle(this) ?? null)
+  }
+
+  /** @internal Video control and state calls address the node after staged writes. */
+  videoNode(renderable: Renderable): { lib: RenderLib; context: NativeContextHandle; node: SceneNodeHandle } {
+    this.flushStaged()
+    return { lib: this.driver.renderLib, context: this.driver.context, node: renderable._getSceneHandle(this) }
   }
 
   /** @internal A scroll write moves the box's children, so it bumps the layout revision like a frame step. */

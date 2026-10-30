@@ -140,6 +140,7 @@ test "Scene frame cancellation revokes painted authority but pins scratch cells 
         defer f.deinit();
         const child = try f.owner.sceneCreateNode(f.id, 1, 2);
         try f.owner.sceneSetStyle(child, 4, 0, 0, 1, 1, 1);
+        try f.owner.sceneSetStyle(child, 4, 1, 0, 1, 1, 1);
         try f.owner.sceneMoveNode(child, f.root, 0);
         const first = try f.owner.sceneFrameStep(f.id, null, options);
         _ = try f.owner.sceneFrameCommit(f.id, first, true);
@@ -203,15 +204,65 @@ test "Scene frame paint layout reports where a hook-free frame painted a node mo
     defer f.deinit();
     const child = try f.owner.sceneCreateNode(f.id, 1, 2);
     try f.owner.sceneSetStyle(child, 4, 0, 0, 1, 1, 1);
+    try f.owner.sceneSetStyle(child, 4, 1, 0, 1, 1, 1);
     try f.owner.sceneSetPaint(child, .{ .background = .{ 2, 0, 0, 255 } });
     try f.owner.sceneMoveNode(child, f.root, 0);
     try f.owner.sceneSetHooks(f.root, c.OT_SCENE_HOOK_UPDATE, 1, 8, 1);
+    // Before any paint list, a measured node reads its solved geometry.
+    try f.owner.sceneMeasureLayout(f.id, f.root);
+    try testing.expectEqual(@as(f32, 1), (try f.owner.sceneGetPaintLayout(child)).width);
     const update = try f.step(null, options, c.OT_SCENE_FRAME_UPDATE, f.root);
     try f.owner.scenePatchPaint(child, c.OT_SCENE_PROPERTY_TRANSLATE_X, .{ .translateX = 3 });
     const done = try f.step(update, options, c.OT_SCENE_FRAME_DONE, null);
     try testing.expectEqual(@as(u16, 2), f.cli.getNextBuffer().get(3, 0).?.bg[0]);
     try testing.expectEqual(@as(f64, 3), (try f.owner.sceneGetPaintLayout(child)).screenX);
+    // A node no solve laid out has no paint cells.
+    try testing.expectEqual(scene.Layout{}, try f.owner.sceneGetPaintLayout(try f.owner.sceneCreateNode(f.id, 1, 3)));
     try f.owner.sceneFrameCancel(f.id, done.frame_id);
+    // A scroll of a culling parent keeps the candidates: a shown row's request reports where the
+    // scroll moved it, through a scroll node's content origin and offset too, and a row no list
+    // painted reads where a later scroll moves it, between frames too (B5d).
+    for ([_]bool{ false, true }) |scroll_node| {
+        const g = try Fixture.init(testing.allocator, 8, 3, .{ .output = transport });
+        defer g.deinit();
+        const content = try g.owner.sceneCreateNode(g.id, 1, 2);
+        try g.owner.sceneSetStyle(content, 4, 1, 0, 1, 3, 1);
+        try g.owner.sceneMoveNode(content, g.root, 0);
+        if (scroll_node) try g.owner.sceneSetScroll(content, .{ .culling = true }) else try g.owner.sceneSetViewport(content, g.root);
+        var rows: [16]context.Handle = undefined;
+        for (&rows, 0..) |*row, index| {
+            row.* = try g.owner.sceneCreateNode(g.id, 1, @intCast(3 + index));
+            try g.owner.sceneSetStyle(row.*, 4, 1, 0, 1, 1, 1);
+            try g.owner.sceneSetStyle(row.*, c.OT_STYLE_FLOAT, c.OT_STYLE_FLOAT_FLEX_SHRINK, 0, 0, 0, 0);
+            try g.owner.sceneMoveNode(row.*, content, @intCast(index));
+        }
+        try g.owner.sceneSetHooks(rows[1], c.OT_SCENE_HOOK_UPDATE, 1, 1, 1);
+        for ([_]f32{ 0, -1, -2 }) |shift| {
+            if (scroll_node) {
+                _ = try g.owner.sceneScrollTo(content, .{ 0, -shift }, .{ false, false }, false);
+            } else try g.owner.scenePatchPaint(content, c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = shift });
+            if (shift == -2) {
+                try testing.expectEqual(@as(f64, -2), (try g.owner.sceneGetPaintLayout(rows[0])).screenY);
+                // Childless rows hold nothing to prepare.
+                try testing.expectEqual(@as(u64, 0), g.state.test_subtree_preparations);
+                break;
+            }
+            const asked = try g.step(null, options, c.OT_SCENE_FRAME_UPDATE, rows[1]);
+            try testing.expectEqual(1 + shift, (try g.owner.sceneGetPaintLayout(rows[1])).screenY);
+            _ = try g.owner.sceneFrameCommit(g.id, try g.step(asked, options, c.OT_SCENE_FRAME_DONE, null), false);
+            try drain(g.owner, g.id);
+            // A painted row reads its solved width after a measurement, and a row detached after
+            // a frame painted it has no paint cells.
+            if (shift == 0) {
+                try g.owner.sceneSetStyle(rows[2], 4, 0, 0, 1, 3, 1);
+                try g.owner.sceneMeasureLayout(g.id, g.root);
+                try testing.expectEqual(@as(f32, 3), (try g.owner.sceneGetPaintLayout(rows[2])).width);
+            }
+            if (shift != -1) continue;
+            try g.owner.sceneMoveNode(rows[1], null, 0);
+            try testing.expectEqual(scene.Layout{}, try g.owner.sceneGetPaintLayout(rows[1]));
+        }
+    }
 }
 
 test "Scene painted node and root destruction retains graphemes but never resurrects hit identities" {
@@ -241,6 +292,7 @@ test "Scene hit tests answer from the last presented scene frame" {
     defer f.deinit();
     const box = try f.owner.sceneCreateNode(f.id, 1, 2);
     try f.owner.sceneSetStyle(box, 4, 0, 0, 1, 2, 1);
+    try f.owner.sceneSetStyle(box, 4, 1, 0, 1, 1, 1);
     try f.owner.sceneMoveNode(box, f.root, 0);
     const commits = [_]@import("../renderer.zig").SplitSnapshot{.{ .snapshot = f.cli.getCurrentBuffer(), .row_columns = 4 }};
     const Step = enum { present, excluded, draft, pending, cancel, skip, raw, split, resize_draft, resize };
@@ -326,6 +378,7 @@ test "Scene hit tests answer from the last presented scene frame" {
     // cell; a cell outside the screen walks none. Rows: x, y, number, members walked.
     const top = try f.owner.sceneCreateNode(f.id, 1, 3);
     try f.owner.sceneSetStyle(top, 4, 0, 0, 1, 1, 1);
+    try f.owner.sceneSetStyle(top, 4, 1, 0, 1, 1, 1);
     try f.owner.sceneMoveNode(top, box, 0);
     try f.owner.sceneSetPaint(box, .{});
     _ = try f.owner.sceneFrameCommit(f.id, try f.owner.scenePaint(f.id, options.background, true, 0), false);
@@ -734,7 +787,7 @@ test "Scene frame band frames paint what a full repaint paints" {
 // later sibling, and below them a scroll node (rows 4-7) of six rows. Each row changes one input and expects the rows it damages and the full-path
 // reasons. The table runs without VERIFY, then with it: VERIFY must pass and change no count.
 test "Scene frame retained paint damages the rows of changed inputs only" {
-    var results: [2][std.meta.fields(Retained).len + 6]FrameWork = undefined;
+    var results: [2][std.meta.fields(Retained).len + 8]FrameWork = undefined;
     for ([_]bool{ false, true }, &results) |verify, *counts| try retainedTable(verify, counts);
     try testing.expectEqualSlices(FrameWork, &results[0], &results[1]);
 }
@@ -846,7 +899,7 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
         .{ .change = .image, .damage = 9, .reasons = FrameWork.full_path_images },
     };
     var image_node: context.Handle = undefined;
-    comptime std.debug.assert(rows.len + 3 <= std.meta.fields(Retained).len + 6);
+    comptime std.debug.assert(rows.len + 6 <= std.meta.fields(Retained).len + 8);
     for (rows, 0..) |row, row_index| {
         errdefer std.debug.print("row {s}, verify {}\n", .{ @tagName(row.change), verify });
         switch (row.change) {
@@ -976,7 +1029,25 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
     try testing.expectEqual(FrameWork.full_path_images | FrameWork.full_path_unretained, counts[rows.len].full_path_reasons);
     try testing.expectEqual(FrameWork.full_path_unretained, counts[rows.len + 1].full_path_reasons);
     try testing.expectEqual(@as(u32, 2), counts[rows.len + 2].damage_rows);
-    for (counts[rows.len + 3 ..]) |*unused| unused.* = .{};
+    // A video takes the full path like an image, although only its rows changed, and frames
+    // retain again two frames after it goes.
+    const video_node = try placedAt(f, f.root, c.OT_SCENE_VIDEO, 12, 6, 7, 2, 1);
+    _ = try f.owner.videoOpen(video_node, "../core/src/tests/fixtures/video/testsrc-160x90-24fps-2s.mp4");
+    counts[rows.len + 3] = try presentWork(f, .{});
+    try testing.expectEqual(FrameWork.full_path_images, counts[rows.len + 3].full_path_reasons);
+    try testing.expectEqual(@as(u32, 9), counts[rows.len + 3].damage_rows);
+    try f.owner.sceneDestroyNode(video_node);
+    counts[rows.len + 4] = try presentWork(f, .{});
+    counts[rows.len + 5] = try presentWork(f, .{});
+    for (counts[rows.len + 6 ..]) |*unused| unused.* = .{};
+    // A video that paints no cell, here one off screen, takes the damaged-rows path, and the
+    // frames after it damage only the surface's rows again.
+    const off_screen = try placedAt(f, f.root, c.OT_SCENE_VIDEO, 13, 20, 7, 2, 1);
+    _ = try f.owner.videoOpen(off_screen, "../core/src/tests/fixtures/video/testsrc-160x90-24fps-2s.mp4");
+    try testing.expectEqual(@as(u32, 0), (try presentWork(f, .{})).full_path_reasons);
+    const kept = try presentWork(f, .{});
+    try testing.expectEqual(@as(u32, 0), kept.full_path_reasons);
+    try testing.expectEqual(@as(u32, 2), kept.damage_rows);
     // A presented frame that differs from what paint produces fails a verified frame.
     if (!verify) return;
     try f.cli.currentRenderBuffer.drawText("X", 9, 3, ansi.rgbColor(255, 255, 255, 255), null, 0);
@@ -985,6 +1056,26 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
 
 // A skipped commit clears next, so the next frame repaints in full although nothing changed.
 // The debug overlay draws after paint, so every frame under it encodes and repaints in full.
+// A video its parent clips away paints no cell, so frames keep their rows; VERIFY's repaint must
+// not draw it, which would put its image unclipped into the presented buffer.
+test "Scene frame retained paint keeps a clipped video out of every buffer" {
+    for ([_]bool{ false, true }) |verify| {
+        errdefer std.debug.print("verify {}\n", .{verify});
+        const f = try Fixture.init(testing.allocator, 10, 9, .{});
+        defer f.deinit();
+        if (verify) try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_VERIFY);
+        const clip = try placedAt(f, f.root, c.OT_SCENE_BOX, 2, 0, 0, 4, 2);
+        try f.owner.sceneSetStyle(clip, 0, c.OT_STYLE_ENUM_OVERFLOW, 0, 0, c.OT_OVERFLOW_HIDDEN, 0);
+        const node = try placedAt(f, clip, c.OT_SCENE_VIDEO, 3, 0, 4, 4, 2);
+        _ = try f.owner.videoOpen(node, "../core/src/tests/fixtures/video/testsrc-160x90-24fps-2s.mp4");
+        _ = try presentWork(f, .{});
+        const kept = try presentWork(f, .{});
+        try testing.expectEqual(@as(u32, 0), kept.full_path_reasons);
+        try testing.expectEqual(@as(usize, 0), f.cli.getNextBuffer().image_placements.items.len);
+        try testing.expectEqual(@as(usize, 0), f.cli.getCurrentBuffer().image_placements.items.len);
+    }
+}
+
 test "Scene frame retained paint repaints in full after a skipped commit and under the debug overlay" {
     const f = try Fixture.init(testing.allocator, 44, 14, .{});
     defer f.deinit();
@@ -1111,15 +1202,16 @@ fn lifecycleTable(verify: bool, counts: []FrameWork) !void {
 // expects the damaged rows.
 test "Scene frame retained paint repaints arrow text outside its rect" {
     const Change = enum { none, text, color, move, band, beside };
-    const rows = [_]struct { scrollbar: bool, change: Change, height: f32 = 1, damage: u32 }{
+    const rows = [_]struct { scrollbar: bool, change: Change, width: f32 = 1, height: f32 = 1, damage: u32 }{
         .{ .scrollbar = false, .change = .none, .damage = 0 },
         .{ .scrollbar = false, .change = .text, .damage = 1 },
         .{ .scrollbar = false, .change = .color, .damage = 1 },
         .{ .scrollbar = false, .change = .move, .damage = 2 },
         .{ .scrollbar = false, .change = .band, .damage = 1 },
         .{ .scrollbar = false, .change = .beside, .damage = 0 },
-        // Every member lays out at least one row tall, so the text stays on the rect's rows.
-        .{ .scrollbar = false, .change = .text, .height = 0, .damage = 1 },
+        // A zero-size arrow paints no cell, so its text change damages no row.
+        .{ .scrollbar = false, .change = .text, .height = 0, .damage = 0 },
+        .{ .scrollbar = false, .change = .text, .width = 0, .damage = 0 },
         .{ .scrollbar = true, .change = .none, .damage = 0 },
         .{ .scrollbar = true, .change = .text, .damage = 2 },
         .{ .scrollbar = true, .change = .color, .damage = 2 },
@@ -1128,12 +1220,12 @@ test "Scene frame retained paint repaints arrow text outside its rect" {
     };
     const red = ansi.rgbColor(255, 0, 0, 255);
     for (rows) |row| {
-        errdefer std.debug.print("scrollbar {} change {s} height {d}\n", .{ row.scrollbar, @tagName(row.change), row.height });
+        errdefer std.debug.print("scrollbar {} change {s} size {d}x{d}\n", .{ row.scrollbar, @tagName(row.change), row.width, row.height });
         const f = try Fixture.init(testing.allocator, 6, 4, .{});
         defer f.deinit();
         try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_VERIFY);
         const y: u32 = if (row.scrollbar) 2 else 1;
-        const node = try placedAt(f, f.root, if (row.scrollbar) c.OT_SCENE_BOX else c.OT_SCENE_ARROW, 2, if (row.scrollbar) -4 else -7, 1, if (row.scrollbar) 4 else 1, if (row.scrollbar) 2 else row.height);
+        const node = try placedAt(f, f.root, if (row.scrollbar) c.OT_SCENE_BOX else c.OT_SCENE_ARROW, 2, if (row.scrollbar) -4 else -7, 1, if (row.scrollbar) 4 else row.width, if (row.scrollbar) 2 else row.height);
         const label = try placedAt(f, f.root, c.OT_SCENE_TEXT, 3, 2, @floatFromInt(y), 4, 1);
         try f.owner.sceneSetText(label, "a");
         const aside = try placedAt(f, f.root, c.OT_SCENE_TEXT, 4, -7, @floatFromInt(y), 6, 1);
@@ -1153,8 +1245,9 @@ test "Scene frame retained paint repaints arrow text outside its rect" {
             const w = try presentWork(f, .{});
             const moved = changed and row.change == .move;
             const cell = f.cli.currentRenderBuffer.get(0, y + @intFromBool(moved)).?;
-            try testing.expectEqual(glyphs[@intFromBool(next)], cell.char);
-            try testing.expectEqual(arrow.foreground, cell.fg);
+            const empty = row.width == 0 or row.height == 0;
+            try testing.expectEqual(if (empty) ' ' else glyphs[@intFromBool(next)], cell.char);
+            if (!empty) try testing.expectEqual(arrow.foreground, cell.fg);
             if (moved) try testing.expectEqual(@as(u32, ' '), f.cli.currentRenderBuffer.get(0, y).?.char);
             if (changed) try testing.expectEqual(row.damage, w.damage_rows);
         }
@@ -1283,8 +1376,14 @@ const StaleReply = struct {
     target: context.Handle,
     truncate: bool = true,
     destroy: bool = false,
+    // Answers UPDATE instead: destroys the target and scrolls this content.
+    scroll: ?context.Handle = null,
     fn apply(self: StaleReply, f: Fixture, request: scene.FrameRequest) !void {
-        if (request.kind != c.OT_SCENE_FRAME_RESIZE) return;
+        if (request.kind != if (self.scroll != null) c.OT_SCENE_FRAME_UPDATE else c.OT_SCENE_FRAME_RESIZE) return;
+        if (self.scroll) |content| {
+            try f.owner.sceneDestroyNode(self.target);
+            return f.owner.scenePatchPaint(content, c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = -1 });
+        }
         if (self.destroy) return f.owner.sceneDestroyNode(self.target);
         try f.owner.sceneSetTextOptions(self.target, .{ .truncate = self.truncate });
     }
@@ -1486,6 +1585,7 @@ fn expectSameObservations(twins: [2]Fixture, nodes: [2][]context.Handle) !void {
         for ([_]bool{ false, true }) |raw| {
             try testing.expectEqual(try twins[0].owner.sceneGetLayout(first, raw), try twins[1].owner.sceneGetLayout(second, raw));
         }
+        try testing.expectEqual(try twins[0].owner.sceneGetPaintLayout(first), try twins[1].owner.sceneGetPaintLayout(second));
         const states = .{ (try twins[0].owner.raw().getRenderable(first)).scene_node.?, (try twins[1].owner.raw().getRenderable(second)).scene_node.? };
         // Composition reads only the box; refresh copies the paint position too.
         inline for (.{ "left", "top", "right", "bottom", "width", "height" }) |name| {
@@ -1580,7 +1680,8 @@ test "Scene feedback runs children that replies mark in a later pass of the roun
 // changes, and an unrelated translate makes a full selection set its row aside: only the
 // culling change's mark, and listing set-aside rows again, reach it (VERIFY).
 test "Scene feedback reaches the children of culled rows when culling stops" {
-    for ([_]bool{ false, true }) |scroll_node| for ([_]bool{ false, true }) |tall| {
+    // Or when a scroll reveals rows 10 and 11, whose subtrees no walk prepared since the solve.
+    for ([_]bool{ false, true }) |scroll_node| for ([_]bool{ false, true }) |tall| for ([_]bool{ false, true }) |reveal| {
         const twins = [2]Fixture{ try Fixture.init(testing.allocator, 6, 4, .{}), try Fixture.init(testing.allocator, 6, 4, .{}) };
         defer for (twins) |f| f.deinit();
         var nodes: [2][43]context.Handle = undefined;
@@ -1629,19 +1730,31 @@ test "Scene feedback reaches the children of culled rows when culling stops" {
                     try f.owner.sceneSetTextOptions(list[24], .{ .truncate = true });
                 }
                 if (tall and frame == 1) try f.owner.sceneSetStyle(list[1], 4, 1, 0, 1, 2, 1);
+                // A culled row starts to clip its child, which paints over the row before it.
+                if (frame == 1) {
+                    try f.owner.sceneSetStyle(list[25], 0, c.OT_STYLE_ENUM_OVERFLOW, 0, 0, c.OT_OVERFLOW_HIDDEN, 0);
+                    try f.owner.sceneSetStyle(list[26], 0, c.OT_STYLE_ENUM_POSITION_TYPE, 0, 0, c.OT_POSITION_ABSOLUTE, 0);
+                    try f.owner.sceneSetPositions(list[26], 3, .{ 1, 1, 0, 0 }, .{ 0, -1, 0, 0 });
+                    try f.owner.sceneSetPaint(list[26], .{ .background = .{ 9, 0, 0, 255 } });
+                }
                 if (tall and frame == 2) try f.owner.sceneSetTextOptions(list[24], .{ .truncate = true });
                 if (tall and frame == 3) try f.owner.scenePatchPaint(list[0], c.OT_SCENE_PROPERTY_TRANSLATE_X, .{ .translateX = 1 });
                 if (frame == if (tall) @as(usize, 4) else 2) {
-                    if (scroll_node) try f.owner.sceneSetScroll(list[1], .{}) else try f.owner.sceneSetViewport(list[2], null);
+                    if (reveal and scroll_node) {
+                        _ = try f.owner.sceneScrollTo(list[1], .{ 0, 10 }, .{ false, false }, false);
+                    } else if (reveal) {
+                        try f.owner.scenePatchPaint(list[2], c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = -10 });
+                    } else if (scroll_node) try f.owner.sceneSetScroll(list[1], .{}) else try f.owner.sceneSetViewport(list[2], null);
                 }
                 log.clearRetainingCapacity();
                 try feedbackFrame(f, .{ .reply = .later, .n = 0, .expected = &.{} }, &list, false, log);
             }
             try testing.expectEqualSlices(usize, logs[0].items, logs[1].items);
             try expectSameObservations(twins, .{ &nodes[0], &nodes[1] });
+            try twins[0].expectSameCells(twins[1]);
         }
         // The last frame resized every row's child that culling hid from the resize frame.
-        if (!tall) try testing.expect(logs[1].items.len >= 16);
+        if (!tall) try testing.expect(logs[1].items.len >= @as(usize, if (reveal) 2 else 16));
     };
 }
 
@@ -1818,6 +1931,22 @@ test "Scene feedback scans a culled wide parent no more than today's walk" {
         try testing.expectEqualSlices(usize, &.{ 1, row.n + 2 }, log.items);
         try testing.expect(f.state.test_feedback_child_steps - steps <= 2 * (row.n + 2) + 8);
     }
+    // The hooked children in the shown one of 16 rows instead: the walk lists none of them, and
+    // feedback still has room to visit them all (B5d).
+    const g = try Fixture.init(testing.allocator, 4, 4, .{ .limits = .{ .object_capacity = 2048 } });
+    defer g.deinit();
+    try feedbackNode(g, nodes, 0, c.OT_SCENE_BOX, g.root, 0);
+    try g.owner.sceneSetStyle(nodes[0], 0, c.OT_STYLE_ENUM_OVERFLOW, 0, 0, c.OT_OVERFLOW_HIDDEN, 0);
+    try feedbackNode(g, nodes, 1, c.OT_SCENE_BOX, nodes[0], 0);
+    try g.owner.sceneSetViewport(nodes[1], nodes[0]);
+    for (2..18) |index| try feedbackNode(g, nodes, index, c.OT_SCENE_BOX, nodes[1], @intCast(index - 2));
+    for (18..nodes.len) |index| {
+        try feedbackNode(g, nodes, index, c.OT_SCENE_BOX, nodes[2], @intCast(index - 18));
+        try feedbackHook(g, nodes[index], c.OT_SCENE_HOOK_UPDATE);
+    }
+    log.clearRetainingCapacity();
+    try feedbackFrame(g, row, nodes, false, &log);
+    try testing.expectEqual(nodes.len - 18, log.items.len);
 }
 
 // A shown idle-update node uses its update when the latest round prepares it, so UPDATE given
@@ -1970,6 +2099,29 @@ test "Scene feedback sorts a node a reply moves in the same frame" {
         }
         try twins[0].expectSameCells(twins[1]);
     }
+    // H's reply creates Y with UPDATE in the childless E: E's selection prepares no node the
+    // round's solve did not lay out, so Y's UPDATE waits for the next round in both twins (B5d).
+    var logs: [2]std.ArrayListUnmanaged([3]u64) = .{ .empty, .empty };
+    defer for (&logs) |*log| log.deinit(testing.allocator);
+    for (twins, &logs) |f, *log| {
+        var list: [7]context.Handle = undefined;
+        for (0..2) |index| try feedbackNode(f, &list, index, c.OT_SCENE_BOX, f.root, @intCast(index));
+        try feedbackHook(f, list[0], c.OT_SCENE_HOOK_UPDATE);
+        _ = try presentStepped(f, NoReply{});
+        // The frame walks again, without a solve.
+        try f.owner.scenePatchPaint(list[1], c.OT_SCENE_PROPERTY_OPACITY, .{ .opacity = 0.5 });
+        var request = try f.owner.sceneFrameStep(f.id, null, options);
+        while (request.kind != c.OT_SCENE_FRAME_DONE) {
+            try log.append(testing.allocator, .{ request.kind, request.num, request.layout_epoch });
+            if (std.meta.eql(request.node, list[0])) {
+                try feedbackNode(f, &list, 2, c.OT_SCENE_BOX, list[1], 0);
+                try feedbackHook(f, list[2], c.OT_SCENE_HOOK_UPDATE);
+            }
+            request = try f.owner.sceneFrameStep(f.id, request, options);
+        }
+        try f.owner.sceneFrameCancel(f.id, request.frame_id);
+    }
+    try testing.expectEqualSlices([3]u64, logs[0].items, logs[1].items);
 }
 
 // A later pass skips the clean subtrees whose updates ran in the frame, not those the first
@@ -2136,75 +2288,83 @@ test "Scene feedback passes keep the round and request counts at the limits" {
 
 // A viewport of 4 x 2 cells over a column of N one-line text rows; 2 rows show. Each row is
 // one frame kind; columns are viewport child refreshes, visibility steps, view preparations,
-// host requests, layout rounds, and text measure callbacks of that frame. Only rows whose
-// layout, text, or view changed refresh, culled ones too; a frame that walks prepares the three
-// boxes' views (B5b). A row that grows the column measures no other row again.
+// host requests, layout rounds, text measure callbacks, overlap tests, and paint visits of that
+// frame. Only rows whose layout, text, or view changed refresh, culled ones too; a frame that
+// walks prepares the three boxes' views (B5b). A row that grows the column measures no other
+// row again. A selection tests every row, and so does a paint walk.
 test "Scene frame work counts viewport refresh and culling work" {
-    const Frame = enum { first, unchanged, scroll, grow, options_prepare, options_color, measure_text, measure_same_text, editor_cursor, hidden, hidden_unchanged, cancelled, stale_reply, stale_requester, placed_reply, destroy_reply };
+    const Frame = enum { first, unchanged, scroll, grow, options_prepare, options_color, measure_text, measure_same_text, editor_cursor, hidden, hidden_unchanged, cancelled, stale_reply, stale_requester, placed_reply, destroy_reply, destroy_hidden, full_scroll };
     const sizes = [_]u32{ 16, 256, 4096 };
-    const expected = [sizes.len][std.meta.fields(Frame).len][6]u64{
+    const expected = [sizes.len][std.meta.fields(Frame).len][8]u64{
         .{
-            .{ 0, 0, 22, 0, 1, 16 }, // first
-            .{ 0, 0, 0, 0, 1, 0 }, // unchanged
-            .{ 0, 0, 3, 0, 1, 0 }, // scroll
-            .{ 1, 0, 5, 0, 1, 0 }, // grow
-            .{ 1, 0, 4, 0, 1, 0 }, // options_prepare
-            .{ 0, 0, 3, 0, 1, 0 }, // options_color
-            .{ 1, 0, 4, 0, 1, 0 }, // measure_text
-            .{ 1, 0, 4, 0, 1, 0 }, // measure_same_text
-            .{ 1, 0, 1, 0, 1, 0 }, // editor_cursor
-            .{ 16, 0, 19, 0, 1, 0 }, // hidden
-            .{ 0, 0, 0, 0, 1, 0 }, // hidden_unchanged
-            .{ 1, 0, 4, 0, 1, 0 }, // cancelled
-            .{ 3, 0, 10, 1, 2, 0 }, // stale_reply
-            .{ 3, 0, 10, 1, 2, 0 }, // stale_requester
-            .{ 2, 0, 10, 1, 2, 0 }, // placed_reply
-            .{ 2, 67, 10, 1, 2, 0 }, // destroy_reply
+            .{ 0, 0, 22, 0, 1, 16, 32, 6 }, // first
+            .{ 0, 0, 0, 0, 1, 0, 0, 0 }, // unchanged
+            .{ 0, 0, 0, 0, 1, 0, 18, 7 }, // scroll
+            .{ 1, 0, 5, 0, 1, 0, 34, 7 }, // grow
+            .{ 1, 0, 4, 0, 1, 0, 9, 7 }, // options_prepare
+            .{ 0, 0, 3, 0, 1, 0, 9, 7 }, // options_color
+            .{ 1, 0, 4, 0, 1, 0, 9, 7 }, // measure_text
+            .{ 1, 0, 4, 0, 1, 0, 9, 7 }, // measure_same_text
+            .{ 1, 0, 1, 0, 1, 0, 0, 0 }, // editor_cursor
+            .{ 16, 0, 19, 0, 1, 0, 31, 7 }, // hidden
+            .{ 0, 0, 0, 0, 1, 0, 0, 0 }, // hidden_unchanged
+            .{ 1, 0, 4, 0, 1, 0, 31, 7 }, // cancelled
+            .{ 3, 0, 10, 1, 2, 0, 31, 7 }, // stale_reply
+            .{ 3, 0, 10, 1, 2, 0, 31, 7 }, // stale_requester
+            .{ 2, 0, 10, 1, 2, 0, 31, 7 }, // placed_reply
+            .{ 2, 67, 10, 1, 2, 0, 0, 18 }, // destroy_reply
+            .{ 1, 26, 8, 1, 2, 0, 0, 17 }, // destroy_hidden
+            .{ 14, 72, 21, 1, 1, 0, 0, 17 }, // full_scroll
         },
         .{
-            .{ 0, 0, 262, 0, 1, 256 }, // first
-            .{ 0, 0, 0, 0, 1, 0 }, // unchanged
-            .{ 0, 0, 3, 0, 1, 0 }, // scroll
-            .{ 1, 0, 5, 0, 1, 0 }, // grow
-            .{ 1, 0, 4, 0, 1, 0 }, // options_prepare
-            .{ 0, 0, 3, 0, 1, 0 }, // options_color
-            .{ 1, 0, 4, 0, 1, 0 }, // measure_text
-            .{ 1, 0, 4, 0, 1, 0 }, // measure_same_text
-            .{ 1, 0, 1, 0, 1, 0 }, // editor_cursor
-            .{ 256, 0, 259, 0, 1, 0 }, // hidden
-            .{ 0, 0, 0, 0, 1, 0 }, // hidden_unchanged
-            .{ 1, 0, 4, 0, 1, 0 }, // cancelled
-            .{ 3, 0, 10, 1, 2, 0 }, // stale_reply
-            .{ 3, 0, 10, 1, 2, 0 }, // stale_requester
-            .{ 2, 0, 10, 1, 2, 0 }, // placed_reply
-            .{ 2, 16, 9, 1, 2, 0 }, // destroy_reply
+            .{ 0, 0, 262, 0, 1, 256, 280, 6 }, // first
+            .{ 0, 0, 0, 0, 1, 0, 0, 0 }, // unchanged
+            .{ 0, 0, 0, 0, 1, 0, 26, 7 }, // scroll
+            .{ 1, 0, 5, 0, 1, 0, 282, 7 }, // grow
+            .{ 1, 0, 4, 0, 1, 0, 13, 7 }, // options_prepare
+            .{ 0, 0, 3, 0, 1, 0, 13, 7 }, // options_color
+            .{ 1, 0, 4, 0, 1, 0, 13, 7 }, // measure_text
+            .{ 1, 0, 4, 0, 1, 0, 13, 7 }, // measure_same_text
+            .{ 1, 0, 1, 0, 1, 0, 0, 0 }, // editor_cursor
+            .{ 256, 0, 259, 0, 1, 0, 279, 7 }, // hidden
+            .{ 0, 0, 0, 0, 1, 0, 0, 0 }, // hidden_unchanged
+            .{ 1, 0, 4, 0, 1, 0, 279, 7 }, // cancelled
+            .{ 3, 0, 10, 1, 2, 0, 279, 7 }, // stale_reply
+            .{ 3, 0, 10, 1, 2, 0, 279, 7 }, // stale_requester
+            .{ 2, 0, 10, 1, 2, 0, 279, 7 }, // placed_reply
+            .{ 2, 16, 9, 1, 2, 0, 545, 7 }, // destroy_reply
+            .{ 1, 26, 7, 1, 2, 0, 544, 7 }, // destroy_hidden
+            .{ 254, 24, 260, 1, 1, 0, 508, 257 }, // full_scroll
         },
         .{
-            .{ 0, 0, 4102, 0, 1, 4096 }, // first
-            .{ 0, 0, 0, 0, 1, 0 }, // unchanged
-            .{ 0, 0, 3, 0, 1, 0 }, // scroll
-            .{ 1, 0, 5, 0, 1, 0 }, // grow
-            .{ 1, 0, 4, 0, 1, 0 }, // options_prepare
-            .{ 0, 0, 3, 0, 1, 0 }, // options_color
-            .{ 1, 0, 4, 0, 1, 0 }, // measure_text
-            .{ 1, 0, 4, 0, 1, 0 }, // measure_same_text
-            .{ 1, 0, 1, 0, 1, 0 }, // editor_cursor
-            .{ 4096, 0, 4099, 0, 1, 0 }, // hidden
-            .{ 0, 0, 0, 0, 1, 0 }, // hidden_unchanged
-            .{ 1, 0, 4, 0, 1, 0 }, // cancelled
-            .{ 3, 0, 10, 1, 2, 0 }, // stale_reply
-            .{ 3, 0, 10, 1, 2, 0 }, // stale_requester
-            .{ 2, 0, 10, 1, 2, 0 }, // placed_reply
-            .{ 2, 16, 9, 1, 2, 0 }, // destroy_reply
+            .{ 0, 0, 4102, 0, 1, 4096, 4128, 6 }, // first
+            .{ 0, 0, 0, 0, 1, 0, 0, 0 }, // unchanged
+            .{ 0, 0, 0, 0, 1, 0, 34, 7 }, // scroll
+            .{ 1, 0, 5, 0, 1, 0, 4130, 7 }, // grow
+            .{ 1, 0, 4, 0, 1, 0, 17, 7 }, // options_prepare
+            .{ 0, 0, 3, 0, 1, 0, 17, 7 }, // options_color
+            .{ 1, 0, 4, 0, 1, 0, 17, 7 }, // measure_text
+            .{ 1, 0, 4, 0, 1, 0, 17, 7 }, // measure_same_text
+            .{ 1, 0, 1, 0, 1, 0, 0, 0 }, // editor_cursor
+            .{ 4096, 0, 4099, 0, 1, 0, 4127, 7 }, // hidden
+            .{ 0, 0, 0, 0, 1, 0, 0, 0 }, // hidden_unchanged
+            .{ 1, 0, 4, 0, 1, 0, 4127, 7 }, // cancelled
+            .{ 3, 0, 10, 1, 2, 0, 4127, 7 }, // stale_reply
+            .{ 3, 0, 10, 1, 2, 0, 4127, 7 }, // stale_requester
+            .{ 2, 0, 10, 1, 2, 0, 4127, 7 }, // placed_reply
+            .{ 2, 16, 9, 1, 2, 0, 8237, 7 }, // destroy_reply
+            .{ 1, 26, 7, 1, 2, 0, 8236, 7 }, // destroy_hidden
+            .{ 4094, 24, 4100, 1, 1, 0, 8188, 4097 }, // full_scroll
         },
     };
     // VERIFY changes no count.
     for ([_]bool{ false, true }) |verify| {
-        var all: [sizes.len][std.meta.fields(Frame).len][6]u64 = undefined;
+        var all: [sizes.len][std.meta.fields(Frame).len][8]u64 = undefined;
         for (sizes, &all) |n, *actual| {
             const f = try Fixture.init(testing.allocator, 8, 4, .{ .limits = .{ .object_capacity = 8192 } });
             defer f.deinit();
-            if (verify) try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_VERIFY);
+            const flags: u32 = if (verify) c.OT_SCENE_DEBUG_VERIFY else 0;
+            try f.owner.sceneSetDebugFlags(f.id, flags);
             const viewport = try f.owner.sceneCreateNode(f.id, 1, 2);
             try f.owner.sceneSetStyle(viewport, 4, 0, 0, 1, 4, 1);
             try f.owner.sceneSetStyle(viewport, 4, 1, 0, 1, 2, 1);
@@ -2313,8 +2473,22 @@ test "Scene frame work counts viewport refresh and culling work" {
                         try f.owner.sceneSetStyle(rows[n - 2], 4, 1, 0, 1, 3, 1);
                         break :blk try presentStepped(f, StaleReply{ .target = rows[n - 1], .destroy = true });
                     },
+                    // A shown row's UPDATE reply destroys the hidden first row and scrolls, so the
+                    // content selects again in the round.
+                    .destroy_hidden => blk: {
+                        try f.owner.sceneSetHooks(rows[1], c.OT_SCENE_HOOK_UPDATE, 1, 8, 1);
+                        break :blk try presentStepped(f, StaleReply{ .target = rows[0], .scroll = content });
+                    },
+                    // A scroll and a solve on the full path test every row twice.
+                    .full_scroll => blk: {
+                        try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_FULL_FRAME | flags);
+                        defer f.owner.sceneSetDebugFlags(f.id, flags) catch unreachable;
+                        try f.owner.scenePatchPaint(content, c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = -1 });
+                        try f.owner.sceneSetStyle(rows[1], 4, 1, 0, 1, 2, 1);
+                        break :blk try presentStepped(f, NoReply{});
+                    },
                 };
-                actual[@intFromEnum(frame)] = .{ w.viewport_child_refreshes, w.visibility_steps, w.view_preparations, w.host_requests, w.layout_rounds, yoga.test_native_measures - measures };
+                actual[@intFromEnum(frame)] = .{ w.viewport_child_refreshes, w.visibility_steps, w.view_preparations, w.host_requests, w.layout_rounds, yoga.test_native_measures - measures, w.overlap_tests, w.paint_visits };
             }
         }
         try testing.expectEqual(expected, all);
@@ -2338,20 +2512,23 @@ test "Scene frame bench scenes pin each frame kind's work at small sizes" {
         .{ .shape = .ui, .size = 0, .change = .glyph, .work = .{ 87, 0, 87, 87, 1, 0, 0, 0, 0, 3, 209, 200, 1, 1, 0, 0, 1, 1, 87, 0, 0 } },
         .{ .shape = .ui, .size = 0, .change = .update_hook, .work = .{ 0, 0, 0, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 4 } },
         .{ .shape = .ui, .size = 0, .change = .reply_text, .work = .{ 87, 87, 88, 0, 0, 30, 0, 0, 0, 3, 209, 200, 1, 0, 0, 1, 1, 1, 87, 0, 11 } },
-        .{ .shape = .scroll, .size = 100, .change = .reply_text, .work = .{ 104, 104, 5, 0, 0, 20, 0, 0, 100, 53, 10000, 10000, 50, 0, 0, 1, 1, 50, 104, 0, 6 } },
+        .{ .shape = .scroll, .size = 100, .change = .reply_text, .work = .{ 104, 55, 5, 0, 0, 20, 0, 0, 58, 53, 10000, 10000, 50, 0, 0, 1, 1, 50, 104, 0, 6 } },
         .{ .shape = .ui, .size = 0, .change = .paint_hook, .work = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0 } },
         .{ .shape = .boxes, .size = 100, .change = .unchanged, .work = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 } },
         .{ .shape = .boxes, .size = 100, .change = .background, .work = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 1, 140, 1, 1, 0, 0, 1, 1, 0, 0, 0 } },
         .{ .shape = .scroll, .size = 100, .change = .unchanged, .work = .{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 } },
-        .{ .shape = .scroll, .size = 100, .change = .glyph, .work = .{ 104, 104, 5, 104, 1, 21, 0, 0, 200, 53, 10000, 10000, 50, 1, 0, 0, 1, 50, 104, 0, 106 } },
-        .{ .shape = .scroll, .size = 100, .change = .scroll, .work = .{ 104, 104, 4, 0, 0, 21, 0, 0, 200, 53, 10000, 10000, 50, 50, 0, 0, 1, 50, 104, 53, 155 } },
-        .{ .shape = .scroll, .size = 100, .change = .append, .work = .{ 106, 106, 6, 106, 1, 18, 0, 0, 204, 53, 10000, 10000, 50, 0, 0, 0, 1, 50, 106, 0, 109 } },
+        .{ .shape = .scroll, .size = 100, .change = .glyph, .work = .{ 104, 55, 5, 104, 1, 21, 0, 0, 216, 53, 10000, 10000, 50, 1, 0, 0, 1, 50, 104, 0, 57 } },
+        .{ .shape = .scroll, .size = 100, .change = .scroll, .work = .{ 0, 56, 0, 0, 0, 21, 0, 0, 118, 53, 10000, 10000, 50, 50, 0, 0, 1, 50, 0, 53, 107 } },
+        .{ .shape = .scroll, .size = 100, .change = .append, .work = .{ 106, 55, 6, 106, 1, 18, 0, 0, 218, 53, 10000, 10000, 50, 0, 0, 0, 1, 50, 106, 0, 59 } },
         .{ .shape = .wrapped_scroll, .size = 20, .change = .unchanged, .work = .{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 } },
+        // Rows inside two boxes each. A scroll keeps the candidates, which hold no row's subtree,
+        // and prepares only the subtrees it reveals (B5d).
+        .{ .shape = .wrapped_scroll, .size = 20, .change = .scroll, .work = .{ 0, 68, 0, 0, 0, 46, 0, 0, 50, 66, 3831, 10000, 50, 20, 0, 0, 1, 50, 0, 69, 36 } },
         // The scroll shape as one scroll node: one node fewer, two hidden Yoga nodes read per
         // solve, a scroll is an offset without a solve, and an append follows the bottom.
         .{ .shape = .scroll_node, .size = 100, .change = .unchanged, .work = .{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 } },
-        .{ .shape = .scroll_node, .size = 100, .change = .scroll, .work = .{ 103, 103, 3, 0, 0, 16, 0, 0, 200, 52, 9950, 10000, 50, 50, 0, 0, 1, 50, 103, 52, 153 } },
-        .{ .shape = .scroll_node, .size = 100, .change = .append, .work = .{ 105, 105, 4, 107, 1, 18, 0, 0, 204, 52, 9950, 10000, 50, 50, 0, 0, 1, 50, 105, 52, 108 } },
+        .{ .shape = .scroll_node, .size = 100, .change = .scroll, .work = .{ 0, 55, 0, 0, 0, 16, 0, 0, 118, 52, 9950, 10000, 50, 50, 0, 0, 1, 50, 0, 52, 105 } },
+        .{ .shape = .scroll_node, .size = 100, .change = .append, .work = .{ 105, 54, 4, 107, 1, 18, 0, 0, 216, 52, 9950, 10000, 50, 50, 0, 0, 1, 50, 105, 52, 58 } },
         .{ .shape = .boxes, .size = 100, .change = .paint_hook, .work = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0 } },
         .{ .shape = .scroll, .size = 100, .change = .update_hook, .work = .{ 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 4 } },
         // A wide parent without a filter: 100 boxes, one with an UPDATE hook.
@@ -2439,4 +2616,240 @@ test "Scene scroll node frames ask the host nothing and toggle bars a bounded nu
     const idle = try presentWork(f, .{});
     try testing.expectEqual(@as(u64, 0), idle.candidate_visits);
     try testing.expectEqual(@as(u32, 0), idle.damage_rows);
+}
+
+const Culled = enum { scroll_in_reply, bars_in_reply, row_bars_in_reply, created_in_reply, detached_out, destroyed_parent, body_offscreen, cancelled_solve, read_moved, first_frame_read, solve_read, translated_read, translate_in_reply, held_read, body_after_reply, moved_out, idle_update, shown_then_update, hidden_row, stale_viewport };
+const always_bars: scene.ScrollOptions = .{ .bars = @splat(.{ .policy = c.OT_SCENE_SCROLL_BAR_ALWAYS }) };
+
+/// H (root child 0), V (`shown` rows tall, clipping), its content with V as the viewport and 16
+/// one-cell rows at list[3..19], and G (list[19]) in row `row`.
+fn culledScene(f: Fixture, list: []context.Handle, shown: f32, row: usize) !void {
+    try feedbackNode(f, list, 0, c.OT_SCENE_BOX, f.root, 0);
+    try feedbackNode(f, list, 1, c.OT_SCENE_BOX, f.root, 1);
+    try f.owner.sceneSetStyle(list[1], 4, 1, 0, 1, shown, 1);
+    try f.owner.sceneSetStyle(list[1], 0, c.OT_STYLE_ENUM_OVERFLOW, 0, 0, c.OT_OVERFLOW_HIDDEN, 0);
+    try feedbackNode(f, list, 2, c.OT_SCENE_BOX, list[1], 0);
+    try f.owner.sceneSetStyle(list[2], 4, 1, 0, c.OT_UNIT_AUTO, 0, 1);
+    try f.owner.sceneSetViewport(list[2], list[1]);
+    for (3..19) |index| try feedbackNode(f, list, index, c.OT_SCENE_BOX, list[2], @intCast(index - 3));
+    try feedbackNode(f, list, 19, c.OT_SCENE_BOX, list[3 + row], 0);
+}
+
+/// One frame; logs each request with the paint layout the C ABI reads for it, and with `reply`
+/// answers as the case says. A RECORD gets H's recording of G's body.
+fn culledFrame(f: Fixture, case: Culled, list: []const context.Handle, log: *std.ArrayListUnmanaged([6]u64), reply: bool) !void {
+    var request = try f.owner.sceneFrameStep(f.id, null, options);
+    while (request.kind != c.OT_SCENE_FRAME_DONE) {
+        if (request.kind == c.OT_SCENE_FRAME_RECORD) {
+            var recording: Recording = .{};
+            recording.slot(0, c.OT_SCENE_RECORD_PHASE_AFTER);
+            recording.append(c.ot_scene_record_view{ .header = .{ .size = 0, .operation = c.OT_SCENE_RECORD_SCENE_BODY }, .source = .{ .context_id = list[19].context_id, .slot = list[19].slot, .generation = list[19].generation }, .x = 0, .y = 0 }, &.{});
+            request = try f.owner.sceneFrameStepWithRecording(f.id, request, options, recording.view());
+            continue;
+        }
+        const read = switch (case) {
+            .first_frame_read, .solve_read, .translated_read, .translate_in_reply, .held_read => true,
+            else => false,
+        };
+        const painted = try f.owner.sceneGetPaintLayout(if (read) list[19] else request.node);
+        try log.append(testing.allocator, .{ request.kind, request.num, request.layout_epoch, @bitCast(@as(f64, painted.width)), @bitCast(painted.screenY), request.node.slot });
+        if (reply and std.meta.eql(request.node, list[0])) switch (case) {
+            .scroll_in_reply => try f.owner.sceneSetScroll(list[19], .{}),
+            .read_moved => {
+                try f.owner.sceneMoveNode(list[19], list[6], 0);
+                _ = try f.owner.sceneGetPaintLayout(list[19]);
+            },
+            .moved_out => try f.owner.sceneMoveNode(list[19], list[20], 0),
+            .idle_update => try feedbackHook(f, list[19], c.OT_SCENE_HOOK_UPDATE),
+            .bars_in_reply => for (list[22..]) |box| try f.owner.sceneSetScroll(box, always_bars),
+            .created_in_reply => for ([_]context.Handle{ list[3], list[19] }, 98..) |parent, num| {
+                const created = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_BOX, @intCast(num));
+                try f.owner.sceneSetHooks(created, c.OT_SCENE_HOOK_UPDATE, 1, 1, 1);
+                try f.owner.sceneMoveNode(created, parent, 0);
+            },
+            .detached_out => {
+                try f.owner.sceneMoveNode(list[19], null, 0);
+                try f.owner.sceneMoveNode(list[19], list[20], 0);
+            },
+            .destroyed_parent => {
+                try f.owner.sceneDestroyNode(list[21]);
+                try f.owner.sceneMoveNode(list[19], list[20], 0);
+            },
+            .body_offscreen => {
+                try f.owner.drawSceneBody(list[22], null, list[19], 0, 0);
+                var drawn: u64 = 0;
+                const target = (try f.owner.raw().getBuffer(list[22])).buffer;
+                for (target.char) |char| drawn += @intFromBool(char != target.char[target.char.len - 1]);
+                try log.append(testing.allocator, .{ 0, 0, 0, drawn, 0, 0 });
+            },
+            .cancelled_solve => {
+                try f.owner.sceneFrameCancel(f.id, request.frame_id);
+                const after = try f.owner.sceneGetPaintLayout(list[19]);
+                return log.append(testing.allocator, .{ 0, 0, 0, @bitCast(@as(f64, after.width)), @bitCast(after.screenY), 0 });
+            },
+            .row_bars_in_reply => {
+                try f.owner.sceneSetScroll(list[3], always_bars);
+                try f.owner.sceneMoveNode(try f.owner.sceneCreateNode(f.id, c.OT_SCENE_BOX, 99), list[3], 0);
+            },
+            .held_read => {
+                try feedbackHook(f, list[20], c.OT_SCENE_HOOK_UPDATE);
+                const after = try f.owner.sceneGetPaintLayout(list[19]);
+                try log.append(testing.allocator, .{ 0, 0, 0, @bitCast(@as(f64, after.width)), @bitCast(after.screenY), 0 });
+            },
+            .shown_then_update, .hidden_row => {
+                try f.owner.sceneSetStyle(list[if (case == .hidden_row) 3 else 19], c.OT_STYLE_ENUM, c.OT_STYLE_ENUM_DISPLAY, 0, 0, c.OT_DISPLAY_FLEX, 0);
+                try feedbackHook(f, list[19], c.OT_SCENE_HOOK_UPDATE);
+            },
+            else => {},
+        };
+        // After selection takes the culling parent's rows.
+        if (reply and case == .translate_in_reply and std.meta.eql(request.node, list[20])) {
+            try f.owner.scenePatchPaint(list[2], c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = -10 });
+        }
+        if (reply and case == .body_after_reply and std.meta.eql(request.node, list[19])) {
+            try f.owner.sceneSetStyle(list[19], 4, 0, 0, 1, 7, 1);
+            try f.owner.scenePatchPaint(list[2], c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = 0 });
+        }
+        request = try f.owner.sceneFrameStep(f.id, request, options);
+    }
+    _ = try f.owner.sceneFrameCommit(f.id, request, false);
+    try drain(f.owner, f.id);
+}
+
+// Replies and reads around subtrees the walk left out, against the forced full-frame twin: a
+// reply adds a scroll node inside a shown row, moves a node into one and reads its paint layout,
+// or moves an unprepared node out of a culled row; paint layout read in the first frame, after a
+// solve or a translation, and in a later round's scene body; a reply gives an idle-update node in
+// a shown row UPDATE; a destroyed viewport in a culled row. Replies also add bars to boxes in a
+// shown row and to an empty row, translate the culling parent, hook a node beside a culled node
+// whose paint layout the request read, and show a node or its hidden row before hooking it.
+test "Scene culled subtrees follow replies and reads as the full walk does" {
+    for (std.enums.values(Culled)) |case| {
+        errdefer std.debug.print("case {t}\n", .{case});
+        const twins = [2]Fixture{ try Fixture.init(testing.allocator, 8, 4, .{}), try Fixture.init(testing.allocator, 8, 4, .{}) };
+        defer for (twins) |f| f.deinit();
+        var logs: [2]std.ArrayListUnmanaged([6]u64) = .{ .empty, .empty };
+        defer for (&logs) |*log| log.deinit(testing.allocator);
+        var results: [2]anyerror!void = undefined;
+        var g_slot: u64 = 0;
+        for (twins, &logs, &results, 0..) |f, *log, *result, twin| {
+            try f.owner.sceneSetDebugFlags(f.id, if (twin == 0) c.OT_SCENE_DEBUG_FULL_FRAME else c.OT_SCENE_DEBUG_VERIFY);
+            var list: [223]context.Handle = undefined;
+            const row: usize = switch (case) {
+                .first_frame_read, .stale_viewport => 7,
+                .solve_read => 3,
+                .body_after_reply => 2,
+                .row_bars_in_reply => 1,
+                .body_offscreen, .cancelled_solve => 3,
+                .moved_out, .held_read, .detached_out, .destroyed_parent => 15,
+                else => 0,
+            };
+            try culledScene(f, &list, if (case == .solve_read or case == .body_offscreen or case == .cancelled_solve) 4 else 2, row);
+            g_slot = list[19].slot;
+            try feedbackHook(f, list[0], if (case == .body_after_reply) c.OT_SCENE_HOOK_RENDER_AFTER else c.OT_SCENE_HOOK_UPDATE);
+            switch (case) {
+                .first_frame_read => try f.owner.sceneSetStyle(list[19], 4, 0, 0, 1, 6, 1),
+                .body_after_reply => {
+                    try f.owner.sceneSetStyle(list[19], 4, 0, 0, 1, 4, 1);
+                    try f.owner.sceneSetPaint(list[19], .{ .borderSides = c.OT_BORDER_ALL });
+                    try f.owner.sceneSetStyle(list[0], 4, 0, 0, 1, 8, 1);
+                },
+                .moved_out, .detached_out, .destroyed_parent => {
+                    if (case == .destroyed_parent) {
+                        try feedbackNode(f, &list, 21, c.OT_SCENE_BOX, list[18], 1);
+                        try f.owner.sceneMoveNode(list[19], list[21], 0);
+                    }
+                    try feedbackNode(f, &list, 20, c.OT_SCENE_BOX, f.root, 2);
+                    try f.owner.sceneSetStyle(list[20], 4, 0, 0, 1, 3, 1);
+                    try f.owner.sceneSetStyle(list[19], 4, 0, 0, c.OT_UNIT_AUTO, 0, 1);
+                },
+                .stale_viewport => {
+                    try feedbackNode(f, &list, 20, c.OT_SCENE_BOX, list[19], 0);
+                    try feedbackNode(f, &list, 21, c.OT_SCENE_BOX, f.root, 2);
+                    try f.owner.sceneSetViewport(list[19], list[21]);
+                },
+                // A scroll node below keeps a translation from keeping the candidates.
+                .translated_read => try f.owner.sceneSetScroll(list[18], .{}),
+                .bars_in_reply => for (list[22..], 1..) |*box, index| {
+                    box.* = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_BOX, @intCast(100 + index));
+                    try f.owner.sceneMoveNode(box.*, list[3], @intCast(index));
+                },
+                .translate_in_reply => {
+                    try feedbackNode(f, &list, 20, c.OT_SCENE_BOX, f.root, 2);
+                    // Asked in the round the translation reveals it in.
+                    try feedbackNode(f, &list, 21, c.OT_SCENE_BOX, list[13], 0);
+                    for (list[20..22]) |node| try feedbackHook(f, node, c.OT_SCENE_HOOK_UPDATE);
+                },
+                .held_read => try feedbackNode(f, &list, 20, c.OT_SCENE_BOX, list[18], 1),
+                .shown_then_update, .hidden_row => try f.owner.sceneSetStyle(list[if (case == .hidden_row) 3 else 19], c.OT_STYLE_ENUM, c.OT_STYLE_ENUM_DISPLAY, 0, 0, c.OT_DISPLAY_NONE, 0),
+                .body_offscreen, .cancelled_solve => {
+                    try f.owner.sceneSetStyle(list[19], 4, 0, 0, 1, 4, 1);
+                    try f.owner.sceneSetPaint(list[19], .{ .borderSides = c.OT_BORDER_ALL });
+                    list[22] = try f.owner.createBuffer(8, 1, .{});
+                },
+                else => {},
+            }
+            const g_hooks: u32 = switch (case) {
+                .idle_update, .shown_then_update, .hidden_row => c.OT_SCENE_HOOK_IDLE_UPDATE,
+                .body_after_reply, .moved_out, .detached_out, .destroyed_parent => c.OT_SCENE_HOOK_UPDATE,
+                else => 0,
+            };
+            if (g_hooks != 0) try feedbackHook(f, list[19], g_hooks);
+            if (case != .first_frame_read) try culledFrame(f, case, &list, log, false);
+            switch (case) {
+                .read_moved, .body_after_reply, .translated_read => try f.owner.scenePatchPaint(list[2], c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = -2 }),
+                .held_read => try f.owner.scenePatchPaint(list[2], c.OT_SCENE_PROPERTY_TRANSLATE_Y, .{ .translateY = -5 }),
+                // A solve while the node is hidden lays it out at no size.
+                .shown_then_update => try f.owner.sceneSetStyle(list[0], 4, 0, 0, 1, 5, 1),
+                .solve_read, .body_offscreen, .cancelled_solve => {
+                    try f.owner.sceneSetStyle(list[1], 4, 1, 0, 1, 2, 1);
+                    try f.owner.sceneSetStyle(list[19], 4, 0, 0, 1, 7, 1);
+                },
+                .stale_viewport => try f.owner.sceneDestroyNode(list[21]),
+                else => {},
+            }
+            // The next frame walks the candidates again, or keeps them for the scroll.
+            if (case != .read_moved and case != .solve_read and case != .body_offscreen and case != .cancelled_solve and case != .translated_read and case != .held_read and case != .translate_in_reply) try f.owner.scenePatchPaint(list[0], c.OT_SCENE_PROPERTY_OPACITY, .{ .opacity = 0.5 });
+            result.* = culledFrame(f, case, &list, log, true);
+        }
+        results[0] catch |err| {
+            try testing.expectError(err, results[1]);
+            continue;
+        };
+        try results[1];
+        try testing.expectEqualSlices([6]u64, logs[0].items, logs[1].items);
+        try twins[0].expectSameCells(twins[1]);
+        // The reply's UPDATE reaches the node it shows, in a later round.
+        if (case == .shown_then_update or case == .hidden_row) {
+            var updates: usize = 0;
+            for (logs[1].items) |entry| updates += @intFromBool(entry[0] == c.OT_SCENE_FRAME_UPDATE and entry[5] == g_slot);
+            try testing.expectEqual(@as(usize, 1), updates);
+        }
+    }
+}
+
+// A viewport inside another culling parent's culled row bounds its filtering parent where it
+// lies, as the full walk reads it (B5d).
+test "Scene viewport inside a culled row filters as the full walk does" {
+    const twins = [2]Fixture{ try Fixture.init(testing.allocator, 4, 4, .{}), try Fixture.init(testing.allocator, 4, 4, .{}) };
+    defer for (twins) |f| f.deinit();
+    for (twins, 0..) |f, twin| {
+        try f.owner.sceneSetDebugFlags(f.id, if (twin == 0) c.OT_SCENE_DEBUG_FULL_FRAME else 0);
+        const viewport = try placedAt(f, f.root, c.OT_SCENE_BOX, 10, 0, 0, 4, 1);
+        const content = try placedAt(f, viewport, c.OT_SCENE_BOX, 11, 0, 0, 4, 16);
+        try f.owner.sceneSetViewport(content, viewport);
+        var other_viewport: context.Handle = undefined;
+        for (0..16) |i| {
+            const row = try placedAt(f, content, c.OT_SCENE_BOX, @intCast(20 + i), 0, @floatFromInt(i), 4, 1);
+            if (i == 2) other_viewport = try placedAt(f, row, c.OT_SCENE_BOX, 40, 0, 0, 4, 1);
+        }
+        const other_content = try placedAt(f, f.root, c.OT_SCENE_BOX, 41, 0, 0, 4, 16);
+        try f.owner.sceneSetViewport(other_content, other_viewport);
+        for (0..16) |i| {
+            const row = try placedAt(f, other_content, c.OT_SCENE_BOX, @intCast(50 + i), 0, @floatFromInt(i), 4, 1);
+            try f.owner.sceneSetPaint(row, .{ .background = .{ 99, 0, 0, 255 } });
+        }
+        _ = try presentStepped(f, NoReply{});
+    }
+    try twins[0].expectSameCells(twins[1]);
 }

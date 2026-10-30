@@ -51,6 +51,7 @@ typedef int32_t ot_status;
 #define OT_IMAGE_OUTPUT_TOO_SMALL (-INT32_C(45))
 #define OT_IMAGE_UNSUPPORTED_FEATURE (-INT32_C(46))
 #define OT_IMAGE_BUSY (-INT32_C(47))
+#define OT_VIDEO_FAILED (-INT32_C(60))
 
 /* A context owns its native resources and I/O storage. Only its creating OS
  * thread may call its functions, including error queries and destruction.
@@ -82,6 +83,7 @@ typedef struct ot_handle {
 #define OT_SCENE_CUSTOM UINT32_C(6)
 #define OT_SCENE_TEXT_VIEW UINT32_C(7)
 #define OT_SCENE_IMAGE UINT32_C(8)
+#define OT_SCENE_VIDEO UINT32_C(9)
 #define OT_SCENE_WRAP_NONE UINT32_C(0)
 #define OT_SCENE_WRAP_CHAR UINT32_C(1)
 #define OT_SCENE_WRAP_WORD UINT32_C(2)
@@ -612,7 +614,7 @@ ot_status ot_scene_set_hooks(ot_context *, const ot_handle *node, const ot_scene
  * it plays RENDER_BEFORE, then RENDER_SELF in place of the node's native body,
  * then native editor cursor maintenance, then RENDER_AFTER, before the node's
  * children. A slot without a recorded phase draws nothing for that phase. An
- * IMAGE node with a backing buffer from ot_scene_set_image plays its phases into
+ * IMAGE or VIDEO node with a backing buffer from ot_scene_set_image or ot_scene_set_video plays its phases into
  * that buffer, in buffer coordinates, after native code clears it and before
  * composing it.
  * recording must be NULL with zero length for every other acknowledgement.
@@ -1024,10 +1026,17 @@ ot_status ot_scene_get_text_lines(ot_context *, const ot_handle *node, uint32_t 
  * combine that geometry with current accepted ancestor relationships
  * and translations immediately, without running layout. OT_LAYOUT_YOGA instead
  * copies the six actual Yoga computed values, including zero dimensions, and
- * sets screen_x/y to zero. OT_LAYOUT_PAINT copies prepared paint geometry, including
- * screen_x/y, with each axis that leaves the signed 32-bit cell range clamped to the
- * whole cells it paints within 2^22 of the origin, at least one; PUBLIC and YOGA keep
- * the unclamped values. During a RECORD request, mutations do not change those coordinates.
+ * sets screen_x/y to zero. OT_LAYOUT_PAINT copies where the latest paint list painted the
+ * node, or where a frame being prepared places it, including screen_x/y, with each axis
+ * that leaves the signed 32-bit cell range clamped to the whole cells it paints within 2^22
+ * of the origin, at least one unless zero; PUBLIC and YOGA keep the unclamped values.
+ * PUBLIC raises a zero width or height to one cell; PAINT keeps it, and a node with a zero
+ * dimension paints and hits no cell. During a RECORD request, mutations do not change those
+ * coordinates. A node that list did not paint (hidden, culled, or detached), and every node
+ * after a solve or after a change between frames that drops the list, until the next list
+ * paints it, reads its latest solved geometry composed with current translations and
+ * offsets; zeros if Yoga has not laid it out since it was created or moved. While a host
+ * request is pending, such a node's first read holds.
  * These reads do not run layout. Other selectors reject without changing output.
  * A scroll node's children report YOGA values local to its content node, and their
  * screen_x/y compose through the viewport and content origins and the offset. */
@@ -1828,6 +1837,62 @@ ot_status ot_image_pixels_release(ot_context *, const ot_handle *lease);
 ot_status ot_scene_set_image(ot_context *, const ot_handle *node, const ot_handle *image,
     uint32_t fit, uint32_t protocol, const ot_handle *buffer);
 
+/* A VIDEO node owns one decoder and player. Decoded frames stay native: each paint
+ * of the node draws the current frame as the IMAGE node does, from a small set of
+ * images that the decoder refreshes in place while no buffer retains them. Audio
+ * plays from a native thread; paints and ot_video_get_state advance the clock and
+ * end or loop playback, so an unpainted node keeps time. Hosts keep frames painting
+ * while playback runs, for example with a live renderable. ot_scene_set_video sets fit and buffer as ot_scene_set_image does;
+ * frames draw with OT_IMAGE_PROTOCOL_AUTO.
+ * ot_video_open replaces the player; a zero path_length closes it, and path may then
+ * be NULL. Audio plays through a private audio engine and is the media clock while it
+ * plays. A decode worker thread starts when the node first needs a frame; an audio
+ * thread starts on the first play of a source with audio and makes every audio engine
+ * call. Failed opens, seeks, and decodes return OT_VIDEO_FAILED; ot_video_get_error
+ * copies the detail. After a failure, ot_video_play and ot_video_seek retry; other
+ * controls still apply and succeed. A paused seek decodes its frame once the node has
+ * painted, so decode failures return from the seek. Audio failures leave playback running silently on the wall clock. Control and
+ * state calls on a node without an open player return OT_INVALID_PHASE.
+ * In ot_video_info, zero duration_us or fps_num means unknown. */
+typedef struct ot_video_info {
+    int64_t duration_us;
+    uint32_t width, height, fps_num, fps_den, has_audio, reserved;
+} ot_video_info;
+/* BUFFERING: playing, and the audio clock waits for queued audio. AUDIO: playing, and
+ * audio output drives the media clock. Without either, playback follows the wall clock. */
+#define OT_VIDEO_PLAYING UINT32_C(1)
+#define OT_VIDEO_ENDED UINT32_C(2)
+#define OT_VIDEO_BUFFERING UINT32_C(4)
+#define OT_VIDEO_AUDIO UINT32_C(8)
+#define OT_VIDEO_HAS_FRAME UINT32_C(16)
+#define OT_VIDEO_ERROR UINT32_C(32)
+typedef struct ot_video_state {
+    int64_t current_time_us;
+    int64_t frame_pts_us;
+    /* quality_tier: 0 is full decode size; each higher tier decodes Kitty output smaller to keep up. */
+    uint32_t flags, quality_tier;
+} ot_video_state;
+ot_status ot_scene_set_video(ot_context *, const ot_handle *node, uint32_t fit, const ot_handle *buffer);
+ot_status ot_video_open(ot_context *, const ot_handle *node, const uint8_t *path, uint32_t path_length,
+    ot_video_info *out_info);
+ot_status ot_video_play(ot_context *, const ot_handle *node);
+ot_status ot_video_pause(ot_context *, const ot_handle *node);
+ot_status ot_video_seek(ot_context *, const ot_handle *node, int64_t time_us);
+ot_status ot_video_set_loop(ot_context *, const ot_handle *node, uint32_t loop);
+ot_status ot_video_set_muted(ot_context *, const ot_handle *node, uint32_t muted);
+ot_status ot_video_set_volume(ot_context *, const ot_handle *node, float volume);
+/* Positive offsets show frames earlier relative to the media clock. Offsets beyond
+ * +-60 s return OT_INVALID_ARGUMENT. */
+ot_status ot_video_set_av_sync_offset(ot_context *, const ot_handle *node, int64_t offset_us);
+/* Frames present at the lower of fps and the source frame rate. fps is 1 to 120; default 30. */
+ot_status ot_video_set_max_fps(ot_context *, const ot_handle *node, uint32_t fps);
+ot_status ot_video_get_state(ot_context *, const ot_handle *node, ot_video_state *out_state);
+/* Copies the detail of the last failure, empty without one. Zero capacity reports the
+ * exact byte count; otherwise insufficient capacity rejects without writing bytes or
+ * out_count. bytes may be NULL only for zero capacity. No terminating NUL is added. */
+ot_status ot_video_get_error(ot_context *, const ot_handle *node, uint8_t *bytes, uint32_t capacity,
+    uint32_t *out_count);
+
 /* x/y and width/height count terminal cells. pixel_* and source_* count image
  * pixels. Absent source extents and reserved fields must be zero. Exact size and
  * version are required. Only the two SOURCE_* flags are accepted. */
@@ -2376,6 +2441,10 @@ typedef struct ot_session_capabilities {
 #define OT_PUMP_OUTPUT_PENDING UINT32_C(2)
 #define OT_PUMP_WAIT_UNTIL UINT32_C(3)
 #define OT_PUMP_CLOSED UINT32_C(4)
+
+/* ot_session_post_stdout states. */
+#define OT_STDOUT_IDLE UINT32_C(0)
+#define OT_STDOUT_IN_FLIGHT UINT32_C(1)
 
 /* Initialize struct_size and abi_version. status, reserved, and deadline_ns are
  * output-only. deadline_ns is nonzero only for OT_PUMP_WAIT_UNTIL. No memory is
@@ -3263,6 +3332,35 @@ ot_status ot_session_drain_stdout(
     ot_context *context,
     const ot_handle *session,
     uint32_t max_bytes,
+    uint32_t *out_written);
+
+/* Write process stdout from a native thread that the Session owns, so this call
+ * never waits in write(2) on a slow terminal.
+ * wait=0: if the running copy has ended, complete its bytes as complete_output
+ *   would; then, when max_bytes is positive and output is queued, copy the next
+ *   prefix (at most max_bytes and 64 KiB) to the thread and start it. max_bytes
+ *   zero only collects.
+ * wait=1 (process exit only): never starts a copy. Waits for the running copy
+ *   without a limit and completes it. A copy the thread has not picked up within
+ *   100 ms is taken back unwritten, stays queued for drain_stdout, and the thread
+ *   is stopped. With no copy running, or no thread: OT_OK and OT_STDOUT_IDLE.
+ * out_written is the bytes this call completed; out_state is OT_STDOUT_IN_FLIGHT
+ * when a copy is still running on return, else OT_STDOUT_IDLE. A failed write
+ * returns OT_OUTPUT_FAILED and stops the transport without replay; outputs are
+ * then unchanged. wait above 1 or a null output: OT_INVALID_ARGUMENT. A pending
+ * read_output ticket: OT_OUTPUT_BUSY. Before consuming output, wait=0 returns
+ * OT_UNSUPPORTED_RESOURCE when stdout is not a terminal, on platforms without the
+ * writer (it runs on Linux), or when the thread cannot start: use drain_stdout.
+ * While a copy is posted, read_output, drain_output and drain_stdout return
+ * OT_OUTPUT_BUSY and complete_output returns OT_STALE_OUTPUT for any ticket.
+ * Cancel and destroy never wait for a running copy. The thread calls nothing
+ * back and keeps the library loaded until process exit. */
+ot_status ot_session_post_stdout(
+    ot_context *context,
+    const ot_handle *session,
+    uint32_t max_bytes,
+    uint32_t wait,
+    uint32_t *out_state,
     uint32_t *out_written);
 
 /* success must be 0 or 1. Failure stops the transport without replaying bytes.

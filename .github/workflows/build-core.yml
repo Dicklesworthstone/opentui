@@ -48,8 +48,31 @@ jobs:
         if: steps.bottle.outputs.cache-hit != 'true'
         uses: ./.github/actions/setup-native-symbol-tools
 
+      # Native video statically links FFmpeg. Its static libraries depend only on the pinned build script.
+      - name: Restore FFmpeg build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            packages/native/.cache/ffmpeg/prefix
+            packages/native/.cache/ffmpeg/downloads
+          key: ffmpeg-v1-${{ runner.os }}-${{ hashFiles('packages/native/scripts/build-ffmpeg.ts') }}
+
       - name: Build or package native libraries
         run: bun scripts/native-bottle.ts package --hit "${{ steps.bottle.outputs.cache-hit }}" --zig "${{ env.ZIG_VERSION }}" --all
+
+      # FFmpeg's configure and make need a POSIX host, so Windows native tests link this cross-built prefix.
+      # A bottle hit skips the FFmpeg build, so build the prefix here if the cache lacks it.
+      - name: Build Windows FFmpeg prefix
+        working-directory: packages/native
+        run: bun scripts/build-ffmpeg.ts --target=x86_64-windows
+
+      - name: Upload Windows FFmpeg prefix
+        uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-x86_64-windows
+          path: packages/native/.cache/ffmpeg/prefix/x86_64-windows/
+          if-no-files-found: error
+          retention-days: 1
 
       # A saved bottle already passed this compile check for the same inputs.
       - name: Build custom target without Ghostty VT
@@ -73,7 +96,8 @@ jobs:
           name: native-symbols
           path: artifacts/native-symbols/*.zip
           if-no-files-found: error
-          retention-days: 1
+          # As long as the Windows crash dumps, which need the PDB.
+          retention-days: 7
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v7
@@ -155,13 +179,54 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/enable-linux-coredumps
 
+      # Native video statically links FFmpeg. Its static libraries depend only on the pinned build script.
+      - name: Restore FFmpeg build cache
+        id: ffmpeg
+        uses: actions/cache@v5
+        with:
+          path: |
+            packages/native/.cache/ffmpeg/prefix
+            packages/native/.cache/ffmpeg/downloads
+          key: ffmpeg-v1-${{ runner.os }}-${{ hashFiles('packages/native/scripts/build-ffmpeg.ts') }}
+
+      # FFmpeg cannot build on Windows, so a cache miss waits for the build job's cross-built prefix.
+      - name: Wait for Windows FFmpeg prefix
+        if: runner.os == 'Windows' && steps.native-tested.outputs.cache-hit != 'true' && steps.ffmpeg.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/wait-for-job.ts --name "Build Native Libraries"
+
+      - name: Download Windows FFmpeg prefix
+        if: runner.os == 'Windows' && steps.native-tested.outputs.cache-hit != 'true' && steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: ffmpeg-x86_64-windows
+          path: packages/native/.cache/ffmpeg/prefix/x86_64-windows/
+
+      # Windows Error Reporting writes a minidump when a node.exe that allows it crashes. Bun exits from its own
+      # crash handler first.
+      - name: Enable Windows crash dumps
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dir = "$env:GITHUB_WORKSPACE\.crash-dumps"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
+          New-ItemProperty -Force $wer -Name DontShowUI -PropertyType DWord -Value 1 | Out-Null
+          $key = "$wer\LocalDumps\node.exe"
+          New-Item -Force $key | Out-Null
+          New-ItemProperty -Force $key -Name DumpFolder -PropertyType ExpandString -Value $dir | Out-Null
+          New-ItemProperty -Force $key -Name DumpType -PropertyType DWord -Value 1 | Out-Null
+          New-ItemProperty -Force $key -Name DumpCount -PropertyType DWord -Value 3 | Out-Null
+
       # Native tests build from source, so they run before this job gets the cross-compiled library.
       - name: Run native tests
         if: steps.native-tested.outputs.cache-hit != 'true'
         working-directory: packages/core
         run: |
           if [ "$(uname -s)" = Linux ]; then ulimit -c unlimited; fi
-          bun run test:native
+          bun run test:native -Drequire-video
           bun run test:native:lifetime
           echo "${{ github.sha }}" > ../../.native-tests-passed
 
@@ -179,6 +244,8 @@ jobs:
         uses: ./.github/actions/restore-native-host-bottle
         with:
           zig-version: ${{ env.ZIG_VERSION }}
+          # This job downloads the build job's libraries instead of building them.
+          ffmpeg: false
 
       - name: Install native host bottle
         if: steps.bottle.outputs.cache-hit == 'true'
@@ -291,6 +358,20 @@ jobs:
         with:
           name: crash-dumps-core-${{ matrix.os }}-${{ github.run_attempt }}
 
+      - name: Upload Windows crash dumps
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: crash-dumps-core-${{ matrix.os }}-${{ github.run_attempt }}
+          # The DLL that crashed. Its PDB is in the native-symbols artifact of the same native inputs.
+          path: |
+            ${{ github.workspace }}/.crash-dumps
+            packages/core/node_modules/@opentui/core-win32-x64/opentui.dll
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 9
+          include-hidden-files: true
+
   # Each package's Windows tests take seconds, and a Windows runner takes about a minute to set up, so
   # the packages share this job. Their own workflows test them on Linux and macOS.
   packages-windows:
@@ -332,6 +413,8 @@ jobs:
         uses: ./.github/actions/restore-native-host-bottle
         with:
           zig-version: ${{ env.ZIG_VERSION }}
+          # This job downloads the build job's libraries instead of building them.
+          ffmpeg: false
 
       - name: Install native host bottle
         if: steps.bottle.outputs.cache-hit == 'true'

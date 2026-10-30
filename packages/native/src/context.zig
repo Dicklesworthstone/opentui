@@ -7,6 +7,7 @@ const link = @import("link.zig");
 const yoga = @import("yoga.zig");
 const renderer = @import("renderer.zig");
 const session = @import("session.zig");
+const stdout_writer = @import("stdout-writer.zig");
 const input_parser = @import("input-parser.zig");
 const scene = @import("scene.zig");
 const native_span_feed = @import("native-span-feed.zig");
@@ -24,6 +25,7 @@ const editor_view = @import("editor-view.zig");
 const ansi = @import("ansi.zig");
 const image = @import("image.zig");
 const audio = @import("audio.zig");
+const video = @import("video.zig");
 const clipboard = @import("clipboard/host.zig");
 const encoded_unicode = @import("encoded-unicode.zig");
 pub const embedded_terminal = if (@import("ghostty_vt_options").available)
@@ -1088,6 +1090,21 @@ pub const Context = struct {
         return (try self.getSession(handle)).drainStdout(self.io, max_bytes);
     }
 
+    /// Process stdout from a Session-owned native thread; see `Session.postStdout`.
+    pub fn postStdout(self: *Context, handle: Handle, max_bytes: u32, wait: bool) Error!session.PostResult {
+        try self.beginMutation();
+        defer self.mutating = false;
+        return (try self.getSession(handle)).postStdout(stdout_writer.StdoutWriter, StdoutCreate{}, max_bytes, wait);
+    }
+
+    const StdoutCreate = struct {
+        pub fn create(_: StdoutCreate) error{UnsupportedResource}!*stdout_writer.StdoutWriter {
+            if (comptime !stdout_writer.supported) return error.UnsupportedResource;
+            if (!stdout_writer.stdoutSupported() or !stdout_writer.pinLibrary()) return error.UnsupportedResource;
+            return stdout_writer.StdoutWriter.create(std.heap.c_allocator, .{ .fd = 1 }, .{});
+        }
+    };
+
     pub fn completeOutput(
         self: *Context,
         handle: Handle,
@@ -1871,9 +1888,12 @@ pub const Context = struct {
     pub fn drawSceneBodyOn(self: *Context, target: *buf.OptimizedBuffer, node_handle: Handle, x: i32, y: i32) !void {
         const node = try self.sceneNode(node_handle);
         const owned = node.scene_node.?;
+        try owned.owner.prepareOmitted(&self.objects, node);
         if (owned.text == null and owned.kind != api.OT_SCENE_BOX and owned.kind != api.OT_SCENE_SLIDER and owned.kind != api.OT_SCENE_ARROW) return error.WrongKind;
         if (x >= target.width or y >= target.height) return;
         const text = owned.text orelse return owned.owner.paintBody(&self.objects, target, node, x, y);
+        // A prepared text that Yoga sizes to zero paints nothing; an unprepared one draws its text.
+        if (owned.geometry_epoch != std.math.maxInt(u64) and (owned.layout.width == 0 or owned.layout.height == 0)) return;
         try text.prepareView();
         try target.drawTextBufferChecked(text.view, x, y);
     }
@@ -1944,7 +1964,7 @@ pub const Context = struct {
     pub fn sceneCreateNode(self: *Context, session_handle: Handle, kind: u32, num: u32) !Handle {
         try self.beginMutation();
         defer self.mutating = false;
-        if (kind > api.OT_SCENE_IMAGE or num == 0) return error.InvalidOptions;
+        if (kind > api.OT_SCENE_VIDEO or num == 0) return error.InvalidOptions;
         const value = try self.getSession(session_handle);
         try value.checkOpen();
         const attached = value.renderer orelse return error.RendererNotAttached;
@@ -2043,6 +2063,7 @@ pub const Context = struct {
     fn sceneMutableNode(self: *Context, handle: Handle) !*native_renderable.NativeRenderable {
         const node = try self.sceneNode(handle);
         try (try self.getSession(node.scene_node.?.owner.session)).checkOpen();
+        try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
         return node;
     }
 
@@ -2057,6 +2078,7 @@ pub const Context = struct {
         try self.beginMutation();
         defer self.mutating = false;
         const node = try self.sceneNode(handle);
+        try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
         try yoga.check(yoga.nodeTeardownStatus(node.yoga_node));
         self.destroyToken(try self.objects.beginDestroy(handle));
     }
@@ -2107,6 +2129,70 @@ pub const Context = struct {
         if (source) |value| value.retain();
         node.scene_node.?.control.image.deinit();
         node.scene_node.?.control.image = .{ .source = source, .fit = fit, .protocol = protocol, .buffer = target };
+    }
+
+    fn videoState(self: *Context, handle: Handle) !*scene.VideoState {
+        const node = try self.sceneMutableNode(handle);
+        if (node.scene_node.?.kind != api.OT_SCENE_VIDEO) return error.WrongKind;
+        return &node.scene_node.?.control.video;
+    }
+
+    fn videoPlayer(self: *Context, handle: Handle) !*video.Player {
+        return (try self.videoState(handle)).player orelse error.NoPlayer;
+    }
+
+    pub fn sceneSetVideo(self: *Context, handle: Handle, fit: image.Fit, buffer_handle: ?Handle) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const node = try self.sceneMutableNode(handle);
+        if (node.scene_node.?.kind != api.OT_SCENE_VIDEO) return error.WrongKind;
+        try yoga.check(yoga.nodeTeardownStatus(node.yoga_node));
+        const target = if (buffer_handle) |id| try self.getBuffer(id) else null;
+        if (target) |value| try value.retain();
+        const state = &node.scene_node.?.control.video;
+        state.image.deinit();
+        state.image = .{ .fit = fit, .buffer = target };
+    }
+
+    /// Replaces the node's player. An empty path closes it. A failed open keeps no player.
+    pub fn videoOpen(self: *Context, handle: Handle, path: []const u8) !video.Info {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const state = try self.videoState(handle);
+        if (state.player) |player| player.deinit();
+        state.player = null;
+        state.painted = 0;
+        self.allocator.free(state.open_error);
+        state.open_error = &.{};
+        if (path.len == 0) return .{};
+        var detail: [256]u8 = undefined;
+        state.player = video.Player.open(self.allocator, path, &detail) catch |err| {
+            state.open_error = self.allocator.dupe(u8, std.mem.sliceTo(&detail, 0)) catch &.{};
+            return err;
+        };
+        return state.player.?.video.info;
+    }
+
+    pub fn videoControl(self: *Context, handle: Handle, comptime operation: anytype, args: anytype) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const player = try self.videoPlayer(handle);
+        try @call(.auto, operation, .{player} ++ args);
+    }
+
+    pub fn videoGetState(self: *Context, handle: Handle) !video.PlayerState {
+        try self.beginMutation();
+        defer self.mutating = false;
+        return (try self.videoPlayer(handle)).snapshot();
+    }
+
+    /// Returns the detail of the last open, seek, or decode failure, or of a non-fatal audio failure.
+    pub fn videoGetError(self: *Context, handle: Handle) ![]const u8 {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const state = try self.videoState(handle);
+        const player = state.player orelse return state.open_error;
+        return player.lastError();
     }
 
     pub fn sceneSetSurface(self: *Context, handle: Handle, buffer_handle: ?Handle) !void {
@@ -2197,7 +2283,8 @@ pub const Context = struct {
         defer self.mutating = false;
         // Detachment is also used by child-first wrapper cleanup after cancellation.
         const node = if (parent_handle == null) try self.sceneNode(handle) else try self.sceneMutableNode(handle);
-        const parent = if (parent_handle) |id| try self.sceneNode(id) else null;
+        if (parent_handle == null) try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
+        const parent = if (parent_handle) |id| try self.sceneMutableNode(id) else null;
         try node.scene_node.?.owner.move(node, parent, index);
     }
 
@@ -2261,6 +2348,8 @@ pub const Context = struct {
             // A shown child's refresh prepares its view although its layout did not change.
             scene.Scene.markObservationStale(node);
         }
+        // A culling parent's main axis decides which children it selects.
+        if (group == api.OT_STYLE_ENUM and kind == api.OT_STYLE_ENUM_FLEX_DIRECTION) node.scene_node.?.owner.selection_epoch +%= 1;
     }
 
     pub fn sceneGetStyle(self: *Context, handle: Handle, group: u32, kind: u32, edge: u32) !scene.StyleValue {
@@ -2836,7 +2925,9 @@ pub const Context = struct {
 
     pub fn sceneGetPaintLayout(self: *Context, handle: Handle) !scene.Layout {
         try self.checkSceneRead();
-        return scene.getPaintLayout(try self.sceneNode(handle));
+        const node = try self.sceneNode(handle);
+        try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
+        return scene.getPaintLayout(node);
     }
 
     /// Solve the Session root without painting or publishing output. Measurement

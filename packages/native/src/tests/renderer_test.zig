@@ -3449,6 +3449,23 @@ test "renderer - split repaint writes the footer and its pending transition in o
     }
 }
 
+test "renderer - split repaint frames record frame cost" {
+    var pools = TestPools.init(std.testing.allocator);
+    defer pools.deinit();
+
+    var test_cli_renderer = try TestRenderer.create(std.testing.allocator, 12, 3, &pools.graphemes, &pools.links);
+    defer test_cli_renderer.deinit();
+    const cli_renderer = test_cli_renderer.renderer;
+
+    _ = cli_renderer.resetSplitScrollback(2, 2);
+    const stale = std.math.maxInt(u32);
+    cli_renderer.lastFrameCostUs = stale;
+    const frames = cli_renderer.renderStats.frameCount;
+    try std.testing.expectEqual(renderer.RenderStatus.rendered, test_cli_renderer.repaintSplit(2, true));
+    try std.testing.expectEqual(frames + 1, cli_renderer.renderStats.frameCount);
+    try std.testing.expect(cli_renderer.lastFrameCostUs != stale);
+}
+
 test "renderer - split commit appends styled snapshot with snapshot links before footer repaint" {
     var pools = TestPools.init(std.testing.allocator);
     defer pools.deinit();
