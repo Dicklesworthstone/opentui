@@ -7,6 +7,7 @@ const link = @import("link.zig");
 const yoga = @import("yoga.zig");
 const renderer = @import("renderer.zig");
 const session = @import("session.zig");
+const stdout_writer = @import("stdout-writer.zig");
 const input_parser = @import("input-parser.zig");
 const scene = @import("scene.zig");
 const native_span_feed = @import("native-span-feed.zig");
@@ -24,6 +25,7 @@ const editor_view = @import("editor-view.zig");
 const ansi = @import("ansi.zig");
 const image = @import("image.zig");
 const audio = @import("audio.zig");
+const video = @import("video.zig");
 const clipboard = @import("clipboard/host.zig");
 const encoded_unicode = @import("encoded-unicode.zig");
 pub const embedded_terminal = if (@import("ghostty_vt_options").available)
@@ -69,19 +71,20 @@ pub const Error = handles.Error || yoga.Error || session.Error || error{
 pub const RendererBuffer = enum { current, next };
 
 const scene_style_enum_maxima = blk: {
-    @setEvalBranchQuota(64 * std.meta.declarations(api).len);
+    const names = @typeInfo(api).@"struct".decl_names;
+    @setEvalBranchQuota(64 * names.len);
     var count = 0;
-    for (std.meta.declarations(api)) |decl| {
-        if (std.mem.startsWith(u8, decl.name, "OT_STYLE_ENUM_") and
-            !std.mem.endsWith(u8, decl.name, "_MAX")) count += 1;
+    for (names) |name| {
+        if (std.mem.startsWith(u8, name, "OT_STYLE_ENUM_") and
+            !std.mem.endsWith(u8, name, "_MAX")) count += 1;
     }
     var maxima: [count]u32 = undefined;
-    var present = [_]bool{false} ** count;
-    for (std.meta.declarations(api)) |decl| {
-        if (!std.mem.startsWith(u8, decl.name, "OT_STYLE_ENUM_") or
-            !std.mem.endsWith(u8, decl.name, "_MAX")) continue;
-        const kind = @field(api, decl.name[0 .. decl.name.len - "_MAX".len]);
-        maxima[kind] = @field(api, decl.name);
+    var present: [count]bool = @splat(false);
+    for (names) |name| {
+        if (!std.mem.startsWith(u8, name, "OT_STYLE_ENUM_") or
+            !std.mem.endsWith(u8, name, "_MAX")) continue;
+        const kind = @field(api, name[0 .. name.len - "_MAX".len]);
+        maxima[kind] = @field(api, name);
         present[kind] = true;
     }
     for (present) |found| if (!found) @compileError("Missing checked scene style enum constraint");
@@ -137,7 +140,7 @@ pub const BufferDraw = struct {
         respect_alpha = api.OT_BUFFER_DRAW_RESPECT_ALPHA,
 
         comptime {
-            // Record decoders range-check the C value, then cast it with @enumFromInt.
+            // Record decoders range-check the C value, then cast it with @fromBackingInt.
             for (0..api.OT_BUFFER_DRAW_RESPECT_ALPHA + 1) |value| std.debug.assert(std.enums.fromInt(Operation, value) != null);
             std.debug.assert(std.enums.values(Operation).len == api.OT_BUFFER_DRAW_RESPECT_ALPHA + 1);
         }
@@ -156,6 +159,7 @@ pub const BufferDraw = struct {
     border_chars: [11]u32 = @splat(0),
     source: ?Handle = null,
     crop: BufferCrop = .{},
+    fit: buf.TextFit = .{},
 };
 
 pub const BufferStack = struct {
@@ -767,7 +771,7 @@ pub const Context = struct {
             .chunk_size = options.chunk_size,
             .initial_chunks = options.chunk_count,
             .max_bytes = @as(u64, options.chunk_size) * options.chunk_count,
-            .growth_policy = @intFromEnum(native_span_feed.GrowthPolicy.block),
+            .growth_policy = @backingInt(native_span_feed.GrowthPolicy.block),
             .auto_commit_on_full = 1,
             .span_queue_capacity = options.span_capacity,
         });
@@ -935,7 +939,7 @@ pub const Context = struct {
         try value.checkOpen();
         const attached = value.renderer orelse return error.RendererNotAttached;
         if (corner > 3) return error.InvalidOptions;
-        attached.setDebugOverlay(enabled, @enumFromInt(corner));
+        attached.setDebugOverlay(enabled, @fromBackingInt(@intCast(corner)));
     }
 
     pub fn sessionUpdateStats(self: *Context, handle: Handle, overall_ms: f64, fps: u32, callback_ms: f64) Error!void {
@@ -1086,6 +1090,21 @@ pub const Context = struct {
         defer self.mutating = false;
         return (try self.getSession(handle)).drainStdout(self.io, max_bytes);
     }
+
+    /// Process stdout from a Session-owned native thread; see `Session.postStdout`.
+    pub fn postStdout(self: *Context, handle: Handle, max_bytes: u32, wait: bool) Error!session.PostResult {
+        try self.beginMutation();
+        defer self.mutating = false;
+        return (try self.getSession(handle)).postStdout(stdout_writer.StdoutWriter, StdoutCreate{}, max_bytes, wait);
+    }
+
+    const StdoutCreate = struct {
+        pub fn create(_: StdoutCreate) error{UnsupportedResource}!*stdout_writer.StdoutWriter {
+            if (comptime !stdout_writer.supported) return error.UnsupportedResource;
+            if (!stdout_writer.stdoutSupported() or !stdout_writer.pinLibrary()) return error.UnsupportedResource;
+            return stdout_writer.StdoutWriter.create(std.heap.c_allocator, .{ .fd = 1 }, .{});
+        }
+    };
 
     pub fn completeOutput(
         self: *Context,
@@ -1702,7 +1721,7 @@ pub const Context = struct {
                 }, options.foreground, background, options.title_color, options.packed_options & 16 != 0, if (text.len == 0) null else text, @intCast((options.packed_options >> 5) & 3), if (bottom_title.len == 0) null else bottom_title, @intCast((options.packed_options >> 7) & 3));
             },
             // Text and fills draw their part inside the target. A cell outside it draws nothing.
-            .text => try target.drawTextChecked(text, options.x, options.y, options.foreground, options.background, options.attributes),
+            .text => try target.drawTextFitted(text, options.x, options.y, options.foreground, options.background, options.attributes, options.fit),
             .fill => target.fillRectClipped(options.x, options.y, options.width, options.height, background),
             .cell, .cell_blend, .char => {
                 if (options.char > 0x10ffff or (options.char >= 0xd800 and options.char <= 0xdfff)) return error.InvalidOptions;
@@ -1819,7 +1838,7 @@ pub const Context = struct {
             if (cells.len / 3 > self.render_cells_max) return error.InvalidOptions;
         }
         try target.checkImageResources();
-        const channels: buffer_effects.ColorTarget = @enumFromInt(channel);
+        const channels: buffer_effects.ColorTarget = @fromBackingInt(@intCast(channel));
         if (mask) |cells| {
             buffer_effects.colorMatrix(target, matrix, cells, strength, channels);
         } else {
@@ -1870,9 +1889,12 @@ pub const Context = struct {
     pub fn drawSceneBodyOn(self: *Context, target: *buf.OptimizedBuffer, node_handle: Handle, x: i32, y: i32) !void {
         const node = try self.sceneNode(node_handle);
         const owned = node.scene_node.?;
+        try owned.owner.prepareOmitted(&self.objects, node);
         if (owned.text == null and owned.kind != api.OT_SCENE_BOX and owned.kind != api.OT_SCENE_SLIDER and owned.kind != api.OT_SCENE_ARROW) return error.WrongKind;
         if (x >= target.width or y >= target.height) return;
         const text = owned.text orelse return owned.owner.paintBody(&self.objects, target, node, x, y);
+        // A prepared text that Yoga sizes to zero paints nothing; an unprepared one draws its text.
+        if (owned.geometry_epoch != std.math.maxInt(u64) and (owned.layout.width == 0 or owned.layout.height == 0)) return;
         try text.prepareView();
         try target.drawTextBufferChecked(text.view, x, y);
     }
@@ -1943,7 +1965,7 @@ pub const Context = struct {
     pub fn sceneCreateNode(self: *Context, session_handle: Handle, kind: u32, num: u32) !Handle {
         try self.beginMutation();
         defer self.mutating = false;
-        if (kind > api.OT_SCENE_IMAGE or num == 0) return error.InvalidOptions;
+        if (kind > api.OT_SCENE_VIDEO or num == 0) return error.InvalidOptions;
         const value = try self.getSession(session_handle);
         try value.checkOpen();
         const attached = value.renderer orelse return error.RendererNotAttached;
@@ -2042,6 +2064,7 @@ pub const Context = struct {
     fn sceneMutableNode(self: *Context, handle: Handle) !*native_renderable.NativeRenderable {
         const node = try self.sceneNode(handle);
         try (try self.getSession(node.scene_node.?.owner.session)).checkOpen();
+        try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
         return node;
     }
 
@@ -2056,6 +2079,7 @@ pub const Context = struct {
         try self.beginMutation();
         defer self.mutating = false;
         const node = try self.sceneNode(handle);
+        try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
         try yoga.check(yoga.nodeTeardownStatus(node.yoga_node));
         self.destroyToken(try self.objects.beginDestroy(handle));
     }
@@ -2066,18 +2090,18 @@ pub const Context = struct {
         const node = try self.sceneMutableNode(handle);
         if (callback) |function| {
             if (self.scene_measures.get(handle.slot)) |registration| {
-                try yoga.check(yoga.yogaNodeSetNativeMeasureFunc(node.yoga_node, registration, &SceneMeasure.measure));
+                try yoga.check(yoga.yogaNodeSetNativeMeasureFunc(node.yoga_node, registration, &SceneMeasure.measure, false));
                 registration.callback = function;
             } else {
                 try self.scene_measures.ensureUnusedCapacity(self.allocator, 1);
                 const registration = try self.allocator.create(SceneMeasure);
                 errdefer self.allocator.destroy(registration);
                 registration.* = .{ .owner = self, .handle = handle, .callback = function };
-                try yoga.check(yoga.yogaNodeSetNativeMeasureFunc(node.yoga_node, registration, &SceneMeasure.measure));
+                try yoga.check(yoga.yogaNodeSetNativeMeasureFunc(node.yoga_node, registration, &SceneMeasure.measure, false));
                 self.scene_measures.putAssumeCapacity(handle.slot, registration);
             }
         } else {
-            try yoga.check(yoga.yogaNodeSetNativeMeasureFunc(node.yoga_node, null, null));
+            try yoga.check(yoga.yogaNodeSetNativeMeasureFunc(node.yoga_node, null, null, false));
             if (self.scene_measures.fetchRemove(handle.slot)) |entry| self.allocator.destroy(entry.value);
         }
         yoga.yogaNodeInvalidateMeasure(node.yoga_node);
@@ -2104,8 +2128,88 @@ pub const Context = struct {
         }
         if (target) |value| try value.retain();
         if (source) |value| value.retain();
-        node.scene_node.?.control.image.deinit();
-        node.scene_node.?.control.image = .{ .source = source, .fit = fit, .protocol = protocol, .buffer = target };
+        const state = &node.scene_node.?.control.image;
+        const crop = state.crop;
+        state.deinit();
+        state.* = .{ .source = source, .fit = fit, .protocol = protocol, .buffer = target, .crop = crop };
+    }
+
+    /// Sets the source region an IMAGE or VIDEO node shows; null shows the whole source.
+    pub fn sceneSetCrop(self: *Context, handle: Handle, crop: ?image.Region) !void {
+        if (crop) |region| std.debug.assert(region.width > 0 and region.height > 0);
+        try self.beginMutation();
+        defer self.mutating = false;
+        const node = (try self.scenePaintNode(handle)).scene_node.?;
+        switch (node.kind) {
+            api.OT_SCENE_IMAGE => node.control.image.crop = crop,
+            api.OT_SCENE_VIDEO => node.control.video.image.crop = crop,
+            else => return error.WrongKind,
+        }
+    }
+
+    fn videoState(self: *Context, handle: Handle) !*scene.VideoState {
+        const node = try self.sceneMutableNode(handle);
+        if (node.scene_node.?.kind != api.OT_SCENE_VIDEO) return error.WrongKind;
+        return &node.scene_node.?.control.video;
+    }
+
+    fn videoPlayer(self: *Context, handle: Handle) !*video.Player {
+        return (try self.videoState(handle)).player orelse error.NoPlayer;
+    }
+
+    pub fn sceneSetVideo(self: *Context, handle: Handle, fit: image.Fit, buffer_handle: ?Handle) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const node = try self.sceneMutableNode(handle);
+        if (node.scene_node.?.kind != api.OT_SCENE_VIDEO) return error.WrongKind;
+        try yoga.check(yoga.nodeTeardownStatus(node.yoga_node));
+        const target = if (buffer_handle) |id| try self.getBuffer(id) else null;
+        if (target) |value| try value.retain();
+        const state = &node.scene_node.?.control.video;
+        const crop = state.image.crop;
+        state.image.deinit();
+        state.image = .{ .fit = fit, .buffer = target, .crop = crop };
+    }
+
+    /// Replaces the node's player. An empty path closes it. A failed open keeps no player.
+    pub fn videoOpen(self: *Context, handle: Handle, path: []const u8, audio_enabled: bool) !video.Info {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const state = try self.videoState(handle);
+        if (state.player) |player| player.deinit();
+        state.player = null;
+        state.painted = 0;
+        self.allocator.free(state.open_error);
+        state.open_error = &.{};
+        if (path.len == 0) return .{};
+        var detail: [256]u8 = undefined;
+        state.player = video.Player.open(self.allocator, path, audio_enabled, &detail) catch |err| {
+            state.open_error = self.allocator.dupe(u8, std.mem.sliceTo(&detail, 0)) catch &.{};
+            return err;
+        };
+        return state.player.?.video.info;
+    }
+
+    pub fn videoControl(self: *Context, handle: Handle, comptime operation: anytype, args: anytype) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const player = try self.videoPlayer(handle);
+        try @call(.auto, operation, .{player} ++ args);
+    }
+
+    pub fn videoGetState(self: *Context, handle: Handle) !video.PlayerState {
+        try self.beginMutation();
+        defer self.mutating = false;
+        return (try self.videoPlayer(handle)).snapshot();
+    }
+
+    /// Returns the detail of the last open, seek, or decode failure, or of a non-fatal audio failure.
+    pub fn videoGetError(self: *Context, handle: Handle) ![]const u8 {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const state = try self.videoState(handle);
+        const player = state.player orelse return state.open_error;
+        return player.lastError();
     }
 
     pub fn sceneSetSurface(self: *Context, handle: Handle, buffer_handle: ?Handle) !void {
@@ -2196,7 +2300,8 @@ pub const Context = struct {
         defer self.mutating = false;
         // Detachment is also used by child-first wrapper cleanup after cancellation.
         const node = if (parent_handle == null) try self.sceneNode(handle) else try self.sceneMutableNode(handle);
-        const parent = if (parent_handle) |id| try self.sceneNode(id) else null;
+        if (parent_handle == null) try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
+        const parent = if (parent_handle) |id| try self.sceneMutableNode(id) else null;
         try node.scene_node.?.owner.move(node, parent, index);
     }
 
@@ -2260,6 +2365,8 @@ pub const Context = struct {
             // A shown child's refresh prepares its view although its layout did not change.
             scene.Scene.markObservationStale(node);
         }
+        // A culling parent's main axis decides which children it selects.
+        if (group == api.OT_STYLE_ENUM and kind == api.OT_STYLE_ENUM_FLEX_DIRECTION) node.scene_node.?.owner.selection_epoch +%= 1;
     }
 
     pub fn sceneGetStyle(self: *Context, handle: Handle, group: u32, kind: u32, edge: u32) !scene.StyleValue {
@@ -2665,7 +2772,7 @@ pub const Context = struct {
             // their caches first so no failing work follows selection publication.
             try text.prepareView();
             if (text.view.virtual_lines.items.len > std.math.maxInt(i32)) return error.InvalidOptions;
-            const behavior: text_buffer_view.SelectionBehavior = @enumFromInt(options.behavior);
+            const behavior: text_buffer_view.SelectionBehavior = @fromBackingInt(@intCast(options.behavior));
             break :selection if (options.operation == api.OT_SCENE_TEXT_SELECTION_SET)
                 text.view.setLocalSelectionBehavior(options.anchor_x, options.anchor_y, options.focus_x, options.focus_y, options.background, options.foreground, behavior)
             else
@@ -2835,7 +2942,9 @@ pub const Context = struct {
 
     pub fn sceneGetPaintLayout(self: *Context, handle: Handle) !scene.Layout {
         try self.checkSceneRead();
-        return scene.getPaintLayout(try self.sceneNode(handle));
+        const node = try self.sceneNode(handle);
+        try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
+        return scene.getPaintLayout(node);
     }
 
     /// Solve the Session root without painting or publishing output. Measurement

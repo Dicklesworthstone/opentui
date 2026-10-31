@@ -7,6 +7,7 @@ const buffer = @import("../buffer.zig");
 const gp = @import("../grapheme.zig");
 const utf8 = @import("../utf8.zig");
 const Fixture = @import("scene_fixture_test.zig").Fixture;
+const NoResizeAllocator = @import("no-resize-allocator.zig");
 
 const Clock = struct {
     time_us: i64,
@@ -372,9 +373,10 @@ test "Context handles distinguish context, kind, stale generation, and limits" {
 test "Context scene measure maps invalid host sizes to zero without a Yoga warning" {
     const Host = struct {
         var width: f32 = 0;
+        var half = false;
 
-        fn measure(_: u64, _: u32, _: u32, _: f32, _: u32, _: f32, _: u32, result: *yoga.ExternalYogaSize) callconv(.c) void {
-            result.* = .{ .width = width, .height = 1 };
+        fn measure(_: u64, _: u32, _: u32, _: f32, _: u32, height: f32, _: u32, result: *yoga.ExternalYogaSize) callconv(.c) void {
+            result.* = .{ .width = width, .height = if (half) height / 2 else 1 };
         }
     };
     const owner = try context.Context.init(std.testing.allocator, std.testing.io, .{});
@@ -394,6 +396,14 @@ test "Context scene measure maps invalid host sizes to zero without a Yoga warni
         try std.testing.expectEqual(@as(f32, if (width == 3) 3 else 0), measured.width);
         try std.testing.expectEqual(@as(f32, 1), measured.height);
         try std.testing.expect(owner.diagnostics.pop() == null);
+    }
+    // Half the offered height: a host measure may use the cap beyond clamping, so a larger
+    // cap measures again.
+    Host.half = true;
+    try owner.sceneMarkDirty(node);
+    for ([_]f32{ 10, 20 }) |height| {
+        try owner.sceneSetStyle(root, 4, 1, 0, 1, height, 1);
+        try std.testing.expectEqual(height / 2, (try layout(owner, node)).height);
     }
 }
 
@@ -621,7 +631,7 @@ test "Context concurrently renders with independent pools, Yoga callbacks, clock
     try std.testing.expectEqualStrings("https://second.invalid", try second.links.get(second_link));
     try std.testing.expectError(error.WrongContext, second.raw().getRenderable(first_identity));
     const custom = try second.raw().getRenderable(tasks[1].custom_id);
-    yoga.yogaNodeStyleSetValue(custom.yoga_node, @intFromEnum(yoga.YogaValueKind.min_width), 0, @intFromEnum(yoga.YogaUnit.point), 1);
+    yoga.yogaNodeStyleSetValue(custom.yoga_node, @backingInt(yoga.YogaValueKind.min_width), 0, @backingInt(yoga.YogaUnit.point), 1);
     second_clock.time_us += 1000;
     try tasks[1].render();
     try std.testing.expect(second_callbacks.dirtied > 0);
@@ -650,8 +660,9 @@ fn createTextWithFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "Context initialization and owned resource allocation failures release all storage" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, createWithFailures, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, createTextWithFailures, .{});
+    var no_resize: NoResizeAllocator = .{ .child = std.testing.allocator };
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), createWithFailures, .{});
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), createTextWithFailures, .{});
     try std.testing.expectError(error.InvalidOptions, context.Context.init(std.testing.allocator, std.testing.io, .{ .object_capacity = 0 }));
     try std.testing.expectError(error.InvalidOptions, context.Context.init(std.testing.allocator, std.testing.io, .{ .render_cells_max = 0 }));
 }

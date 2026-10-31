@@ -7,6 +7,7 @@ const bench_utils = @import("../bench-utils.zig");
 const context = @import("../context.zig");
 const scene = @import("../scene.zig");
 const renderer = @import("../renderer.zig");
+const utils = @import("../utils.zig");
 
 pub const benchName = "Scene Frame";
 
@@ -93,7 +94,7 @@ pub const Scene = struct {
         const body = try self.node(c.OT_SCENE_BOX, self.root);
         try self.float(body, c.OT_STYLE_FLOAT_FLEX_GROW, 1);
         for (0..40) |_| {
-            _ = try self.text(try self.node(c.OT_SCENE_BOX, body), "a" ** 70);
+            _ = try self.text(try self.node(c.OT_SCENE_BOX, body), utils.repeat(u8, "a", 70));
         }
         const footer = try self.node(c.OT_SCENE_BOX, self.root);
         try self.dimension(footer, 1, 3);
@@ -208,6 +209,8 @@ const scenarios = [_]Scenario{
     .{ .name = "scroll-10000 scroll by one row", .shape = .scroll, .size = 10_000, .change = .scroll },
     .{ .name = "scroll-10000 append", .shape = .scroll, .size = 10_000, .change = .append },
     .{ .name = "scroll-1000-w6d2 unchanged", .shape = .wrapped_scroll, .size = 1000, .change = .unchanged },
+    .{ .name = "scroll-1000-w6d2 status glyph", .shape = .wrapped_scroll, .size = 1000, .change = .glyph },
+    .{ .name = "scroll-1000-w6d2 scroll by one row", .shape = .wrapped_scroll, .size = 1000, .change = .scroll },
     .{ .name = "scroll-node-10000 unchanged", .shape = .scroll_node, .size = 10_000, .change = .unchanged },
     .{ .name = "scroll-node-10000 scroll by one row", .shape = .scroll_node, .size = 10_000, .change = .scroll },
     .{ .name = "scroll-node-10000 append", .shape = .scroll_node, .size = 10_000, .change = .append },
@@ -231,9 +234,9 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, show_mem: bool, bench_filte
             work = try target.frame(scenario.change);
             if (sample >= WARMUP_SAMPLES) stats.record(timer.read());
         }
-        const counters = try allocator.alloc(bench_utils.Counter, std.meta.fields(renderer.FrameWork).len - 1);
-        inline for (std.meta.fields(renderer.FrameWork)[1..], 0..) |field, index| {
-            counters[index] = .{ .name = field.name, .value = @field(work, field.name) };
+        const counters = try allocator.alloc(bench_utils.Counter, @typeInfo(renderer.FrameWork).@"struct".field_names.len - 1);
+        inline for (@typeInfo(renderer.FrameWork).@"struct".field_names[1..], 0..) |name, index| {
+            counters[index] = .{ .name = name, .value = @field(work, name) };
         }
         try results.append(allocator, .{
             .name = scenario.name,

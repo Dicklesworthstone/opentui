@@ -13,6 +13,7 @@ const EditBuffer = @import("../edit-buffer.zig").EditBuffer;
 const EditorView = @import("../editor-view.zig").EditorView;
 const OptimizedBuffer = @import("../buffer.zig").OptimizedBuffer;
 const scene_fixture = @import("scene_fixture_test.zig");
+const utils = @import("../utils.zig");
 const Counts = text_work.Counts;
 const ControlDisplay = @import("../utf8.zig").ControlDisplay;
 
@@ -135,7 +136,7 @@ test "text work: the frame after one edit lays out and measures only the lines i
     var pools = TestPools.init(allocator);
     defer pools.deinit();
     const line = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor in";
-    const paste = "pasted line of text that is shorter than the wrap width\n" ** 100;
+    const paste = utils.repeat(u8, "pasted line of text that is shorter than the wrap width\n", 100);
     const Op = enum { insert, delete, paste, undo, enter, join };
     // Lines laid out = document lines × `per_line` + `extra`. Before dirty line ranges, every
     // row was 1 × the document (paste +100, Enter +1, join −1).
@@ -240,7 +241,7 @@ test "text work: replaced lines and word metadata stay within a constant factor 
     }
     // Word metadata: a one-line paragraph, and many lines whose edits alternate with width changes.
     const rows = [_]struct { line: []const u8, lines: usize, rewrap: bool }{
-        .{ .line = "word " ** 40, .lines = 1, .rewrap = false },
+        .{ .line = utils.repeat(u8, "word ", 40), .lines = 1, .rewrap = false },
         .{ .line = "alpha \u{754c} e\u{301} words and more words", .lines = 200, .rewrap = true },
     };
     for (rows) |row| {
@@ -392,12 +393,12 @@ test "text work: drawing a long line scrolled right or down searches for its fir
         .{ .unit = "a", .prefix = "0123456789\u{200b}", .reads = 1, .steps = .{ 0, 0, 0 }, .drawn = .{ 80, 80, 80 } },
         .{ .unit = "a", .prefix = "0123456789\u{200b}", .control = .notation, .reads = 1, .steps = .{ 0, 0, 0 }, .drawn = .{ 80, 80, 80 } },
         .{ .unit = "a", .truncate = true, .xs = .{ 10, 40, 60 }, .steps = .{ 0, 1, 2 }, .drawn = .{ 70, 40, 20 } },
-        .{ .unit = "\u{754c}", .truncate = true, .xs = .{ 10, 40, 60 }, .scan = .{ 17, 17, 17 }, .steps = .{ 17, 1, 7 }, .drawn = .{ 36, 20, 9 } },
-        .{ .unit = "\u{754c}", .part = 3 * 1024, .steps = .{ 10, 34, 73 }, .drawn = .{ 40, 40, 40 } },
-        .{ .unit = "\u{754c}", .steps = .{ 17, 17, 17 }, .drawn = .{ 40, 40, 40 } },
-        .{ .unit = "\u{1f600}", .steps = .{ 17, 17, 17 }, .drawn = .{ 40, 40, 40 } },
-        .{ .unit = "ab\t", .steps = .{ 17, 17, 17 }, .drawn = .{ 60, 60, 60 } },
-        .{ .unit = "e\u{301}", .steps = .{ 17, 17, 17 }, .drawn = .{ 80, 80, 80 } },
+        .{ .unit = "\u{754c}", .truncate = true, .xs = .{ 10, 40, 60 }, .scan = .{ 17, 17, 17 }, .steps = .{ 18, 1, 7 }, .drawn = .{ 36, 20, 10 } },
+        .{ .unit = "\u{754c}", .part = 3 * 1024, .steps = .{ 11, 35, 74 }, .drawn = .{ 40, 40, 40 } },
+        .{ .unit = "\u{754c}", .steps = .{ 18, 18, 18 }, .drawn = .{ 40, 40, 40 } },
+        .{ .unit = "\u{1f600}", .steps = .{ 18, 18, 18 }, .drawn = .{ 40, 40, 40 } },
+        .{ .unit = "ab\t", .steps = .{ 18, 18, 18 }, .drawn = .{ 60, 60, 60 } },
+        .{ .unit = "e\u{301}", .steps = .{ 18, 18, 18 }, .drawn = .{ 80, 80, 80 } },
         .{ .unit = "\u{754c}", .wrap = .char, .scan = .{ 308, 510, 510 }, .steps = .{ 0, 0, 0 }, .drawn = .{ 1_200, 1_200, 1_192 } },
         .{ .unit = "\u{754c}", .wrap = .word, .scan = .{ 308, 510, 510 }, .steps = .{ 0, 0, 0 }, .drawn = .{ 1_200, 1_200, 1_192 } },
         .{ .unit = "e\u{301}", .wrap = .char, .scan = .{ 337, 510, 510 }, .steps = .{ 0, 0, 0 }, .drawn = .{ 2_400, 2_400, 2_352 } },
@@ -516,7 +517,7 @@ test "text work: wrapping one long line costs work linear in its length" {
         .{ .unit = "x", .mode = .word },
         .{ .unit = "\u{e9}", .mode = .word },
         .{ .unit = "xxxxxxxxxx ", .mode = .word },
-        .{ .unit = "\u{e9}" ** 10 ++ " ", .mode = .word },
+        .{ .unit = utils.repeat(u8, "\u{e9}", 10) ++ " ", .mode = .word },
         .{ .unit = "x", .mode = .char },
         .{ .unit = "\u{e9}", .mode = .char },
     };

@@ -36,6 +36,7 @@ export type {
   NativeRenderStats,
 }
 
+import type { ExtractOptions } from "./image.js"
 import { RGBA } from "./lib/RGBA.js"
 import { isStyledText, type StyledText } from "./lib/styled-text.js"
 import { YogaError, YogaStatus, type MeasureFunction } from "./yoga.js"
@@ -211,6 +212,8 @@ export enum NativeEditPositionQuery {
   Offset = 4,
   Coords = 5,
   LineStart = 6,
+  End = 7,
+  PrevChar = 8,
 }
 
 export enum NativeEditorStyleMask {
@@ -516,7 +519,14 @@ type BufferDrawColors = { foreground?: RGBA; background?: RGBA }
 export type NativeBufferDraw =
   | { operation: "clear"; background?: RGBA }
   | (BufferDrawPosition & { operation: "fill"; width?: number; height?: number; background?: RGBA })
-  | (BufferDrawPosition & BufferDrawColors & { operation: "text"; text?: string; attributes?: number })
+  | (BufferDrawPosition &
+      BufferDrawColors & {
+        operation: "text"
+        text?: string
+        attributes?: number
+        maxWidth?: number
+        ellipsis?: boolean
+      })
   | (BufferDrawPosition &
       BufferDrawColors & { operation: "cell" | "cellBlend" | "char"; char?: number; attributes?: number })
   | (BufferDrawPosition &
@@ -744,6 +754,12 @@ export interface NativeSessionRendererState {
   height: number
   frameCount: bigint
   framePending: boolean
+  /** Presented Kitty and Sixel placements whose image a later frame still sends. */
+  imageUploadsPending: number
+  /** Distinct frame contents dropped because their output is larger than the write limit. */
+  droppedFrames: number
+  /** The size of the last attempt's frame when it was dropped for size, else 0. */
+  droppedFrameBytes: number
 }
 
 export interface NativeSessionKittyImageTransportStatus {
@@ -765,7 +781,14 @@ export interface NativeSessionTerminalOptions {
   clearOnClose?: boolean
   /** End the startup query batch with DA1 (the reply sentinel). Defaults to false. */
   replySentinel?: boolean
+  /** Wrap frames in synchronized output (DEC mode 2026). Defaults to "auto". */
+  synchronizedOutput?: SynchronizedOutput
+  /** The output passes through tmux, screen or Zellij on this host. Defaults to false. */
+  hostMultiplexer?: boolean
 }
+
+/** "auto" leaves synchronized output out for a remote terminal without mode 2026 or under a multiplexer on the app's host. */
+export type SynchronizedOutput = "auto" | "always" | "never"
 
 export enum NativeSessionTerminalPhase {
   Uninitialized = 0,
@@ -848,6 +871,28 @@ export enum NativeStatus {
   LayoutLimit = -26,
   FrameBusy = -27,
   FrameRequestLimit = -28,
+  VideoFailed = -60,
+}
+
+export interface NativeVideoInfo {
+  durationUs: bigint
+  width: number
+  height: number
+  fpsNum: number
+  fpsDen: number
+  hasAudio: boolean
+}
+
+export interface NativeVideoState {
+  currentTimeUs: bigint
+  framePtsUs: bigint
+  playing: boolean
+  ended: boolean
+  buffering: boolean
+  audio: boolean
+  hasFrame: boolean
+  failed: boolean
+  qualityTier: number
 }
 
 export class NativeError extends Error {
@@ -1019,6 +1064,14 @@ registerEnvVar({
   type: "string",
   required: false,
 })
+// Read by video-shim.c when a video opens
+registerEnvVar({
+  name: "OPENTUI_EXPERIMENTAL_VIDEO_HWACCEL",
+  description:
+    "Experimental: decode video with VideoToolbox on macOS when set to exactly 1 or true; otherwise or on failure, decode in software",
+  type: "string",
+  required: false,
+})
 
 // Cursor & mouse pointer style mappings (avoid recreation on each call)
 const CURSOR_STYLE_TO_ID = { block: 0, line: 1, underline: 2, default: 3 } as const
@@ -1077,7 +1130,18 @@ const MOUSE_STYLE_TO_ID = {
 const SCENE_BORDER_STYLES = ["single", "double", "rounded", "heavy"] as const
 const SCENE_TEXT_WRAP_MODES = ["none", "char", "word"] as const
 const SCENE_TEXT_ALIGNS = ["left", "center", "right"] as const
-const SCENE_NODE_KINDS = ["root", "box", "text", "slider", "arrow", "editor", "custom", "text_view", "image"] as const
+const SCENE_NODE_KINDS = [
+  "root",
+  "box",
+  "text",
+  "slider",
+  "arrow",
+  "editor",
+  "custom",
+  "text_view",
+  "image",
+  "video",
+] as const
 const IMAGE_PROTOCOL_TO_ID = { auto: 0, kitty: 1, sixel: 2, blocks: 3 } as const
 const IMAGE_FITS = ["fit", "cover", "fill"] as const
 const BUFFER_DRAW_OPERATIONS = new Map<string, { id: number; size: number }>([
@@ -1170,6 +1234,12 @@ function toFFIU64(value: bigint, label: string): bigint {
 function toFFIBool(value: boolean, label: string): 0 | 1 {
   if (typeof value !== "boolean") throw new TypeError(`${label} must be a boolean`)
   return ffiBool(value)
+}
+
+const SYNCHRONIZED_OUTPUT_FLAGS: Record<SynchronizedOutput, number> = {
+  auto: 0,
+  always: nativeConstants.OT_TERMINAL_SYNC_ALWAYS,
+  never: nativeConstants.OT_TERMINAL_SYNC_NEVER,
 }
 
 function toFFIF32(value: number, label: string, allowNaN = false): number {
@@ -1574,8 +1644,10 @@ function encodeBufferDrawRecord(
       const fields = nativeLayouts.ot_buffer_draw_text_record.fields
       encodeDrawPosition(signed, fields, options, base)
       words[word + fields.attributes.offset / 4] = toSafeFFIU32Length(options.attributes ?? 0, "Buffer attributes")
-      if (encodeDrawColors(colors, fields, options, base))
-        words[word + header.flags.offset / 4] = nativeConstants.OT_BUFFER_DRAW_HAS_BACKGROUND
+      words[word + fields.max_width.offset / 4] = toSafeFFIU32Length(options.maxWidth ?? 0, "Buffer text width")
+      words[word + header.flags.offset / 4] =
+        (encodeDrawColors(colors, fields, options, base) ? nativeConstants.OT_BUFFER_DRAW_HAS_BACKGROUND : 0) |
+        (options.ellipsis ? nativeConstants.OT_BUFFER_DRAW_FIT_ELLIPSIS : 0)
       break
     }
     case "cell":
@@ -3462,6 +3534,8 @@ export class FFIRenderLib {
     createEditorSelectionRecord()
   // Info reads never call back into JavaScript, so one output record serves every read.
   private readonly editorViewInfoRecord = createContextRecord(nativeLayouts.ot_editor_view_info)
+  private readonly videoStateRecord = new Uint8Array(nativeLayouts.ot_video_state.size)
+  private readonly videoStateView = new DataView(this.videoStateRecord.buffer)
   private readonly selectionResetRecord = encodeEditorSelection({ operation: NativeEditorSelectionOperation.Reset })
   private readonly localSelectionResetRecord = encodeEditorSelection({
     operation: NativeEditorSelectionOperation.LocalReset,
@@ -5719,6 +5793,161 @@ export class FFIRenderLib {
     })
   }
 
+  public sceneSetVideo(
+    context: NativeContextHandle,
+    node: SceneNodeHandle,
+    fit: "fit" | "cover" | "fill",
+    buffer: ContextBufferHandle | null,
+  ): void {
+    const handle = encodeContextHandle(context, node)
+    const storage = buffer === null ? null : encodeContextHandle(context, buffer)
+    const fitId = IMAGE_FITS.indexOf(fit)
+    if (fitId < 0) throw new TypeError("Unknown video fit")
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_scene_set_video")
+      nativeResult("ot_scene_set_video", this.opentui.symbols.ot_scene_set_video(pointer, handle, fitId, storage))
+    })
+  }
+
+  /** Sets the source region an image or video node shows; undefined shows the whole source. */
+  public sceneSetCrop(context: NativeContextHandle, node: SceneNodeHandle, crop: ExtractOptions | undefined): void {
+    const handle = encodeContextHandle(context, node)
+    const { left = 0, top = 0, width = 0, height = 0 } = crop ?? {}
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_scene_set_crop")
+      nativeResult(
+        "ot_scene_set_crop",
+        this.opentui.symbols.ot_scene_set_crop(pointer, handle, left, top, width, height),
+      )
+    })
+  }
+
+  /** Replaces the node's player; an empty path closes it. Without audio, playback opens no audio device. */
+  public videoOpen(context: NativeContextHandle, node: SceneNodeHandle, path: string, audio: boolean): NativeVideoInfo {
+    const handle = encodeContextHandle(context, node)
+    const bytes = path.length === 0 ? null : sessionBytes(this.encoder.encode(path), "Video path length")
+    const layout = nativeLayouts.ot_video_info
+    const output = new Uint8Array(layout.size)
+    const flags = audio ? 0 : nativeConstants.OT_VIDEO_OPEN_NO_AUDIO
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_open")
+      nativeResult(
+        "ot_video_open",
+        this.opentui.symbols.ot_video_open(pointer, handle, bytes, bytes?.byteLength ?? 0, flags, output),
+      )
+    })
+    const view = new DataView(output.buffer)
+    const fields = layout.fields
+    return {
+      durationUs: view.getBigInt64(fields.duration_us.offset, true),
+      width: view.getUint32(fields.width.offset, true),
+      height: view.getUint32(fields.height.offset, true),
+      fpsNum: view.getUint32(fields.fps_num.offset, true),
+      fpsDen: view.getUint32(fields.fps_den.offset, true),
+      hasAudio: view.getUint32(fields.has_audio.offset, true) !== 0,
+    }
+  }
+
+  public videoCall(
+    context: NativeContextHandle,
+    node: SceneNodeHandle,
+    operation: "ot_video_play" | "ot_video_pause",
+  ): void {
+    const handle = encodeContextHandle(context, node)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, operation)
+      nativeResult(operation, this.opentui.symbols[operation](pointer, handle))
+    })
+  }
+
+  public videoSeek(context: NativeContextHandle, node: SceneNodeHandle, timeUs: bigint): void {
+    const handle = encodeContextHandle(context, node)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_seek")
+      nativeResult("ot_video_seek", this.opentui.symbols.ot_video_seek(pointer, handle, timeUs))
+    })
+  }
+
+  public videoSetLoop(context: NativeContextHandle, node: SceneNodeHandle, loop: boolean): void {
+    const handle = encodeContextHandle(context, node)
+    const value = toFFIBool(loop, "Video loop")
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_set_loop")
+      nativeResult("ot_video_set_loop", this.opentui.symbols.ot_video_set_loop(pointer, handle, value))
+    })
+  }
+
+  public videoSetMuted(context: NativeContextHandle, node: SceneNodeHandle, muted: boolean): void {
+    const handle = encodeContextHandle(context, node)
+    const value = toFFIBool(muted, "Video muted")
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_set_muted")
+      nativeResult("ot_video_set_muted", this.opentui.symbols.ot_video_set_muted(pointer, handle, value))
+    })
+  }
+
+  public videoSetVolume(context: NativeContextHandle, node: SceneNodeHandle, volume: number): void {
+    const handle = encodeContextHandle(context, node)
+    const value = toFFIF32(volume, "Video volume")
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_set_volume")
+      nativeResult("ot_video_set_volume", this.opentui.symbols.ot_video_set_volume(pointer, handle, value))
+    })
+  }
+
+  public videoSetAvSyncOffset(context: NativeContextHandle, node: SceneNodeHandle, offsetUs: bigint): void {
+    const handle = encodeContextHandle(context, node)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_set_av_sync_offset")
+      nativeResult(
+        "ot_video_set_av_sync_offset",
+        this.opentui.symbols.ot_video_set_av_sync_offset(pointer, handle, offsetUs),
+      )
+    })
+  }
+
+  public videoSetMaxFps(context: NativeContextHandle, node: SceneNodeHandle, fps: number): void {
+    const handle = encodeContextHandle(context, node)
+    if (!isFFIU32(fps)) throw new RangeError("Video maxFps must be a u32")
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_set_max_fps")
+      nativeResult("ot_video_set_max_fps", this.opentui.symbols.ot_video_set_max_fps(pointer, handle, fps))
+    })
+  }
+
+  public videoGetState(context: NativeContextHandle, node: SceneNodeHandle): NativeVideoState {
+    const handle = encodeContextHandle(context, node)
+    const layout = nativeLayouts.ot_video_state
+    const output = this.videoStateRecord
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_get_state")
+      nativeResult("ot_video_get_state", this.opentui.symbols.ot_video_get_state(pointer, handle, output))
+    })
+    const view = this.videoStateView
+    const flags = view.getUint32(layout.fields.flags.offset, true)
+    return {
+      currentTimeUs: view.getBigInt64(layout.fields.current_time_us.offset, true),
+      framePtsUs: view.getBigInt64(layout.fields.frame_pts_us.offset, true),
+      playing: (flags & nativeConstants.OT_VIDEO_PLAYING) !== 0,
+      ended: (flags & nativeConstants.OT_VIDEO_ENDED) !== 0,
+      buffering: (flags & nativeConstants.OT_VIDEO_BUFFERING) !== 0,
+      audio: (flags & nativeConstants.OT_VIDEO_AUDIO) !== 0,
+      hasFrame: (flags & nativeConstants.OT_VIDEO_HAS_FRAME) !== 0,
+      failed: (flags & nativeConstants.OT_VIDEO_ERROR) !== 0,
+      qualityTier: view.getUint32(layout.fields.quality_tier.offset, true),
+    }
+  }
+
+  public videoGetError(context: NativeContextHandle, node: SceneNodeHandle): string {
+    const handle = encodeContextHandle(context, node)
+    return this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_video_get_error")
+      return this.readText("ot_video_get_error", (bytes, capacity, count) =>
+        this.opentui.symbols.ot_video_get_error(pointer, handle, bytes, capacity, count),
+      )
+    })
+  }
+
   public contextDrawImage(
     { context, target, frame }: NativeDrawingTarget,
     image: ContextImageHandle,
@@ -6325,6 +6554,9 @@ export class FFIRenderLib {
       height: words[layout.fields.height.offset / 4],
       frameCount: output[layout.fields.frame_count.offset / 8],
       framePending: words[layout.fields.frame_pending.offset / 4] !== 0,
+      imageUploadsPending: words[layout.fields.image_uploads_pending.offset / 4],
+      droppedFrames: words[layout.fields.dropped_frames.offset / 4],
+      droppedFrameBytes: words[layout.fields.dropped_frame_bytes.offset / 4],
     }
   }
 
@@ -6463,6 +6695,10 @@ export class FFIRenderLib {
   ): void {
     const layout = nativeLayouts.ot_session_terminal_options
     const handle = encodeContextHandle(context, session)
+    const synchronizedOutput = options.synchronizedOutput ?? "auto"
+    if (!Object.hasOwn(SYNCHRONIZED_OUTPUT_FLAGS, synchronizedOutput)) {
+      throw new TypeError("Session synchronizedOutput must be auto, always, or never")
+    }
     const flag = (value: boolean | undefined, label: string, bit: number) =>
       toFFIBool(value ?? true, `Session ${label}`) ? bit : 0
     const flags =
@@ -6470,7 +6706,9 @@ export class FFIRenderLib {
       flag(options.mouse, "mouse", nativeConstants.OT_TERMINAL_MOUSE) |
       flag(options.mouseMovement, "mouseMovement", nativeConstants.OT_TERMINAL_MOUSE_MOVEMENT) |
       flag(options.clearOnClose, "clearOnClose", nativeConstants.OT_TERMINAL_CLEAR_ON_CLOSE) |
-      (options.replySentinel ? nativeConstants.OT_TERMINAL_REPLY_SENTINEL : 0)
+      (options.replySentinel ? nativeConstants.OT_TERMINAL_REPLY_SENTINEL : 0) |
+      SYNCHRONIZED_OUTPUT_FLAGS[synchronizedOutput] |
+      (options.hostMultiplexer ? nativeConstants.OT_TERMINAL_HOST_MULTIPLEXER : 0)
     const record = createContextRecord(layout)
     record[layout.fields.flags.offset / 4] = flags
     record[layout.fields.kitty_keyboard_flags.offset / 4] = toSafeFFIU32Length(
@@ -6895,6 +7133,26 @@ export class FFIRenderLib {
       this.opentui.symbols.ot_session_drain_stdout(pointer, handle, limit, output),
     )
     return output[0]
+  }
+
+  /** Collects a finished stdout writer copy and, when `maxBytes` is positive, starts the next. `wait` waits for
+   * the running copy (process exit). */
+  public sessionPostStdout(
+    context: NativeContextHandle,
+    session: SessionHandle,
+    maxBytes: number,
+    wait: boolean,
+  ): { written: number; inFlight: boolean } {
+    const handle = encodeContextHandle(context, session)
+    const limit = toSafeFFIU32Length(maxBytes, "Stdout byte limit")
+    const state = new Uint32Array(1)
+    const written = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_session_post_stdout")
+    nativeResult(
+      "ot_session_post_stdout",
+      this.opentui.symbols.ot_session_post_stdout(pointer, handle, limit, wait ? 1 : 0, state, written),
+    )
+    return { written: written[0]!, inFlight: state[0] === 1 }
   }
 
   public sessionCompleteOutput(
