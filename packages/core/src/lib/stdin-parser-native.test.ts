@@ -193,6 +193,19 @@ const INTENTIONAL: Array<
     [mouse("down", 9, 4), mouse("down", -1, -1)],
     [reply("\x1b[<3;10;5M"), mouse("down", 0, 0)],
   ],
+  ["a typed byte order mark is a character (issue 368)", [bytes("\xef\xbb\xbf")], [key("", "")], [key("\ufeff")]],
+  [
+    "URxvt motion after a wheel tick drags the held button, not the wheel's (issue 426)",
+    ["\x1b[<0;1;1M\x1b[<65;1;1M\x1b[<97;2;1M\x1b[<99;3;1M"],
+    [mouse("down", 0, 0), mouse("scroll", 0, 0, 1), mouse("drag", 1, 0, 1), mouse("move", 2, 0)],
+    [mouse("down", 0, 0), mouse("scroll", 0, 0, 1), mouse("drag", 1, 0), mouse("drag", 2, 0)],
+  ],
+  [
+    "X10 motion with a held button is a drag, after a wheel tick too (issue 426)",
+    [bytes('\x1b[M !!\x1b[M@"!\x1b[M`"!\x1b[M\x80#!')],
+    [mouse("down", 0, 0), mouse("move", 1, 0), mouse("scroll", 1, 0), mouse("move", 2, 0)],
+    [mouse("down", 0, 0), mouse("drag", 1, 0), mouse("scroll", 1, 0), mouse("drag", 2, 0)],
+  ],
 ]
 
 describe("native stdin parser: intentional changes", () => {
@@ -208,19 +221,20 @@ describe("native stdin parser: differential replay", () => {
   // Representative input streams: typing, editing keys, startup capability replies,
   // mouse selection, scrolling, focus, and pastes, in the forms both parsers share.
   const streams: Array<[label: string, bytes: string]> = [
-    ["typing", "Hello, wörld! 日本語 👍\r\x7f\x7f\t"],
+    ["typing", "Hello, wörld! 日本語 👍\ue000\ue001\ue003\ue06e\r\x7f\x7f\t"],
     ["editing keys", "\x1b[A\x1b[B\x1b[1;5C\x1b[1;2D\x1b[H\x1b[F\x1b[3~\x1b[5~\x1b[6;5~\x1bOP\x1b[15~\x1b[Z"],
-    ["control and Alt keys", "\x01\x03\x1a\x1ba\x1bA\x1b\x01\x1b\r\x1b \x1bB\x1bF"],
+    ["control and Alt keys", "\x01\x03\x1a\x1ba\x1bA\x1b\x01\x1b\r\x1b \x1bB\x1bF\x1b[27;5;57344~"],
     [
       "startup replies",
       "\x1b[?62;22;52c\x1b[?2026;2$y\x1b[?1u\x1bP>|kitty(0.40.1)\x1b\\\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\x1b_Gi=31337;OK\x1b\\\x1b[4;800;1200t",
     ],
     ["selection drag", "\x1b[<0;10;5M\x1b[<32;11;5M\x1b[<32;14;6M\x1b[<0;14;6m\x1b[<35;20;7M"],
+    ["URxvt drag across a wheel tick", "\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<64;3;1M\x1b[<96;6;1M\x1b[<0;6;1m\x1b[<96;8;1M"],
     ["scrolling", "\x1b[<64;10;5M\x1b[<64;10;5M\x1b[<65;10;5M\x1b[<66;10;5M\x1b[<67;10;5M"],
     ["X10 mouse", "\x1b[M !!\x1b[M#!!\x1b[M`$%"],
     ["focus", "\x1b[O\x1b[I"],
     ["pastes", "\x1b[200~line 1\nline 2\x1b[A\x1b[201~x\x1b[200~\x1b[201~"],
-    ["Kitty keys", "\x1b[97u\x1b[97;5u\x1b[97;1:3u\x1b[13;2u\x1b[57364u\x1b[1;1:1A\x1b[5;1:3~\x1b[57399u"],
+    ["Kitty keys", "\x1b[97u\x1b[97;5u\x1b[97;1:3u\x1b[13;2u\x1b[57364u\x1b[1;1:1A\x1b[5;1:3~\x1b[57399u\x1b[65279u"],
     ["modifyOtherKeys", "\x1b[27;2;13~\x1b[27;5;27~\x1b[27;5;32~\x1b[27;2;53~\x1b[27;2;65~\x1b[27;5;65~\x1b[27;3;65~"],
   ]
 
@@ -351,6 +365,7 @@ describe("native stdin parser: adapter", () => {
     expect(linefeed).toMatchObject({ name: "linefeed", sequence: "\n" })
     expect(altA).toMatchObject({ name: "A", meta: true, shift: true, option: false, sequence: "\x1bA" })
     expect(kittyA).toMatchObject({ name: "a", shift: true, sequence: "A", source: "kitty" })
+    expect(parse(native, ["\x1b"])[0]).toMatchObject({ key: { name: "", meta: true, sequence: "\x1b" } })
     expect(keypad).toMatchObject({ name: "0", sequence: "0", number: true, code: "Op" })
     expect(repeat).toMatchObject({ name: "a", eventType: "press", repeated: true })
     expect(base).toMatchObject({ name: "с", ctrl: true, baseCode: 99 })
@@ -359,6 +374,10 @@ describe("native stdin parser: adapter", () => {
     expect(altMok).toMatchObject({ name: "A", ctrl: true, meta: true, shift: false, option: true })
     expect(altO).toMatchObject({ name: "O", meta: true, shift: true, option: false, raw: "\x1bO" })
     expect(altBracket).toMatchObject({ name: "[", meta: true, shift: false, option: false, raw: "\x1b[" })
+    const [bom, ...kittyBom] = parse(native, [bytes("\xef\xbb\xbf\x1b[65279u\x1b[65279;1;65279u")])
+    expect(bom).toMatchObject({ raw: "\ufeff", key: { name: "\ufeff", sequence: "\ufeff", raw: "\ufeff" } })
+    expect(kittyBom[0]).toMatchObject({ key: { name: "\ufeff", sequence: "\ufeff", raw: "\x1b[65279u" } })
+    expect(parse(legacy, ["\x1b[65279u\x1b[65279;1;65279u"])).toEqual(kittyBom)
   })
 
   test("suspension stops input time so a reply split across it still completes", () => {
