@@ -9,6 +9,7 @@
 const std = @import("std");
 const testing = std.testing;
 const ip = @import("../input-parser.zig");
+const utils = @import("../utils.zig");
 
 const K = ip.key;
 const Mods = ip.Modifiers;
@@ -75,7 +76,7 @@ fn k(code: u32, modifiers: Mods) Expect {
 }
 
 fn ka(code: u32, modifiers: Mods, action: ip.KeyAction) Expect {
-    return .{ .kind = .key, .action = @intFromEnum(action), .code = code, .mods = modifiers };
+    return .{ .kind = .key, .action = @backingInt(action), .code = code, .mods = modifiers };
 }
 
 fn kt(code: u32, modifiers: Mods, text: []const u8) Expect {
@@ -103,7 +104,7 @@ fn report(raw: []const u8) Expect {
 }
 
 fn mouse(action: ip.MouseAction, button: u32, x: u16, y: u16, modifiers: Mods) Expect {
-    return .{ .kind = .mouse, .action = @intFromEnum(action), .code = button, .x = x, .y = y, .mods = modifiers };
+    return .{ .kind = .mouse, .action = @backingInt(action), .code = button, .x = x, .y = y, .mods = modifiers };
 }
 
 fn down(button: u32, x: u16, y: u16) Expect {
@@ -181,7 +182,7 @@ const Harness = struct {
         for (sink.events[0..sink.count]) |record| {
             const raw = try allocator.dupe(u8, sink.raw(record));
             const text = sink.text(record);
-            if (record.kind == @intFromEnum(ip.Kind.paste) and self.out.items.len > 0) {
+            if (record.kind == @backingInt(ip.Kind.paste) and self.out.items.len > 0) {
                 const last = &self.out.items[self.out.items.len - 1];
                 if (last.kind == .paste and last.flags & ip.flags.paste_end == 0) {
                     try testing.expectEqual(@as(u8, 0), record.flags & ip.flags.paste_start);
@@ -191,7 +192,7 @@ const Harness = struct {
                 }
             }
             try self.out.append(allocator, .{
-                .kind = @enumFromInt(record.kind),
+                .kind = @fromBackingInt(@intCast(record.kind)),
                 .action = record.action,
                 .mods = record.modifiers,
                 .flags = record.flags,
@@ -295,12 +296,12 @@ fn x10(code: u8, x: u8, y: u8) [6]u8 {
 
 test "input parser text, controls, and Alt prefixes" {
     try checkOne(&.{
-        .{ "a", kt('a', NONE, "a") },
+        .{ "a", Expect{ .kind = .key, .action = 1, .code = 'a', .flags = ip.flags.key_typed, .text = "a" } },
         .{ "A", kt('A', NONE, "A") },
         .{ "1", ch('1') },
         .{ "!", ch('!') },
         .{ " ", kt(' ', NONE, " ") },
-        .{ "é", kt(0xe9, NONE, "é") },
+        .{ "é", Expect{ .kind = .key, .action = 1, .code = 0xe9, .flags = ip.flags.key_typed, .text = "é" } },
         .{ "中", ch(0x4e2d) },
         .{ "👍", kt(0x1f44d, NONE, "👍") },
         .{ "\r", kt(K.enter, NONE, "") },
@@ -319,7 +320,7 @@ test "input parser text, controls, and Alt prefixes" {
         .{ "\x1b\r", kr(K.enter, ALT, "\x1b\r") },
         .{ "\x1b\n", k(K.enter, ALT) },
         .{ "\x1b ", k(' ', ALT) },
-        .{ "\x1ba", Expect{ .kind = .key, .action = 1, .code = 'a', .mods = ALT, .raw = "\x1ba", .text = "" } },
+        .{ "\x1ba", Expect{ .kind = .key, .action = 1, .code = 'a', .mods = ALT, .flags = ip.flags.key_typed, .raw = "\x1ba", .text = "" } },
         .{ "\x1bA", k('A', ALT) },
         .{ "\x1bU", k('U', ALT) },
         .{ "\x1b5", k('5', ALT) },
@@ -344,7 +345,7 @@ test "input parser text, controls, and Alt prefixes" {
         .{ "\x1b!", k('!', ALT) },
         .{ "\x1bN", k('N', ALT) },
         // Issue 047: Alt with any UTF-8 scalar.
-        .{ "\x1bé", Expect{ .kind = .key, .action = 1, .code = 0xe9, .mods = ALT, .raw = "\x1bé", .text = "" } },
+        .{ "\x1bé", Expect{ .kind = .key, .action = 1, .code = 0xe9, .mods = ALT, .flags = ip.flags.key_typed, .raw = "\x1bé", .text = "" } },
         .{ "\x1bж", k(0x436, ALT) },
         .{ "\x1b👍", k(0x1f44d, ALT) },
     });
@@ -578,7 +579,7 @@ test "input parser modifyOtherKeys" {
         .{ "\x1b[27;2;127~", k(K.backspace, SHIFT) },
         .{ "\x1b[27;5;8~", k(K.backspace, CTRL) },
         .{ "\x1b[27;2;53~", k('5', SHIFT) },
-        .{ "\x1b[27;5;57399~", kt(K.kp_0, CTRL, "0") },
+        .{ "\x1b[27;5;57399~", Expect{ .kind = .key, .action = 1, .code = 0xe037, .mods = CTRL, .flags = ip.flags.key_typed, .text = "\u{e037}" } },
         .{ "\x1b[27;5;3~", reply("\x1b[27;5;3~") },
         .{ "\x1b[27;5~", reply("\x1b[27;5~") },
     });
@@ -603,11 +604,11 @@ test "input parser replies, focus, and mouse reports are not keys" {
     try check("\x1b[I\x1b[O", &.{ focus(true), focus(false) });
     try check("a\x1b[Ib\x1b[Oc", &.{ ch('a'), focus(true), ch('b'), focus(false), ch('c') });
     // Reply protocols.
-    try check("\x1b[?1u", &.{Expect{ .kind = .reply, .code = @intFromEnum(ip.Protocol.csi), .flags = 0 }});
-    try check("\x1bOz", &.{Expect{ .kind = .reply, .code = @intFromEnum(ip.Protocol.ss3), .flags = 0 }});
-    try check("\x1b]1\x07", &.{Expect{ .kind = .reply, .code = @intFromEnum(ip.Protocol.osc), .flags = 0 }});
-    try check("\x1bP1\x1b\\", &.{Expect{ .kind = .reply, .code = @intFromEnum(ip.Protocol.dcs), .flags = 0 }});
-    try check("\x1b_1\x1b\\", &.{Expect{ .kind = .reply, .code = @intFromEnum(ip.Protocol.apc), .flags = 0 }});
+    try check("\x1b[?1u", &.{Expect{ .kind = .reply, .code = @backingInt(ip.Protocol.csi), .flags = 0 }});
+    try check("\x1bOz", &.{Expect{ .kind = .reply, .code = @backingInt(ip.Protocol.ss3), .flags = 0 }});
+    try check("\x1b]1\x07", &.{Expect{ .kind = .reply, .code = @backingInt(ip.Protocol.osc), .flags = 0 }});
+    try check("\x1bP1\x1b\\", &.{Expect{ .kind = .reply, .code = @backingInt(ip.Protocol.dcs), .flags = 0 }});
+    try check("\x1b_1\x1b\\", &.{Expect{ .kind = .reply, .code = @backingInt(ip.Protocol.apc), .flags = 0 }});
     // BEL ends only OSC.
     try check("\x1bPa\x07b\x1b\\", &.{reply("\x1bPa\x07b\x1b\\")});
     try check("\x1b_a\x07b\x1b\\", &.{reply("\x1b_a\x07b\x1b\\")});
@@ -730,7 +731,7 @@ test "input parser Kitty keys report modifiers, events, and text" {
         Expect{ .kind = .key, .action = 1, .code = 0, .flags = kitty | ip.flags.key_text_truncated, .text = "中文中文中文中文" },
     });
     try check("\x1b[0;;128512:128512:128512:128512:128512:128512:128512:128512:128512u", &.{
-        Expect{ .kind = .key, .action = 1, .code = 0, .flags = kitty | ip.flags.key_text_truncated, .text = "😀" ** 8 },
+        Expect{ .kind = .key, .action = 1, .code = 0, .flags = kitty | ip.flags.key_text_truncated, .text = utils.repeat(u8, "😀", 8) },
     });
     // Base-layout keys are reported as sent; key bindings decide policy (issue 050).
     try check("\x1b[97:65:113u", &.{Expect{ .kind = .key, .action = 1, .code = 'a', .base = 'q' }});
@@ -800,6 +801,12 @@ test "input parser X10 mouse reports" {
     // A release reports the button pressed last.
     try check("\x1b[M\"!!\x1b[M#!!", &.{ down(2, 0, 0), mouse(.up, 2, 0, 0, NONE) });
     try check("\x1b[M\"!!\x1b[M'!!", &.{ down(2, 0, 0), mouse(.up, 2, 0, 0, SHIFT) });
+    // URxvt's motion after a wheel tick drags the held button too (issue 426). A later release
+    // names the lowest button still held.
+    try check("\x1b[M !!\x1b[M!!!\x1b[M\"!!\x1b[M`!!\x1b[M\x80\"!\x1b[M#\"!\x1b[M#\"!\x1b[M#\"!\x1b[M\x80\"!", &.{
+        down(0, 0, 0),             down(1, 0, 0),             down(2, 0, 0),             mouse(.scroll, 0, 0, 0, NONE),  mouse(.drag, 0, 1, 0, NONE),
+        mouse(.up, 2, 1, 0, NONE), mouse(.up, 0, 1, 0, NONE), mouse(.up, 1, 1, 0, NONE), mouse(.move, none, 1, 0, NONE),
+    });
     // A control byte cuts the report short.
     try check("\x1b[M \x1b[A", &.{ frag("\x1b[M "), k(K.up, NONE) });
     var harness = try Harness.create();
@@ -843,12 +850,19 @@ test "input parser SGR mouse reports" {
         .{ "\x1b[<0;1;1;1M", reply("\x1b[<0;1;1;1M") },
         .{ "\x1b[<0:1;1;1M", reply("\x1b[<0:1;1;1M") },
         .{ "\x1b[<0;1;1R", reply("\x1b[<0;1;1R") },
+        // The urxvt 1015 encoding is not decoded.
+        .{ "\x1b[96;7;1M", reply("\x1b[96;7;1M") },
     });
-    // Mouse decoding is stateless.
+    // Motion names its button, but URxvt's motion after a wheel tick names the wheel until the
+    // next button event: it drags the lowest button held (issue 426).
     try check("\x1b[<0;6;6M\x1b[<32;9;6m\x1b[<0;9;6m\x1b[<35;11;6m", &.{
         down(0, 5, 5), mouse(.drag, 0, 8, 5, NONE), mouse(.up, 0, 8, 5, NONE), mouse(.move, none, 10, 5, NONE),
     });
-    try check("\x1b[<64;83;68M\x1b[<96;82;68M", &.{ mouse(.scroll, 0, 82, 67, NONE), mouse(.move, none, 81, 67, NONE) });
+    try check("\x1b[<0;1;1M\x1b[<2;1;1M\x1b[<65;1;1M\x1b[<113;2;1M\x1b[<35;2;1M\x1b[<0;2;1m\x1b[<99;3;1M\x1b[<2;3;1m\x1b[<96;4;1M", &.{
+        down(0, 0, 0),                  down(2, 0, 0),             mouse(.scroll, 1, 0, 0, NONE), mouse(.drag, 0, 1, 0, CTRL),
+        mouse(.move, none, 1, 0, NONE), mouse(.up, 0, 1, 0, NONE), mouse(.drag, 2, 2, 0, NONE),   mouse(.up, 2, 2, 0, NONE),
+        mouse(.move, none, 3, 0, NONE),
+    });
     try check("x\x1b[<64;10;5M", &.{ ch('x'), mouse(.scroll, 0, 9, 4, NONE) });
     var harness = try Harness.create();
     defer harness.deinit();
@@ -1126,7 +1140,7 @@ test "input parser times out partial units unless they may be mouse reports, Kit
         .{ "\x1b]11;rg", &.{frag("\x1b]11;rg")} },
         .{ "\x1b_", &.{frag("\x1b_")} },
         .{ "\x1b[24", &.{frag("\x1b[24")} },
-        .{ "\x1b_Gi=" ++ [_]u8{'9'} ** ip.unit_bytes_max, &.{} },
+        .{ "\x1b_Gi=" ++ utils.repeat(u8, "9", ip.unit_bytes_max), &.{} },
     }) |case| {
         harness.parser.setExpectations(sentinel);
         _ = try harness.feed(case[0]);
@@ -1143,14 +1157,14 @@ test "input parser times out partial units unless they may be mouse reports, Kit
     try expectGot("", &.{ frag("\x1b["), ch('?') }, try harness.feed("?"));
     // An overlong reply is discarded up to its terminator, however long it takes.
     harness.parser.setExpectations(sentinel);
-    _ = try harness.feed("\x1b_Gi=" ++ [_]u8{'9'} ** ip.unit_bytes_max);
+    _ = try harness.feed("\x1b_Gi=" ++ utils.repeat(u8, "9", ip.unit_bytes_max));
     try expectGot("", &.{}, try harness.wait(60_000));
     try expectGot("", &.{ch('q')}, try harness.feed("9\x1b\\q"));
     // A discarded string that begins like no reply, and a discarded CSI, still time out.
-    _ = try harness.feed("\x1b]x" ++ [_]u8{'9'} ** ip.unit_bytes_max);
+    _ = try harness.feed("\x1b]x" ++ utils.repeat(u8, "9", ip.unit_bytes_max));
     try expectGot("", &.{}, try harness.wait(20));
     try expectGot("", &.{ch('q')}, try harness.feed("q"));
-    _ = try harness.feed("\x1b[" ++ [_]u8{'9'} ** ip.sequence_bytes_max);
+    _ = try harness.feed("\x1b[" ++ utils.repeat(u8, "9", ip.sequence_bytes_max));
     try expectGot("", &.{}, try harness.wait(20));
     try expectGot("", &.{ ch('1'), ch('q') }, try harness.feed("1q"));
 }
@@ -1227,7 +1241,7 @@ test "input parser keeps typed text typed after a held or recovered prefix while
         .{ "E4", &.{ .{ .feed = "\x1b" }, .{ .wait = 1000 }, .{ .feed = "[2024\r" } }, &.{ esc, kt('[', NONE, "["), frag("2024"), k(K.enter, NONE) } },
         .{ "P2", &.{ .{ .feed = "\x1b[" }, .{ .wait = 100 }, .{ .feed = "2" }, .{ .wait = 100 }, .{ .feed = "0" }, .{ .wait = 100 }, .{ .feed = "0" }, .{ .wait = 5 }, .{ .feed = "~" }, .{ .feed = "abc" }, .{ .feed = da1 }, .clear, .{ .wait = 60_000 }, .{ .feed = "later\r" } }, &([_]Expect{ frag("\x1b[200"), ch('~') } ++ typed("abc") ++ [_]Expect{reply(da1)} ++ typed("later\r")) },
         .{ "C11", &.{ .{ .feed = "\x1b" }, .{ .wait = 30 }, .{ .feed = "[" }, .{ .wait = 5 }, .{ .feed = "2" }, .{ .wait = 5 }, .{ .feed = "0" }, .{ .wait = 5 }, .{ .feed = "0" }, .{ .wait = 5 }, .{ .feed = "~" }, .{ .feed = "abc" } }, &([_]Expect{ esc, kt('[', NONE, "["), frag("200"), ch('~') } ++ typed("abc")) },
-        .{ "R7", &.{ .{ .feed = "\x1b" }, .{ .wait = 20 }, .{ .feed = "[1x" } }, &.{ esc, kt('[', NONE, "["), frag("1"), ch('x') } },
+        .{ "R7", &.{ .{ .feed = "\x1b" }, .{ .wait = 20 }, .{ .feed = "[1x" } }, &.{ esc, Expect{ .kind = .key, .action = 1, .code = '[', .flags = ip.flags.key_typed, .text = "[" }, frag("1"), ch('x') } },
         // Esc, then an introducer in a read of its own (vim's P, [, ], _): the introducer is typed when
         // the next key or the batch end cuts it.
         .{ "O1P", &.{ .{ .feed = "\x1b" }, .{ .wait = 120 }, .{ .feed = "P" }, .{ .wait = 120 }, .{ .feed = "x" } }, &.{ esc, kt('P', NONE, "P"), ch('x') } },
@@ -1272,22 +1286,24 @@ test "input parser recovers mouse reports after a timed-out Escape" {
     for ([_]Case{
         .{ &.{"[<64;38;15M"}, &.{Expect{ .kind = .mouse, .action = 5, .code = 0, .x = 37, .y = 14, .raw = "\x1b[<64;38;15M" }} },
         .{ &.{"[<35;20;5m"}, &.{mouse(.move, none, 19, 4, NONE)} },
+        .{ &.{"[<96;20;5M"}, &.{mouse(.drag, 0, 19, 4, NONE)} },
         .{ &.{"[<0;10;5M"}, &.{down(0, 9, 4)} },
         .{ &.{ "[", "<35;20;5m" }, &.{mouse(.move, none, 19, 4, NONE)} },
         .{ &.{ "[M", " !!" }, &.{Expect{ .kind = .mouse, .action = 1, .code = 0, .raw = "\x1b[M !!" }} },
         .{ &.{"[<x"}, &.{ frag("[<"), ch('x') } },
         .{ &.{"[<0M"}, &.{frag("[<0M")} },
         .{ &.{"[<64;11;6m"}, &.{frag("[<64;11;6m")} },
-        .{ &.{"[A"}, &.{ kt('[', NONE, "["), ch('A') } },
+        .{ &.{"[A"}, &.{ Expect{ .kind = .key, .action = 1, .code = '[', .flags = ip.flags.key_typed, .text = "[" }, ch('A') } },
         .{ &.{"[M \x01"}, &.{ frag("[M "), k('a', CTRL) } },
         .{ &.{"q[<0;1;1M"}, &.{ ch('q'), ch('['), ch('<'), ch('0'), ch(';'), ch('1'), ch(';'), ch('1'), ch('M') } },
-        .{ &.{"[<" ++ "1" ** 260}, &([_]Expect{frag("[<" ++ "1" ** 253)} ++ [_]Expect{ch('1')} ** 7) },
+        .{ &.{"[<" ++ utils.repeat(u8, "1", 260)}, &([_]Expect{frag("[<" ++ utils.repeat(u8, "1", 253))} ++ @as([7]Expect, @splat(ch('1')))) },
         .{ &.{"[<35;"}, &.{} },
         .{ &.{"[<"}, &.{} },
     }) |case| {
         var harness = try Harness.create();
         defer harness.deinit();
-        _ = try harness.feed("\x1b");
+        // The left button is held, so URxvt's motion after a wheel tick drags it (issue 426).
+        _ = try harness.feed("\x1b[<0;1;1M\x1b");
         try expectGot("", &.{k(K.escape, NONE)}, try harness.wait(20));
         try expectGot(case[0][0], case[1], try split(&harness, case[0]));
     }
@@ -1307,7 +1323,7 @@ test "input parser recovers mouse reports after a timed-out Escape" {
     _ = try harness.wait(20);
     try expectGot("", &.{}, try harness.feed("["));
     try expectGot("", &.{}, try harness.wait(19));
-    try expectGot("", &.{kr('[', NONE, "[")}, try harness.wait(1));
+    try expectGot("", &.{Expect{ .kind = .key, .action = 1, .code = '[', .flags = ip.flags.key_typed, .text = "[", .raw = "[" }}, try harness.wait(1));
     // Without a timed-out Escape, `[<` is text.
     try check("[<35;20;5m", &.{ ch('['), ch('<'), ch('3'), ch('5'), ch(';'), ch('2'), ch('0'), ch(';'), ch('5'), ch('m') });
     // With SENTINEL an introducer and a byte that begin a reply resume it; other bytes are typed,
@@ -1479,7 +1495,7 @@ test "input parser arbitrary bytes with uneven time stay bounded" {
 
 test "input parser reaches every state" {
     const Tag = std.meta.Tag(@TypeOf(@as(ip.InputParser, .{}).state));
-    var seen = std.EnumSet(Tag).initEmpty();
+    var seen: std.EnumSet(Tag) = .empty;
     var harness = try Harness.create();
     defer harness.deinit();
     for ([_][]const u8{
@@ -1500,25 +1516,25 @@ test "input parser reaches every state" {
     _ = try harness.feed("\x1b[<0;1");
     _ = try harness.wait(20);
     seen.insert(harness.parser.state);
-    const nines = [_]u8{'9'} ** 300;
+    const nines: [300]u8 = @splat('9');
     _ = try harness.feed("\x1b[");
     _ = try harness.feed(&nines);
     seen.insert(harness.parser.state);
-    try testing.expectEqual(std.EnumSet(Tag).initFull(), seen);
+    try testing.expectEqual(std.EnumSet(Tag).full, seen);
 }
 
-test "input parser reset drops the pending unit and X10 button, or keeps a reply" {
+test "input parser reset drops the pending unit and mouse buttons, or keeps a reply" {
     var harness = try Harness.create();
     defer harness.deinit();
     harness.parser.setExpectations(.{ .kitty_keyboard = true });
-    _ = try harness.feed("\x1b[M\"!!\x1b[97;");
+    _ = try harness.feed("\x1b[<0;1;1M\x1b[M\"!!\x1b[97;");
     harness.parser.reset(false);
     try testing.expectEqual(null, harness.parser.deadlineNs());
-    try expectGot("", &.{ ch('u'), mouse(.up, 0, 0, 0, NONE) }, try harness.feed("u\x1b[M#!!"));
+    try expectGot("", &.{ ch('u'), mouse(.up, 0, 0, 0, NONE), mouse(.move, none, 0, 0, NONE) }, try harness.feed("u\x1b[M#!!\x1b[<96;1;1M"));
     try testing.expect(harness.parser.expect.kitty_keyboard);
     // Keeping a reply keeps only a CSI unit shaped like one, deferred without a deadline.
     for ([_]struct { []const u8, []const u8, []const Expect }{
-        .{ "\x1b[M\"!!\x1b\x1b[4;80", ";80t\x1b[M#!!", &.{ reply("\x1b[4;80;80t"), mouse(.up, 0, 0, 0, NONE) } },
+        .{ "\x1b[M\"!!\x1b\x1b[4;80", ";80t\x1b[M#!!\x1b[<96;1;1M", &.{ reply("\x1b[4;80;80t"), mouse(.up, 0, 0, 0, NONE), mouse(.move, none, 0, 0, NONE) } },
         .{ "\x1b[4;80", "a", &.{ frag("\x1b[4;80"), ch('a') } },
         .{ "\x1b[?62", "c", &.{reply("\x1b[?62c")} },
         .{ "\x1b[24", ";1R", &.{ ch(';'), ch('1'), ch('R') } },
@@ -1593,7 +1609,7 @@ test "input parser passes Core's conformance vectors, whole and one byte at a ti
                 .string => |text| text,
                 .array => |values| bytes: {
                     const bytes = try allocator.alloc(u8, values.items.len);
-                    for (values.items, bytes) |value, *byte| byte.* = @intCast(value.integer);
+                    for (values.items, bytes) |value, *byte| byte.* = utils.unsigned(u8, value.integer);
                     break :bytes bytes;
                 },
                 else => return error.InvalidConformanceStep,
@@ -1655,8 +1671,8 @@ fn notation(allocator: std.mem.Allocator, got: Got) ![]const u8 {
         .key => {
             var shift = modifiers.shift;
             var scalar: [4]u8 = undefined;
-            const name = if (got.code == 0) got.text else if (coreKeyName(got.code)) |core| core else name: {
-                if (got.code >= K.functional_first and got.code <= K.functional_last) {
+            const name = if (got.code == 0) got.text else if (if (got.flags & ip.flags.key_typed != 0) null else coreKeyName(got.code)) |core| core else name: {
+                if (got.flags & ip.flags.key_typed == 0 and got.code >= K.functional_first and got.code <= K.functional_last) {
                     std.debug.print("no notation name for key code {d}; add Core's name to coreKeyName\n", .{got.code});
                     return error.UnnamedKey;
                 }
@@ -1673,11 +1689,11 @@ fn notation(allocator: std.mem.Allocator, got: Got) ![]const u8 {
             if (modifiers.ctrl) try out.appendSlice(allocator, " ctrl");
             if (modifiers.alt or modifiers.meta) try out.appendSlice(allocator, " meta");
             if (shift) try out.appendSlice(allocator, " shift");
-            if (got.action == @intFromEnum(ip.KeyAction.release)) try out.appendSlice(allocator, " release");
+            if (got.action == @backingInt(ip.KeyAction.release)) try out.appendSlice(allocator, " release");
             try out.append(allocator, ')');
         },
         .mouse => {
-            const action: ip.MouseAction = @enumFromInt(got.action);
+            const action: ip.MouseAction = @fromBackingInt(@intCast(got.action));
             const sgr = got.raw.len > 2 and got.raw[2] == '<';
             // Core: SGR motion and wheels without a button report 0, X10 motion -1.
             var button: i64 = got.code;

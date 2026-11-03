@@ -1842,6 +1842,136 @@ test("suspend resolves idle waiters when an output-idle render was scheduled", a
   expect(output.lastIndexOf("\x1b[?25h")).toBeGreaterThan(output.indexOf("captured-before-suspend"))
 })
 
+type StdoutStep =
+  | string
+  | ArrayBufferView
+  | [string, string]
+  | ((renderer: CliRenderer, stdout: CollectingStdout) => unknown)
+const splitBytes = (text: string, at: number, ...between: StdoutStep[]): StdoutStep[] => {
+  const bytes = Buffer.from(text)
+  return [bytes.subarray(0, at), ...between, bytes.subarray(at)]
+}
+const lead = Buffer.from([0xc3])
+const passthrough = (renderer: CliRenderer) => (renderer.externalOutputMode = "passthrough")
+const destroy = (renderer: CliRenderer) => renderer.destroy()
+const capture = (renderer: CliRenderer) => (renderer.externalOutputMode = "capture-stdout")
+const passthroughInFrame = (renderer: CliRenderer, stdout: CollectingStdout) =>
+  renderer.requestAnimationFrame(() => {
+    passthrough(renderer)
+    stdout.write(Buffer.from([0xa9]))
+  })
+const savedWriteWhileOff = (renderer: CliRenderer, stdout: CollectingStdout) => {
+  const write = stdout.write
+  passthrough(renderer)
+  write.call(stdout, lead)
+  capture(renderer)
+}
+const outputFailure = async (renderer: CliRenderer, stdout: CollectingStdout) => {
+  stdout.emit("error", new Error("terminal gone"))
+  await expect(renderer.closed).rejects.toThrow("terminal gone")
+}
+const suspendInSplit = async (renderer: CliRenderer, stdout: CollectingStdout) => {
+  const suspending = renderer.suspend()
+  stdout.write(Buffer.from("caf\u00e9").subarray(0, 4))
+  await suspending
+  stdout.write(Buffer.from([0xa9]))
+  await renderer.resume()
+}
+const pendingModeInSplit = async (renderer: CliRenderer, stdout: CollectingStdout) => {
+  await renderer.suspend()
+  const resuming = renderer.resume()
+  renderer.footerHeight = 5
+  stdout.write(lead)
+  passthrough(renderer)
+  stdout.write(Buffer.from([0xa9]))
+  await resuming
+}
+const processExit = (renderer: CliRenderer) => {
+  let flushed = 0
+  renderer.on(CliRenderEvents.EXTERNAL_OUTPUT, () => flushed++)
+  renderer.nativeScene.driver.restoreOnExit()
+  renderer.destroy()
+  renderer.nativeScene.driver.dispose()
+  expect(flushed).toBe(0)
+}
+const sessionClose = async (renderer: CliRenderer) => {
+  const closing = renderer.nativeScene.driver.close()
+  renderer.destroy()
+  await Promise.allSettled([closing, renderer.closed])
+}
+
+test.each<[string, StdoutStep[], string]>([
+  ["Uint8Array view", [new TextEncoder().encode("\u00e9-view-tail\n").subarray(1, 7)], "\ufffd-view"],
+  [
+    "other views",
+    [new Uint16Array([0x6968]), new Int8Array([-61]), new DataView(Buffer.from("x\u00e9").buffer, 2, 1)],
+    "hi\u00e9",
+  ],
+  ["base64", [[Buffer.from("hello-b64\n").toString("base64"), "BASE64"]], "hello-b64"],
+  ["latin1", [["\u00e9", "latin1"], "x"], "\ufffdx"],
+  ["2-byte split across a frame", splitBytes("caf\u00e9", 4, (renderer) => renderer.idle()), "caf\u00e9"],
+  ["3-byte split", splitBytes("\u4e00", 1), "\u4e00"],
+  ["4-byte split", splitBytes("\u{10437}", 1), "\u{10437}"],
+  ["empty writes inside a split", splitBytes("\u00e9", 1, "", null as never, ["", ""], ["", "bogus"]), "\u00e9"],
+  ["string inside a split", splitBytes("\u00e9", 1, "x"), "\ufffdx\ufffd"],
+  ["capture set again inside a split", splitBytes("\u00e9", 1, capture), "\u00e9"],
+  ["split across a deferred passthrough", splitBytes("caf\u00e9", 4, passthrough), "caf\u00e9"],
+  ["passthrough set in a frame inside a split", [lead, passthroughInFrame], "\u00e9"],
+  [
+    "split across a cancelled passthrough",
+    splitBytes("caf\u00e9", 4, passthrough, capture, (renderer) => renderer.idle()),
+    "caf\u00e9",
+  ],
+  ["saved write while capture is off", [savedWriteWhileOff, Buffer.from([0xa9]), "b"], "\ufffdb"],
+  ["passthrough after a lead byte", [lead, passthrough], "\ufffd"],
+  ["lead byte after deferred passthrough", ["a", passthrough, lead], "a\ufffd"],
+  ["suspend after a lead byte", ["a", lead, (renderer) => renderer.suspend(), destroy], "a\ufffd|"],
+  ["replay reset after a lead byte", ["a", lead, (renderer) => renderer.resetSplitFooterForReplay(), "b"], "a\ufffd|b"],
+  ["destroy after a lead byte", ["a", lead, destroy], "a\ufffd|"],
+  ["split across suspend during a deferred passthrough", ["a", passthrough, suspendInSplit], "a|caf\u00e9"],
+  ["passthrough during a pending native mode", [pendingModeInSplit], "|\u00e9"],
+  ["exit after a lead byte", [lead, processExit], ""],
+  ["destroy after the session closes", ["a", lead, sessionClose], ""],
+  ["output failure after a lead byte", ["a", lead, outputFailure], ""],
+  ["SGR", ["\x1b[31mred\x1b[0m [1m]\x1b[m\x1b[38;2;1;2;3mx\x1b[2@\x1b[?25h\x1b[ q\x1b[3~~\n"], "red [1m]x~"],
+  ["SGR across a newline", ["\x1b[1mbold\nnext\x1b[22m\n"], "bold\r\nnext"],
+  ["strings", ["\x1b]8;;u\x1b\\l\x1b]0;a b\x07\x1bPq#0\x1b\\\x1b_Ga=q\x1b\\\x1b^p\x07\x1bXs\x07!\n"], "l!"],
+  ["a BEL title after a full row", ["x".repeat(80), "\x1b]0;t\x07", "y\n"], `${"x".repeat(80)}\r\ny`],
+  ["a BEL string between ZWJ parts", ["\u{1f468}\x1b]8;;u\x07\u200d\u{1f4bb}\n"], "\u{1f468}\u200d\u{1f4bb}"],
+  ["ESC sequences", ["a\x1b7b\x1b(Bc\x1b8\x1b=\x1b(0\x1b F\x1b~\n"], "abc"],
+  ["split sequences", ["a\x1b", "[3", "1m", "b\x1b]8;", ";u", "rl\x1b", "\\c\x1b(", "Bd\x1b(B", "e\n"], "abcde"],
+  ["malformed sequences", ["a\x1b[31\nb\x1b[1\u00e9\x1b]0;t\nc\x1b\n", "[d\n"], "a\r\nb\u00e9\r\nc\r\n[d"],
+  ["a lone ESC before a replay reset", ["a\x1b", (renderer) => renderer.resetSplitFooterForReplay(), "[1mb"], "a|[1mb"],
+  ["an unterminated CSI at the end of the stream", ["a\x1b[3", destroy], "a|"],
+])("split-footer capture-stdout decodes %s like the terminal", async (_name, steps, expected) => {
+  const stdout = createCollectingStdout(80, 24)
+  const renderer = new CliRenderer(createTestStdin(), stdout, 80, 24, {
+    screenMode: "split-footer",
+    consoleMode: "disabled",
+  })
+  destroyFns.push(() => renderer.destroy())
+
+  await renderer.setupTerminal()
+  renderer.stdin.emit("data", Buffer.from("\x1b[1;1R"))
+  await renderer.idle()
+  stdout.clear()
+
+  for (const step of steps) {
+    if (typeof step === "function") await step(renderer, stdout)
+    else if (Array.isArray(step)) stdout.write(step[0], step[1] as BufferEncoding)
+    else stdout.write(step)
+  }
+  await renderer.idle().catch(() => {})
+  await renderer.nativeScene.driver.idle().catch(() => {})
+
+  const shown = stdout
+    .text()
+    .replace(/\x1b\[[0-3]?J/g, "|")
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?>]*[ -/]*[@-~]/g, "")
+    .trim()
+  expect(shown).toBe(expected)
+})
+
 // ---- Dimension fallback ----
 
 test.each([
@@ -1955,14 +2085,25 @@ test("Session teardown after successful setup releases listeners without closing
 
 // ---- Destroy resilience ----
 
-// A cooked tty echoes mouse reports, so raw mode covers the bytes that turn mouse tracking off on destroy and on on
-// resume. suspend() leaves raw mode at once: callers hand the terminal to the next program without awaiting it.
-// Each entry is a raw-mode switch, noting whether the sink already holds the mouse off (or on) bytes and whether the
-// Session has finished its close; a switch on a timer that fires before the close finishes fails the destroy rows.
+// A cooked tty echoes mouse reports, so raw mode covers the bytes that turn mouse tracking off on destroy and suspend,
+// and on on resume. Each entry is a raw-mode switch, noting whether the sink already holds the mouse off (or on) bytes
+// and whether the Session has finished its close; a switch on a timer that fires before the bytes fails the held rows.
 const rawModeActions: Record<string, (renderer: CliRenderer) => Promise<unknown>> = {
   destroy: (renderer) => (renderer.destroy(), renderer.closed),
   "destroy behind held output": (renderer) => (renderer.destroy(), renderer.closed),
   suspend: (renderer) => renderer.suspend(),
+  "suspend behind held output": (renderer) => renderer.suspend(),
+  "failing suspend": (renderer) => (
+    spyOn(renderer.nativeScene.driver, "suspend").mockRejectedValue(0), renderer.suspend()
+  ),
+  "destroy during suspend": (renderer) => (renderer.suspend().catch(() => {}), renderer.destroy(), renderer.closed),
+  // The footer change applies as the transition clears, and its resize listener resumes in that turn.
+  "footer resize during a suspension": async (renderer) => {
+    renderer.screenMode = "split-footer"
+    void renderer.suspend()
+    renderer.footerHeight = 5
+    await new Promise((resolve) => renderer.once(CliRenderEvents.RESIZE, () => resolve(renderer.resume())))
+  },
   resume: (renderer) => renderer.resume(),
   "failing resume": (renderer) => renderer.resume().catch(() => {}),
   "resume after destroy": (renderer) => (renderer.destroy(), renderer.closed.then(() => renderer.resume())),
@@ -1972,7 +2113,11 @@ const rawModeActions: Record<string, (renderer: CliRenderer) => Promise<unknown>
 test.each<{ action: string; sync: string[]; settled: string[] }>([
   { action: "destroy", sync: [], settled: ["off after mouse bytes after close"] },
   { action: "destroy behind held output", sync: [], settled: ["off after mouse bytes after close"] },
-  { action: "suspend", sync: ["off"], settled: ["off"] },
+  { action: "suspend", sync: [], settled: ["off after mouse bytes"] },
+  { action: "suspend behind held output", sync: [], settled: ["off after mouse bytes"] },
+  { action: "failing suspend", sync: [], settled: ["off"] },
+  { action: "destroy during suspend", sync: [], settled: ["off after mouse bytes after close"] },
+  { action: "footer resize during a suspension", sync: [], settled: ["off after mouse bytes", "on"] },
   { action: "resume", sync: ["on"], settled: ["on"] },
   { action: "failing resume", sync: [], settled: [] },
   { action: "resume after destroy", sync: [], settled: ["off after close"] },
@@ -2011,7 +2156,7 @@ test.each<{ action: string; sync: string[]; settled: string[] }>([
     expect({ sync: log, settled: rawMode, suspended: renderer.controlState === "explicit_suspended" }).toEqual({
       sync,
       settled,
-      suspended: ["suspend", "failing resume", "resume after destroy"].includes(action),
+      suspended: action.includes("suspend") || ["failing resume", "resume after destroy"].includes(action),
     })
   } finally {
     renderer.destroy()

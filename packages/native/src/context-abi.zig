@@ -16,7 +16,9 @@ const terminal_transport = @import("context-terminal-abi.zig");
 const input_transport = @import("context-input-abi.zig");
 const output_transport = @import("context-output-abi.zig");
 const image_transport = @import("context-image-abi.zig");
+const video_transport = @import("context-video-abi.zig");
 const clipboard_transport = @import("clipboard-abi.zig");
+const utils = @import("utils.zig");
 
 /// Each C Context owns a private allocator. Test builds back it with
 /// std.testing.allocator and enable safety, so a test that leaks Context memory fails.
@@ -88,8 +90,8 @@ fn createContext(
 }
 
 /// DebugAllocator never reuses a freed slot, so release builds use libc; tests keep its leak checks.
-fn contextAllocator(gpa: std.mem.Allocator, mode: std.builtin.OptimizeMode, is_test: bool, safe_stats: bool) std.mem.Allocator {
-    return if (is_test or safe_stats or mode == .Debug) gpa else std.heap.c_allocator;
+fn contextAllocator(gpa: std.mem.Allocator, mode: std.lang.Optimize, is_test: bool, safe_stats: bool) std.mem.Allocator {
+    return if (is_test or safe_stats or mode == .debug) gpa else std.heap.c_allocator;
 }
 
 pub fn ot_context_destroy(context: ?*ContextHandle) callconv(.c) c.ot_status {
@@ -160,7 +162,7 @@ pub fn ot_context_drain_diagnostics(
     for (0..count) |index| {
         const record = queue.pop().?;
         records.?[index] = .{
-            .level = @intFromEnum(record.level),
+            .level = @backingInt(record.level),
             .message_len = record.message_len,
             .flags = if (record.truncated) c.OT_DIAGNOSTIC_TRUNCATED else 0,
             .reserved = 0,
@@ -332,7 +334,7 @@ pub fn ot_edit_buffer_get_info(context: ?*ContextHandle, edit_ptr: ?*const c.ot_
 
 fn editEventCallback(userdata: ?*anyopaque, handle: ObjectHandle, event: @import("context.zig").EditEvent) void {
     const owner: *ContextHandle = @ptrCast(@alignCast(userdata.?));
-    if (owner.edit_event_callback) |callback| callback(handle.context_id, handle.slot, handle.generation, @intFromEnum(event));
+    if (owner.edit_event_callback) |callback| callback(handle.context_id, handle.slot, handle.generation, @backingInt(event));
 }
 
 pub fn ot_context_set_edit_event_callback(context: ?*ContextHandle, callback: c.ot_edit_event_callback) callconv(.c) c.ot_status {
@@ -384,10 +386,22 @@ pub fn ot_scene_set_image(context: ?*ContextHandle, node_ptr: ?*const c.ot_handl
     owner.core.sceneSetImage(
         handleFromC(node.*),
         if (image_ptr) |id| handleFromC(id.*) else null,
-        @enumFromInt(fit),
-        @enumFromInt(protocol),
+        @fromBackingInt(@intCast(fit)),
+        @fromBackingInt(@intCast(protocol)),
         if (buffer_ptr) |id| handleFromC(id.*) else null,
     ) catch |err| return sessionError(owner, err);
+    return c.OT_OK;
+}
+
+pub fn ot_scene_set_crop(context: ?*ContextHandle, node_ptr: ?*const c.ot_handle, left: u32, top: u32, width: u32, height: u32) callconv(.c) c.ot_status {
+    const status = sessionContextStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    const node = node_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const whole = left == 0 and top == 0 and width == 0 and height == 0;
+    if (!whole and (width == 0 or height == 0)) return sessionError(owner, error.InvalidOptions);
+    const crop: ?@import("image.zig").Region = if (whole) null else .{ .left = left, .top = top, .width = width, .height = height };
+    owner.core.sceneSetCrop(handleFromC(node.*), crop) catch |err| return sessionError(owner, err);
     return c.OT_OK;
 }
 
@@ -524,10 +538,10 @@ pub fn widthMethodFromC(value: u32) error{InvalidOptions}!WidthMethod {
 }
 
 comptime {
-    std.debug.assert(@intFromEnum(WidthMethod.wcwidth) == c.OT_WIDTH_METHOD_WCWIDTH);
-    std.debug.assert(@intFromEnum(WidthMethod.unicode) == c.OT_WIDTH_METHOD_UNICODE);
-    std.debug.assert(@intFromEnum(WidthMethod.no_zwj) == c.OT_WIDTH_METHOD_NO_ZWJ);
-    std.debug.assert(@intFromEnum(WidthMethod.unicode_wide) == c.OT_WIDTH_METHOD_UNICODE_WIDE);
+    std.debug.assert(@backingInt(WidthMethod.wcwidth) == c.OT_WIDTH_METHOD_WCWIDTH);
+    std.debug.assert(@backingInt(WidthMethod.unicode) == c.OT_WIDTH_METHOD_UNICODE);
+    std.debug.assert(@backingInt(WidthMethod.no_zwj) == c.OT_WIDTH_METHOD_NO_ZWJ);
+    std.debug.assert(@backingInt(WidthMethod.unicode_wide) == c.OT_WIDTH_METHOD_UNICODE_WIDE);
     std.debug.assert(std.enums.values(WidthMethod).len == 4);
 }
 
@@ -602,7 +616,7 @@ pub fn ot_buffer_stack(context: ?*ContextHandle, target_ptr: ?*const c.ot_handle
     if (operation > c.OT_BUFFER_STACK_CLEAR_OPACITY) return sessionError(owner, error.InvalidOptions);
     const frame = if (frame_ptr) |record| frameRequestFromC(record.*) catch |err| return sessionError(owner, err) else null;
     out.* = owner.core.bufferStack(handleFromC(target.*), frame, .{
-        .operation = @enumFromInt(operation),
+        .operation = @fromBackingInt(@intCast(operation)),
         .x = x,
         .y = y,
         .width = width,
@@ -945,7 +959,9 @@ pub fn ot_session_get_renderer_state(
         .height = attached.height,
         .frame_count = attached.getRenderStats().frameCount,
         .frame_pending = @intFromBool(value.frame_end_offset != null),
-        .reserved = 0,
+        .image_uploads_pending = attached.imageUploadsPending(),
+        .dropped_frames = attached.dropped_frames,
+        .dropped_frame_bytes = attached.dropped_frame_bytes,
     };
     return c.OT_OK;
 }
@@ -1129,6 +1145,27 @@ pub fn ot_session_drain_stdout(
     return c.OT_OK;
 }
 
+pub fn ot_session_post_stdout(
+    context: ?*ContextHandle,
+    session_ptr: ?*const c.ot_handle,
+    max_bytes: u32,
+    wait: u32,
+    out_state_ptr: ?*u32,
+    out_written_ptr: ?*u32,
+) callconv(.c) c.ot_status {
+    const status = sessionContextStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    const id = session_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const out_state = out_state_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const out_written = out_written_ptr orelse return sessionError(owner, error.InvalidOptions);
+    if (wait > 1) return sessionError(owner, error.InvalidOptions);
+    const result = owner.core.postStdout(handleFromC(id.*), max_bytes, wait == 1) catch |err| return sessionError(owner, err);
+    out_state.* = if (result.in_flight) c.OT_STDOUT_IN_FLIGHT else c.OT_STDOUT_IDLE;
+    out_written.* = result.written;
+    return c.OT_OK;
+}
+
 pub fn ot_session_setup_terminal(
     context: ?*ContextHandle,
     session_ptr: ?*const c.ot_handle,
@@ -1141,8 +1178,10 @@ pub fn ot_session_setup_terminal(
     const options = options_ptr orelse return sessionError(owner, error.InvalidOptions);
     if (options.struct_size != @sizeOf(c.ot_session_terminal_options)) return sessionError(owner, error.InvalidOptions);
     if (options.abi_version != c.OT_CONTEXT_ABI_VERSION) return sessionError(owner, error.UnsupportedVersion);
+    const sync_flags: u32 = c.OT_TERMINAL_SYNC_ALWAYS | c.OT_TERMINAL_SYNC_NEVER;
     const known_flags: u32 = c.OT_TERMINAL_ALTERNATE_SCREEN | c.OT_TERMINAL_MOUSE |
-        c.OT_TERMINAL_MOUSE_MOVEMENT | c.OT_TERMINAL_CLEAR_ON_CLOSE | c.OT_TERMINAL_REPLY_SENTINEL;
+        c.OT_TERMINAL_MOUSE_MOVEMENT | c.OT_TERMINAL_CLEAR_ON_CLOSE | c.OT_TERMINAL_REPLY_SENTINEL | sync_flags |
+        c.OT_TERMINAL_HOST_MULTIPLEXER;
     if (options.flags & ~known_flags != 0 or options.kitty_keyboard_flags > 31) {
         return sessionError(owner, error.InvalidOptions);
     }
@@ -1152,6 +1191,13 @@ pub fn ot_session_setup_terminal(
         .mouse_movement = options.flags & c.OT_TERMINAL_MOUSE_MOVEMENT != 0,
         .clear_on_close = options.flags & c.OT_TERMINAL_CLEAR_ON_CLOSE != 0,
         .reply_sentinel = options.flags & c.OT_TERMINAL_REPLY_SENTINEL != 0,
+        .host_multiplexer = options.flags & c.OT_TERMINAL_HOST_MULTIPLEXER != 0,
+        .synchronized_output = switch (options.flags & sync_flags) {
+            0 => .auto,
+            c.OT_TERMINAL_SYNC_ALWAYS => .always,
+            c.OT_TERMINAL_SYNC_NEVER => .never,
+            else => return sessionError(owner, error.InvalidOptions),
+        },
         .kitty_keyboard_flags = @intCast(options.kitty_keyboard_flags),
     }) catch |err| return sessionError(owner, err);
     return c.OT_OK;
@@ -1273,7 +1319,7 @@ pub fn ot_session_control(
     const payload = options.kind == c.OT_CONTROL_CAPABILITY_RESPONSE or options.kind == c.OT_CONTROL_TITLE or options.kind == c.OT_CONTROL_CURSOR or options.kind == c.OT_CONTROL_PALETTE_QUERY or
         options.kind == c.OT_CONTROL_PROGRAM_STATUS;
     const argument_max: u32 = switch (options.kind) {
-        c.OT_CONTROL_MOUSE => @intFromEnum(@import("session.zig").MouseMode.motion),
+        c.OT_CONTROL_MOUSE => @backingInt(@import("session.zig").MouseMode.motion),
         c.OT_CONTROL_KITTY_KEYBOARD_FLAGS => 31,
         c.OT_CONTROL_QUERY_PIXEL_RESOLUTION => 1,
         else => 0,
@@ -1283,7 +1329,7 @@ pub fn ot_session_control(
     const command: @import("session.zig").Control = switch (options.kind) {
         c.OT_CONTROL_CAPABILITY_RESPONSE => .{ .capability_response = bytes },
         c.OT_CONTROL_TITLE => .{ .title = bytes },
-        c.OT_CONTROL_MOUSE => .{ .mouse = @enumFromInt(options.argument) },
+        c.OT_CONTROL_MOUSE => .{ .mouse = @fromBackingInt(@intCast(options.argument)) },
         c.OT_CONTROL_KITTY_KEYBOARD_FLAGS => .{ .kitty_keyboard_flags = @intCast(options.argument) },
         c.OT_CONTROL_RESTORE_MODES => .restore_modes,
         c.OT_CONTROL_QUERY_PIXEL_RESOLUTION => .{ .query_pixel_resolution = options.argument != 0 },
@@ -1311,10 +1357,10 @@ pub fn ot_session_control(
                     .y = update.y,
                     .visible = update.visible != 0,
                 } else null,
-                .style = if (update.fields & c.OT_CURSOR_STYLE != 0) @enumFromInt(update.style) else null,
+                .style = if (update.fields & c.OT_CURSOR_STYLE != 0) @fromBackingInt(@intCast(update.style)) else null,
                 .blinking = if (update.fields & c.OT_CURSOR_BLINKING != 0) update.blinking != 0 else null,
                 .color = if (update.fields & c.OT_CURSOR_COLOR != 0) update.color else null,
-                .cursor = if (update.fields & c.OT_CURSOR_MOUSE_POINTER != 0) @enumFromInt(update.mouse_pointer) else null,
+                .cursor = if (update.fields & c.OT_CURSOR_MOUSE_POINTER != 0) @fromBackingInt(@intCast(update.mouse_pointer)) else null,
             } };
         },
         c.OT_CONTROL_PROGRAM_STATUS => blk: {
@@ -1332,8 +1378,8 @@ pub fn ot_session_control(
             const title_start = app_start + report.app_len;
             const message_start = title_start + report.title_len;
             break :blk .{ .program_status = .{
-                .state = @enumFromInt(report.state),
-                .kind = if (report.kind == 0) null else @enumFromInt(report.kind),
+                .state = @fromBackingInt(@intCast(report.state)),
+                .kind = if (report.kind == 0) null else @fromBackingInt(@intCast(report.kind)),
                 .progress = if (report.fields & c.OT_PROGRAM_STATUS_PROGRESS != 0) @intCast(report.progress) else null,
                 .id = text[0..app_start],
                 .app = text[app_start..title_start],
@@ -1363,7 +1409,7 @@ pub fn ot_session_clipboard(
     out.* = 0;
     if (target > 3 or (byte_count != 0 and bytes_ptr == null)) return sessionError(owner, error.InvalidOptions);
     const bytes = if (bytes_ptr) |ptr| ptr[0..byte_count] else &.{};
-    out.* = @intFromBool(owner.core.writeSessionClipboard(handleFromC(id.*), @enumFromInt(target), bytes) catch |err| return sessionError(owner, err));
+    out.* = @intFromBool(owner.core.writeSessionClipboard(handleFromC(id.*), @fromBackingInt(@intCast(target)), bytes) catch |err| return sessionError(owner, err));
     return c.OT_OK;
 }
 
@@ -1443,10 +1489,10 @@ pub fn ot_session_get_capabilities(
     }) |field| {
         if (@field(caps, field[0])) result.flags |= field[1];
     }
-    result.width_method = @intFromEnum(caps.unicode);
-    result.multiplexer = @intFromEnum(term.multiplexer);
-    result.image_protocol = @intFromEnum(term.image_protocol);
-    result.osc52_support = @intFromEnum(term.osc52_support);
+    result.width_method = @backingInt(caps.unicode);
+    result.multiplexer = @backingInt(term.multiplexer);
+    result.image_protocol = @backingInt(term.image_protocol);
+    result.osc52_support = @backingInt(term.osc52_support);
     result.kitty_keyboard_flags = term.opts.kitty_keyboard_flags;
     result.term_name_len = @intCast(term.term_info.name_len);
     result.term_version_len = @intCast(term.term_info.version_len);
@@ -1483,6 +1529,15 @@ pub fn ot_session_close(context: ?*ContextHandle, session_ptr: ?*const c.ot_hand
     const owner = context.?;
     const id = session_ptr orelse return sessionError(owner, error.InvalidOptions);
     owner.core.beginSessionClose(handleFromC(id.*)) catch |err| return sessionError(owner, err);
+    return c.OT_OK;
+}
+
+pub fn ot_session_drop_output(context: ?*ContextHandle, session_ptr: ?*const c.ot_handle) callconv(.c) c.ot_status {
+    const status = sessionContextStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    const id = session_ptr orelse return sessionError(owner, error.InvalidOptions);
+    owner.core.dropSessionOutput(handleFromC(id.*)) catch |err| return sessionError(owner, err);
     return c.OT_OK;
 }
 
@@ -2461,7 +2516,7 @@ pub fn ot_scene_get_stats(context: ?*ContextHandle, session_ptr: ?*const c.ot_ha
         .stdout_write_time_valid = @intFromBool(result.outputWriteTime != null),
     };
     // The header names each work field after its FrameWork field.
-    inline for (std.meta.fields(@TypeOf(result.frameWork))) |field| @field(out, field.name) = @field(result.frameWork, field.name);
+    inline for (@typeInfo(@TypeOf(result.frameWork)).@"struct".field_names) |name| @field(out, name) = @field(result.frameWork, name);
     return c.OT_OK;
 }
 
@@ -2857,7 +2912,7 @@ test "Context focused draw records validate exact size before payload access" {
             .operation = entry[1],
             .flags = 0,
         };
-        for ([_]u32{ 0, @sizeOf(entry[0]) - 4, @sizeOf(entry[0]) + 4, 136 }) |size| {
+        for ([_]u32{ 0, @sizeOf(entry[0]) - 1, @sizeOf(entry[0]) + 4, 136 }) |size| {
             header.struct_size = size;
             try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_buffer_draw(context, &buffer, null, &header, null, null, 0, null, 0));
         }
@@ -2908,7 +2963,7 @@ test "Context buffer ABI rejects invalid arguments without writing outputs" {
     try std.testing.expectEqual(kept, unicode);
     for (std.enums.values(WidthMethod)) |method| {
         var width_options = valid;
-        width_options.width_method = @intFromEnum(method);
+        width_options.width_method = @backingInt(method);
         try std.testing.expectEqual(c.OT_OK, ot_buffer_create(context, &width_options, &out));
         const value = try core.raw().getBuffer(handleFromC(out));
         try std.testing.expectEqual(method, value.width_method);
@@ -2917,7 +2972,7 @@ test "Context buffer ABI rejects invalid arguments without writing outputs" {
     }
 
     const target = handleToC(try core.createBuffer(2, 1, .{}));
-    const bytes = [_]u8{0} ** 48;
+    const bytes: [48]u8 = @splat(0);
     const samples = [_]f32{0};
     const color = [_]u16{ 255, 255, 255, 255 };
     var opacity: f32 = 1;
@@ -3281,7 +3336,7 @@ test "Context editor ABI validates bindings records and readonly admission" {
 fn cursorUpdate(fields: u32, values: anytype) c.ot_session_cursor_update {
     var update = std.mem.zeroes(c.ot_session_cursor_update);
     update.fields = fields;
-    inline for (std.meta.fields(@TypeOf(values))) |field| @field(update, field.name) = @field(values, field.name);
+    inline for (@typeInfo(@TypeOf(values)).@"struct".field_names) |name| @field(update, name) = @field(values, name);
     return update;
 }
 
@@ -3290,7 +3345,7 @@ inline fn programStatus(comptime values: anytype, comptime text: []const u8) []c
     comptime {
         var report = std.mem.zeroes(c.ot_session_program_status);
         report.state = c.OT_PROGRAM_STATE_IDLE;
-        for (std.meta.fields(@TypeOf(values))) |field| @field(report, field.name) = @field(values, field.name);
+        for (@typeInfo(@TypeOf(values)).@"struct".field_names) |name| @field(report, name) = @field(values, name);
         const bytes = std.mem.toBytes(report) ++ text[0..text.len].*;
         return &bytes;
     }
@@ -3400,8 +3455,8 @@ test "Context ABI Session control decodes kinds arguments and cursor records bef
         try std.testing.expectEqual(case.status, status);
         if (status != c.OT_OK) try std.testing.expectEqualDeep(before, terminal.*);
     }
-    try std.testing.expectEqual(@as(u32, c.OT_MOUSE_POINTER_MAX), @intFromEnum(terminal.getMousePointer()));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(terminal.getCursorStyle().style));
+    try std.testing.expectEqual(@as(u32, c.OT_MOUSE_POINTER_MAX), @backingInt(terminal.getMousePointer()));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(terminal.getCursorStyle().style));
     try std.testing.expect(terminal.getCursorStyle().blinking);
 }
 
@@ -3496,12 +3551,13 @@ test "Context ABI Session setup and capability records validate before changing 
     try std.testing.expectEqualDeep(rejected, capabilities);
     // Every capability owns one distinct flag.
     var seen: u32 = 0;
-    inline for (std.meta.fields(@TypeOf(cli.terminal.caps))) |field| {
-        if (field.type != bool) continue;
+    const caps_info = @typeInfo(@TypeOf(cli.terminal.caps)).@"struct";
+    inline for (caps_info.field_names, caps_info.field_types) |name, Field| {
+        if (Field != bool) continue;
         const saved = cli.terminal.caps;
         defer cli.terminal.caps = saved;
         cli.terminal.caps = .{};
-        @field(cli.terminal.caps, field.name) = true;
+        @field(cli.terminal.caps, name) = true;
         try std.testing.expectEqual(c.OT_OK, ot_session_get_capabilities(context, &id, &capabilities));
         try std.testing.expectEqual(@as(u32, 1), @popCount(capabilities.flags));
         try std.testing.expect(seen & capabilities.flags == 0);
@@ -3523,14 +3579,16 @@ test "Context ABI Session setup and capability records validate before changing 
     const valid: c.ot_session_terminal_options = .{
         .struct_size = @sizeOf(c.ot_session_terminal_options),
         .abi_version = c.OT_CONTEXT_ABI_VERSION,
-        .flags = c.OT_TERMINAL_ALTERNATE_SCREEN | c.OT_TERMINAL_MOUSE | c.OT_TERMINAL_CLEAR_ON_CLOSE | c.OT_TERMINAL_REPLY_SENTINEL,
+        .flags = c.OT_TERMINAL_ALTERNATE_SCREEN | c.OT_TERMINAL_MOUSE | c.OT_TERMINAL_CLEAR_ON_CLOSE |
+            c.OT_TERMINAL_REPLY_SENTINEL | c.OT_TERMINAL_SYNC_NEVER | c.OT_TERMINAL_HOST_MULTIPLEXER,
         .kitty_keyboard_flags = 31,
     };
-    var invalid: [4]c.ot_session_terminal_options = @splat(valid);
+    var invalid: [5]c.ot_session_terminal_options = @splat(valid);
     invalid[0].struct_size += 1;
     invalid[1].abi_version += 1;
-    invalid[2].flags |= c.OT_TERMINAL_REPLY_SENTINEL << 1;
+    invalid[2].flags |= c.OT_TERMINAL_HOST_MULTIPLEXER << 1;
     invalid[3].kitty_keyboard_flags = 32;
+    invalid[4].flags |= c.OT_TERMINAL_SYNC_ALWAYS | c.OT_TERMINAL_SYNC_NEVER;
     try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_session_setup_terminal(context, &id, null));
     for (invalid, 0..) |options, index| {
         const expected = if (index == 1) c.OT_UNSUPPORTED_VERSION else c.OT_INVALID_ARGUMENT;
@@ -3541,6 +3599,7 @@ test "Context ABI Session setup and capability records validate before changing 
     try std.testing.expect(cli.useAlternateScreen and cli.clearOnShutdown and cli.terminal.reply_sentinel);
     try std.testing.expect(value.lifecycle.mouse and !value.lifecycle.mouse_movement);
     try std.testing.expectEqual(@as(u8, 31), cli.terminal.opts.kitty_keyboard_flags);
+    try std.testing.expect(cli.terminal.synchronized_output == .never and cli.terminal.multiplexer_on_host);
     value.cancel();
 }
 
@@ -3551,7 +3610,7 @@ fn ScenePointee(comptime P: type) ?type {
     if (info != .optional or @typeInfo(info.optional.child) != .pointer) return null;
     const pointer = @typeInfo(info.optional.child).pointer;
     if (pointer.size != .one or @typeInfo(pointer.child) == .@"fn") return null;
-    return if (!pointer.is_const or isSceneRecord(pointer.child)) pointer.child else null;
+    return if (!pointer.attrs.@"const" or isSceneRecord(pointer.child)) pointer.child else null;
 }
 
 fn isSceneRecord(comptime T: type) bool {
@@ -3563,7 +3622,7 @@ fn isSceneRecord(comptime T: type) bool {
 /// handle; the rest break one pointer argument each (NULL, size, version, reserved). Reads stay
 /// admitted while a measure callback runs. A rejection leaves every record and output unchanged.
 fn expectSceneWrapperRules(comptime wrapper: anytype, comptime read: bool, context: *ContextHandle, handles: *const [4]c.ot_handle, fill: u32) !void {
-    const params = @typeInfo(@TypeOf(wrapper)).@"fn".params;
+    const params = @typeInfo(@TypeOf(wrapper)).@"fn".param_types;
     for (0..8 + 4 * params.len) |row| {
         var args: std.meta.ArgsTuple(@TypeOf(wrapper)) = undefined;
         var storage: [params.len][256]u8 align(8) = @splat(@splat(0));
@@ -3580,10 +3639,10 @@ fn expectSceneWrapperRules(comptime wrapper: anytype, comptime read: bool, conte
             else => null,
         };
         inline for (params[2..], 2..) |param, index| {
-            if (comptime ScenePointee(param.type.?)) |T| {
+            if (comptime ScenePointee(param.?)) |T| {
                 comptime std.debug.assert(@sizeOf(T) <= 256);
                 const record: *T = @ptrCast(@alignCast(&storage[index]));
-                if (!@typeInfo(@typeInfo(param.type.?).optional.child).pointer.is_const) @memset(&storage[index], 0xa5);
+                if (!@typeInfo(@typeInfo(param.?).optional.child).pointer.attrs.@"const") @memset(&storage[index], 0xa5);
                 const is_record = comptime isSceneRecord(T);
                 if (is_record) record.struct_size = @sizeOf(T);
                 if (is_record) record.abi_version = c.OT_CONTEXT_ABI_VERSION;
@@ -3601,12 +3660,12 @@ fn expectSceneWrapperRules(comptime wrapper: anytype, comptime read: bool, conte
                         record.abi_version += 1;
                         expected = c.OT_UNSUPPORTED_VERSION;
                     },
-                    else => if (comptime is_record and @typeInfo(param.type.?).optional.child == *const T and @hasField(T, "reserved")) {
+                    else => if (comptime is_record and @typeInfo(param.?).optional.child == *const T and @hasField(T, "reserved")) {
                         record.reserved = 1;
                         expected = c.OT_INVALID_ARGUMENT;
                     },
                 };
-            } else args[index] = switch (@typeInfo(param.type.?)) {
+            } else args[index] = switch (@typeInfo(param.?)) {
                 .optional => null,
                 .float => @floatFromInt(fill),
                 else => fill,
@@ -3649,7 +3708,7 @@ test "Scene ABI wrappers share admission handle and record rules and keep output
         ot_scene_set_viewport,       ot_scene_set_focus,  ot_scene_set_slider,       ot_scene_get_slider_thumb,
         ot_scene_set_arrow,          ot_scene_set_text,   ot_scene_set_styled_text,  ot_scene_set_text_options,
         ot_scene_set_text_selection, ot_scene_set_hooks,  ot_scene_set_editor_view,  ot_scene_set_editor_options,
-        ot_scene_set_image,          ot_scene_set_scroll, ot_scene_set_scroll_arrow,
+        ot_scene_set_image,          ot_scene_set_scroll, ot_scene_set_scroll_arrow, ot_scene_set_crop,
     }) |wrapper| {
         try expectSceneWrapperRules(wrapper, false, handle, &nodes, 0);
     }
@@ -3805,7 +3864,7 @@ test "Scene Slider and Arrow ABI validate fixed records without changing accepte
     try std.testing.expectEqual(c.OT_OK, ot_scene_create_node(handle, &id, c.OT_SCENE_ROOT, 1, &root));
     try std.testing.expectEqual(c.OT_OK, ot_scene_create_node(handle, &id, c.OT_SCENE_SLIDER, 2, &slider));
     try std.testing.expectEqual(c.OT_OK, ot_scene_create_node(handle, &id, c.OT_SCENE_ARROW, 3, &arrow));
-    try owner.sceneSetHooks(handleFromC(slider), 0, 1, 4.25, 1);
+    try owner.sceneSetHooks(handleFromC(slider), 0, 2, 4.25, 1);
     const slider_options: c.ot_scene_slider_options = .{
         .struct_size = @sizeOf(c.ot_scene_slider_options),
         .abi_version = c.OT_CONTEXT_ABI_VERSION,
@@ -3827,6 +3886,7 @@ test "Scene Slider and Arrow ABI validate fixed records without changing accepte
         .background = .{ 130, 140, 150, 160 },
     };
     try std.testing.expectEqual(c.OT_OK, ot_scene_set_slider(handle, &slider, &slider_options));
+    try owner.sceneSetHooks(handleFromC(slider), 0, 3, 10, 1);
     try std.testing.expectEqual(c.OT_OK, ot_scene_set_arrow(handle, &arrow, &arrow_options, null, 0));
     const accepted_slider = (try owner.raw().getRenderable(handleFromC(slider))).scene_node.?.control.slider;
     const accepted_arrow = (try owner.raw().getRenderable(handleFromC(arrow))).scene_node.?.control.arrow;
@@ -4706,9 +4766,9 @@ test "Context ABI creation clears failed Yoga output and retries without retaini
 
 test "Context ABI uses libc in release builds and DebugAllocator in tests and Debug builds" {
     const gpa = std.testing.allocator;
-    try std.testing.expectEqual(std.heap.c_allocator.vtable, contextAllocator(gpa, .ReleaseFast, false, false).vtable);
-    try std.testing.expectEqual(gpa.vtable, contextAllocator(gpa, .ReleaseFast, true, false).vtable);
-    try std.testing.expectEqual(gpa.vtable, contextAllocator(gpa, .Debug, false, false).vtable);
+    try std.testing.expectEqual(std.heap.c_allocator.vtable, contextAllocator(gpa, .fast, false, false).vtable);
+    try std.testing.expectEqual(gpa.vtable, contextAllocator(gpa, .fast, true, false).vtable);
+    try std.testing.expectEqual(gpa.vtable, contextAllocator(gpa, .debug, false, false).vtable);
 }
 
 test "Context ABI creation releases backing storage at every allocation failure" {
@@ -4798,7 +4858,7 @@ test "Context ABI diagnostics copy bounded records and preserve failed drains" {
     defer if (second != null) std.testing.expectEqual(c.OT_OK, ot_context_destroy(second)) catch unreachable;
     const owner = first.?;
     second.?.core.logger.info("peer", .{});
-    owner.core.logger.warn("{s}", .{"x" ** (c.OT_DIAGNOSTIC_MESSAGE_BYTES + 1)});
+    owner.core.logger.warn("{s}", .{utils.repeat(u8, "x", c.OT_DIAGNOSTIC_MESSAGE_BYTES + 1)});
     for (0..64) |index| owner.core.logger.info("{}", .{index});
 
     var out: c.ot_diagnostic_drain = .{
@@ -4828,7 +4888,7 @@ test "Context ABI diagnostics copy bounded records and preserve failed drains" {
     try std.testing.expectEqual(c.OT_DIAGNOSTIC_MESSAGE_BYTES, record.message_len);
     try std.testing.expectEqual(c.OT_DIAGNOSTIC_TRUNCATED, record.flags);
     try std.testing.expectEqual(0, record.reserved);
-    try std.testing.expectEqualSlices(u8, "x" ** c.OT_DIAGNOSTIC_MESSAGE_BYTES, &record.message);
+    try std.testing.expectEqualSlices(u8, utils.repeat(u8, "x", c.OT_DIAGNOSTIC_MESSAGE_BYTES), &record.message);
 
     try std.testing.expectEqual(c.OT_OK, ot_context_drain_diagnostics(second, @ptrCast(&record), 1, &out));
     try std.testing.expectEqual(c.OT_OK, ot_context_destroy(second));
@@ -4864,8 +4924,8 @@ test "Context error mapping gives every Context error a specific status" {
     defer std.testing.expectEqual(c.OT_OK, ot_context_destroy(handle)) catch unreachable;
     // These report a broken native invariant rather than a caller error.
     const internal = [_]anyerror{ error.ContextLimit, error.YogaException, error.YogaPoisoned };
-    inline for (@typeInfo(@import("context.zig").Error).error_set.?) |info| {
-        const err = @field(anyerror, info.name);
+    inline for (@typeInfo(@import("context.zig").Error).error_set.error_names.?) |name| {
+        const err = @field(anyerror, name);
         const status = sessionError(handle, err);
         try std.testing.expectEqual(status, handle.last_error);
         try std.testing.expectEqual(std.mem.findScalar(anyerror, &internal, err) != null, status == c.OT_INTERNAL_ERROR);
@@ -4941,6 +5001,24 @@ test "Session native output ABI validates admission before writing and rejects c
     handle.owner_thread -= 1;
     try std.testing.expectEqual(c.OT_WRONG_THREAD, wrong_thread);
     try std.testing.expectEqual(@as(u32, 99), written);
+    // post_stdout (R29): wait above 1 and null outputs are invalid, and outputs stay unchanged; wait=1 without a
+    // writer is idle on every platform; a non-terminal fd 1 refuses before consuming output.
+    var state: u32 = 99;
+    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_session_post_stdout(handle, &id, 4, 2, &state, &written));
+    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_session_post_stdout(handle, &id, 4, 0, null, &written));
+    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_session_post_stdout(handle, &id, 4, 0, &state, null));
+    try std.testing.expectEqual(c.OT_WRONG_CONTEXT, ot_session_post_stdout(handle, &foreign, 4, 0, &state, &written));
+    try std.testing.expectEqual(@as(u32, 99), state);
+    try std.testing.expectEqual(c.OT_OK, ot_session_post_stdout(handle, &id, 0, 1, &state, &written));
+    try std.testing.expectEqual(@as(u32, c.OT_STDOUT_IDLE), state);
+    try std.testing.expectEqual(@as(u32, 0), written);
+    const terminal = if (comptime builtin.os.tag == .windows) false else std.c.isatty(1) == 1;
+    if (!terminal) {
+        written = 99;
+        try std.testing.expectEqual(c.OT_UNSUPPORTED_RESOURCE, ot_session_post_stdout(handle, &id, 4, 0, &state, &written));
+        try std.testing.expectEqual(@as(u32, 99), written);
+        try std.testing.expectEqual(@as(u64, 0), (try handle.core.raw().getSession(native_id)).completed_bytes);
+    }
     try std.testing.expectEqual(@as(u32, 0), writer.calls);
     try std.testing.expectEqual(c.OT_OK, ot_session_drain_output(handle, &id, 4, &written, &writer, Writer.write));
     try std.testing.expectEqual(@as(u32, 2), written);
@@ -5000,7 +5078,7 @@ test "Session pump ABIs validate the result record and map every pump status" {
     try std.testing.expectEqual(@as(u32, 99), record.status);
 
     var bytes: [8192]u8 = undefined;
-    var seen = [_]bool{false} ** 5;
+    var seen: [5]bool = @splat(false);
     var now: u64 = 10;
     // Setup, then suspension with its cursor-settle waits, each pumped until idle.
     for (0..2) |phase| {
@@ -5026,7 +5104,7 @@ test "Session pump ABIs validate the result record and map every pump status" {
     try handle.core.resumeSession(native_id);
 
     // Exit pumping visits one restoration unit per call until the output closes.
-    var exit_seen = [_]bool{false} ** 5;
+    var exit_seen: [5]bool = @splat(false);
     var status: u32 = 99;
     for (0..64) |_| {
         try std.testing.expectEqual(c.OT_OK, ot_session_pump_exit(handle, &id, &status));
@@ -5049,6 +5127,7 @@ const abi_modules = .{
     input_transport,
     output_transport,
     image_transport,
+    video_transport,
     clipboard_transport,
 };
 
@@ -5056,23 +5135,23 @@ const abi_modules = .{
 // The C header is the source of ABI record types.
 pub fn export_symbols() void {
     @setEvalBranchQuota(200_000);
-    for (@typeInfo(c).@"struct".decls) |declaration| {
-        if (!std.mem.startsWith(u8, declaration.name, "ot_")) continue;
-        const Prototype = @TypeOf(@field(c, declaration.name));
+    for (@typeInfo(c).@"struct".decl_names) |name| {
+        if (!std.mem.startsWith(u8, name, "ot_")) continue;
+        const Prototype = @TypeOf(@field(c, name));
         if (@typeInfo(Prototype) != .@"fn") continue;
         const implementation = find: {
             for (abi_modules) |module| {
-                if (@hasDecl(module, declaration.name)) break :find &@field(module, declaration.name);
+                if (@hasDecl(module, name)) break :find &@field(module, name);
             }
-            @compileError("Missing checked ABI implementation: " ++ declaration.name);
+            @compileError("Missing checked ABI implementation: " ++ name);
         };
-        checkPrototype(declaration.name, Prototype, @TypeOf(implementation.*));
-        @export(implementation, .{ .name = declaration.name });
+        checkPrototype(name, Prototype, @TypeOf(implementation.*));
+        @export(implementation, .{ .name = name });
     }
     for (abi_modules) |module| {
-        for (@typeInfo(module).@"struct".decls) |declaration| {
-            if (std.mem.startsWith(u8, declaration.name, "ot_") and !@hasDecl(c, declaration.name))
-                @compileError("ABI implementation is not declared in opentui.h: " ++ declaration.name);
+        for (@typeInfo(module).@"struct".decl_names) |name| {
+            if (std.mem.startsWith(u8, name, "ot_") and !@hasDecl(c, name))
+                @compileError("ABI implementation is not declared in opentui.h: " ++ name);
         }
     }
 }
@@ -5082,24 +5161,24 @@ pub fn export_symbols() void {
 fn checkPrototype(comptime name: []const u8, comptime Prototype: type, comptime Implementation: type) void {
     const prototype = @typeInfo(Prototype).@"fn";
     const implementation = @typeInfo(Implementation).@"fn";
-    if (!std.meta.eql(implementation.calling_convention, std.builtin.CallingConvention.c) or
-        implementation.params.len != prototype.params.len or
+    if (!std.meta.eql(implementation.attrs.@"callconv", std.lang.CallingConvention.c) or
+        implementation.param_types.len != prototype.param_types.len or
         implementation.return_type.? != prototype.return_type.?)
     {
         @compileError("ABI implementation differs from opentui.h: " ++ name);
     }
-    for (prototype.params, implementation.params, 0..) |expected, actual, index| {
-        const expected_pointer = nullablePointer(expected.type.?) orelse {
-            if (actual.type.? != expected.type.?) prototypeError("scalar differs from opentui.h", name, index);
+    for (prototype.param_types, implementation.param_types, 0..) |expected, actual, index| {
+        const expected_pointer = nullablePointer(expected.?) orelse {
+            if (actual.? != expected.?) prototypeError("scalar differs from opentui.h", name, index);
             continue;
         };
-        const actual_pointer = nullablePointer(actual.type.?) orelse
+        const actual_pointer = nullablePointer(actual.?) orelse
             prototypeError("pointer must accept NULL", name, index);
-        if (expected_pointer.is_const and !actual_pointer.is_const)
+        if (expected_pointer.attrs.@"const" and !actual_pointer.attrs.@"const")
             prototypeError("pointer drops const", name, index);
         if (@typeInfo(expected_pointer.child) == .@"struct" and actual_pointer.child != expected_pointer.child)
             prototypeError("record pointer differs from opentui.h", name, index);
-        if (@typeInfo(expected_pointer.child) == .@"fn" and actual.type.? != expected.type.?)
+        if (@typeInfo(expected_pointer.child) == .@"fn" and actual.? != expected.?)
             prototypeError("callback differs from opentui.h", name, index);
     }
 }
@@ -5108,7 +5187,7 @@ fn prototypeError(comptime reason: []const u8, comptime name: []const u8, compti
     @compileError(std.fmt.comptimePrint("ABI {s}: {s} argument {d}", .{ reason, name, index }));
 }
 
-fn nullablePointer(comptime T: type) ?std.builtin.Type.Pointer {
+fn nullablePointer(comptime T: type) ?std.lang.Type.Pointer {
     return switch (@typeInfo(T)) {
         .pointer => |info| if (info.size == .c) info else null,
         .optional => |info| switch (@typeInfo(info.child)) {
@@ -5128,7 +5207,7 @@ comptime {
     for (std.meta.tags(MousePointerStyle)) |style| {
         var name: [@tagName(style).len]u8 = undefined;
         _ = std.ascii.upperString(&name, @tagName(style));
-        if (@field(c, "OT_MOUSE_POINTER_" ++ name) != @intFromEnum(style))
+        if (@field(c, "OT_MOUSE_POINTER_" ++ name) != @backingInt(style))
             @compileError("OT_MOUSE_POINTER_" ++ name ++ " differs from terminal.MousePointerStyle");
     }
     if (c.OT_MOUSE_POINTER_MAX != std.meta.tags(MousePointerStyle).len - 1)
@@ -5136,9 +5215,9 @@ comptime {
     const TextLine = @import("scene.zig").TextLine;
     if (@sizeOf(c.ot_scene_text_line) != @sizeOf(TextLine) or @alignOf(c.ot_scene_text_line) != @alignOf(TextLine))
         @compileError("ot_scene_text_line differs from scene.TextLine");
-    for (std.meta.fields(TextLine)) |field| {
-        if (@offsetOf(c.ot_scene_text_line, field.name) != @offsetOf(TextLine, field.name))
-            @compileError("ot_scene_text_line differs from scene.TextLine: " ++ field.name);
+    for (@typeInfo(TextLine).@"struct".field_names) |name| {
+        if (@offsetOf(c.ot_scene_text_line, name) != @offsetOf(TextLine, name))
+            @compileError("ot_scene_text_line differs from scene.TextLine: " ++ name);
     }
     if (@import("link.zig").MAX_URL_LENGTH != 512) @compileError("opentui.h documents 512-byte URLs");
 }

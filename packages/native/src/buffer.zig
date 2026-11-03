@@ -8,6 +8,8 @@ const edv = @import("editor-view.zig");
 const math = std.math;
 const assert = std.debug.assert;
 const fillU32 = @import("utils.zig").fillU32;
+const nonNegative = @import("utils.zig").nonNegative;
+const unsigned = @import("utils.zig").unsigned;
 
 const gp = @import("grapheme.zig");
 const link = @import("link.zig");
@@ -480,6 +482,16 @@ pub const BufferLease = struct {
 /// A glyph that a text view draw wrote at column x of its current row.
 const MarkBase = struct { x: u32, char: u32 };
 
+/// A cell limit for a text draw.
+pub const TextFit = struct {
+    /// Cells right of x that the text may cover; zero means no limit.
+    max_width: u32 = 0,
+    /// For text wider than max_width: keep the glyphs that leave room for an ellipsis, then draw it.
+    ellipsis: bool = false,
+};
+
+const ellipsis_bytes = "\u{2026}";
+
 /// One glyph of a text row with at least one cell to draw.
 const TextGlyph = struct {
     bytes: []const u8,
@@ -494,7 +506,7 @@ const TextGlyph = struct {
 /// Places the glyphs of one text row for drawText and drawTextChecked. Controls and other
 /// zero-width clusters take no cells. A tab or a cluster that a cell cannot hold is blank
 /// (see isPrintableGlyph): its spaces clip one by one, also left of column 0. Any other glyph
-/// draws only when all of its cells are inside the target and its scissor. Every glyph
+/// draws only when all of its cells are left of end and inside the target's scissor. Every glyph
 /// advances by the width it is drawn with, so clipping never moves the visible glyphs.
 const TextRow = struct {
     target: *const OptimizedBuffer,
@@ -503,6 +515,8 @@ const TextRow = struct {
     clusters: []const utf8.RenderClusterInfo,
     x: i32,
     y: i32,
+    /// The column where the row stops: the target's width, or less for a fitted draw.
+    end: i64,
     byte_offset: usize = 0,
     cluster_index: usize = 0,
     advance_cells: u64 = 0,
@@ -510,9 +524,36 @@ const TextRow = struct {
     const tab_width: u8 = 2;
 
     fn next(self: *TextRow) ?TextGlyph {
-        const target = self.target;
         // A glyph is at most two cells per byte, so the columns fit in i64.
-        while (self.byte_offset < self.text.len and self.x + @as(i64, @intCast(self.advance_cells)) < target.width) {
+        while (self.x + @as(i64, @intCast(self.advance_cells)) < self.end) {
+            const glyph = self.nextGlyph() orelse return null;
+            const blank = !isPrintableGlyph(glyph.bytes, glyph.width);
+            // A glyph that starts left of column 0 is clipped, even a wide glyph that reaches column 0.
+            if (!blank and glyph.x < 0) continue;
+            const first: u32 = @intCast(@max(glyph.x, 0));
+            const end = @min(glyph.x + glyph.width, self.end);
+            const count: u32 = if (!blank) 1 else if (end > first) @intCast(end - first) else 0;
+            if (!self.isVisible(first, if (blank) count else glyph.width, blank)) continue;
+            return .{ .bytes = glyph.bytes, .x = first, .width = glyph.width, .blank = blank, .count = count };
+        }
+        return null;
+    }
+
+    /// The byte length of the glyphs that end at most `room` cells right of x, or null when the
+    /// whole row is at most `max_width` cells wide.
+    fn fitBytes(self: *TextRow, room: u64, max_width: u64) ?usize {
+        var kept: ?usize = null;
+        while (self.advance_cells <= max_width) {
+            const start = self.byte_offset;
+            _ = self.nextGlyph() orelse return null;
+            if (kept == null and self.advance_cells > room) kept = start;
+        }
+        return kept;
+    }
+
+    /// The next glyph with at least one cell, at column x plus the cells before it.
+    fn nextGlyph(self: *TextRow) ?struct { bytes: []const u8, x: i64, width: u32 } {
+        while (self.byte_offset < self.text.len) {
             const start = self.byte_offset;
             // Unchecked text can be invalid UTF-8, which ends a cluster at another byte.
             while (self.cluster_index < self.clusters.len and self.clusters[self.cluster_index].byte_start < start) {
@@ -529,25 +570,18 @@ const TextRow = struct {
                 self.byte_offset = @min(start + length, self.text.len);
             }
             const bytes = self.text[start..self.byte_offset];
-            const width = if (cluster) |entry| entry.width_cols else utf8.getWidthAt(bytes, 0, tab_width, .hidden, target.width_method);
+            const width = if (cluster) |entry| entry.width_cols else utf8.getWidthAt(bytes, 0, tab_width, .hidden, self.target.width_method);
             if (width == 0) continue;
             const glyph_x = self.x + @as(i64, @intCast(self.advance_cells));
             self.advance_cells += width;
-            const blank = !isPrintableGlyph(bytes, width);
-            // A glyph that starts left of column 0 is clipped, even a wide glyph that reaches column 0.
-            if (!blank and glyph_x < 0) continue;
-            const first: u32 = @intCast(@max(glyph_x, 0));
-            const end = @min(glyph_x + width, target.width);
-            const count: u32 = if (!blank) 1 else if (end > first) @intCast(end - first) else 0;
-            if (!self.isVisible(first, if (blank) count else width, blank)) continue;
-            return .{ .bytes = bytes, .x = first, .width = width, .blank = blank, .count = count };
+            return .{ .bytes = bytes, .x = glyph_x, .width = width };
         }
         return null;
     }
 
-    /// Blank cells need one cell in the scissor; a glyph needs all of its cells in the target and scissor.
+    /// Blank cells need one cell in the scissor; a glyph needs all of its cells left of end and in the scissor.
     fn isVisible(self: *const TextRow, first: u32, cells: u32, blank: bool) bool {
-        if (cells > self.target.width - first) return false;
+        if (@as(i64, first) + cells > self.end) return false;
         for (0..cells) |offset| {
             const inside = self.target.isPointInScissor(@intCast(first + offset), self.y);
             if (blank and inside) return true;
@@ -1826,6 +1860,21 @@ pub const OptimizedBuffer = struct {
         bg: ?RGBA,
         attributes: u32,
     ) error{ InvalidUnicode, InvalidOptions, TextLimit, UnsupportedResource, OutOfMemory, TrackerLimit }!void {
+        return self.drawTextFitted(text, x, y, fg, bg, attributes, .{});
+    }
+
+    /// drawTextChecked within fit.max_width cells from x (see TextFit).
+    pub fn drawTextFitted(
+        self: *OptimizedBuffer,
+        text: []const u8,
+        x: i32,
+        y: i32,
+        fg: RGBA,
+        bg: ?RGBA,
+        attributes: u32,
+        fit: TextFit,
+    ) error{ InvalidUnicode, InvalidOptions, TextLimit, UnsupportedResource, OutOfMemory, TrackerLimit }!void {
+        assert(!fit.ellipsis or fit.max_width > 0);
         if (text.len > text_bytes_max) return error.TextLimit;
         try self.checkImageResources();
         if (attributes & ~ansi.TextAttributes.ATTRIBUTE_BASE_MASK != 0) return error.InvalidOptions;
@@ -1837,27 +1886,45 @@ pub const OptimizedBuffer = struct {
         try self.checkDrawState();
         const opacity = self.getCurrentOpacity();
         if (self.skipTransparentCellDraw(opacity, isFullyTransparent(opacity, fg, bg orelse ansi.rgbColor(0, 0, 0, 0)))) return;
-        if (utf8.isAsciiOnly(text)) {
+        // i64 holds any i32 position plus any u32 width.
+        const end: i64 = if (fit.max_width == 0) self.width else @min(self.width, @as(i64, x) + fit.max_width);
+        const ascii = utf8.isAsciiOnly(text);
+        if (ascii and !(fit.ellipsis and text.len > fit.max_width)) {
             // Printable ASCII is one cell per byte and takes no pool or tracker capacity, so it
             // skips the copy and the prepared runs. The bytes left of column 0 are clipped.
             const clipped_byte_count: usize = if (x < 0) @min(text.len, @abs(x)) else 0;
-            var column: u32 = @intCast(@max(x, 0));
+            var column: u32 = @intCast(nonNegative(x));
             for (text[clipped_byte_count..]) |byte| {
-                if (column >= self.width) break;
+                if (column >= end) break;
                 self.setTextCell(column, row, makeCell(byte, fg, bg orelse self.get(column, row).?.bg, attributes));
                 column += 1;
             }
             return;
         }
 
-        var scratch = std.heap.stackFallback(4096, self.allocator);
-        const scratch_allocator = scratch.get();
-        // Pool growth can move input borrowed from this same pool.
-        const input = try scratch_allocator.dupe(u8, text);
-        defer scratch_allocator.free(input);
+        var scratch_buffer: [4096]u8 = undefined;
+        var scratch: std.heap.BufferFirstAllocator = .init(&scratch_buffer, self.allocator);
+        const scratch_allocator = scratch.allocator();
+        // Pool growth can move input borrowed from this same pool. The spare bytes hold an ellipsis.
+        const storage = try scratch_allocator.alloc(u8, text.len + ellipsis_bytes.len);
+        defer scratch_allocator.free(storage);
+        @memcpy(storage[0..text.len], text);
+        var input = storage[0..text.len];
         var clusters: std.ArrayListUnmanaged(utf8.RenderClusterInfo) = .empty;
         defer clusters.deinit(scratch_allocator);
-        try utf8.findRenderClusterInfo(scratch_allocator, input, TextRow.tab_width, .hidden, utf8.isAsciiOnly(input), self.width_method, &clusters);
+        try utf8.findRenderClusterInfo(scratch_allocator, input, TextRow.tab_width, .hidden, ascii, self.width_method, &clusters);
+        if (fit.ellipsis) {
+            var measure: TextRow = .{ .target = self, .text = input, .clusters = clusters.items, .x = x, .y = y, .end = std.math.maxInt(i64) };
+            const room = fit.max_width -| utf8.getWidthAt(ellipsis_bytes, 0, TextRow.tab_width, .hidden, self.width_method);
+            if (measure.fitBytes(room, fit.max_width)) |kept| {
+                // TextRow measures the ellipsis itself: metadata for the cut bytes no longer applies.
+                var count: usize = 0;
+                while (count < clusters.items.len and clusters.items[count].byte_start < kept) count += 1;
+                clusters.shrinkRetainingCapacity(count);
+                @memcpy(storage[kept..][0..ellipsis_bytes.len], ellipsis_bytes);
+                input = storage[0 .. kept + ellipsis_bytes.len];
+            }
+        }
 
         const PreparedRun = struct { x: u32, char: u32, count: u32 };
         var runs: std.ArrayListUnmanaged(PreparedRun) = .empty;
@@ -1868,7 +1935,7 @@ pub const OptimizedBuffer = struct {
             runs.deinit(scratch_allocator);
         }
         var grapheme_count: u32 = 0;
-        var layout: TextRow = .{ .target = self, .text = input, .clusters = clusters.items, .x = x, .y = y };
+        var layout: TextRow = .{ .target = self, .text = input, .clusters = clusters.items, .x = x, .y = y, .end = end };
         while (layout.next()) |glyph| {
             try runs.ensureUnusedCapacity(scratch_allocator, 1);
             const encoded: u32 = if (glyph.blank) DEFAULT_SPACE_CHAR else if (glyph.bytes.len == 1) glyph.bytes[0] else encoded: {
@@ -2005,7 +2072,7 @@ pub const OptimizedBuffer = struct {
         defer clusters.deinit(self.allocator);
         try utf8.findRenderClusterInfo(self.allocator, text, TextRow.tab_width, .hidden, is_ascii_only, self.width_method, &clusters);
 
-        var layout: TextRow = .{ .target = self, .text = text, .clusters = clusters.items, .x = x, .y = @intCast(y) };
+        var layout: TextRow = .{ .target = self, .text = text, .clusters = clusters.items, .x = x, .y = @intCast(y), .end = self.width };
         while (layout.next()) |glyph| {
             const background = bg orelse self.get(glyph.x, y).?.bg;
             var retained_id: ?u32 = null;
@@ -2048,8 +2115,8 @@ pub const OptimizedBuffer = struct {
         const clampedSrcWidth = @min(srcWidth, frameBuffer.width - srcX);
         const clampedSrcHeight = @min(srcHeight, frameBuffer.height - srcY);
 
-        const startDestX = @max(0, destX);
-        const startDestY = @max(0, destY);
+        const startDestX = nonNegative(destX);
+        const startDestY = nonNegative(destY);
         const endDestX = @min(@as(i32, @intCast(self.width)) - 1, destX + @as(i32, @intCast(clampedSrcWidth)) - 1);
         const endDestY = @min(@as(i32, @intCast(self.height)) - 1, destY + @as(i32, @intCast(clampedSrcHeight)) - 1);
 
@@ -2892,8 +2959,8 @@ pub const OptimizedBuffer = struct {
         if (self.skipTransparentCellDraw(opacity, isFullyTransparent(opacity, borderFg, borderBg))) return;
         const transparent_fast = opacity == 1.0 and ansi.alpha(borderBg) == 0 and gridBorderCharsSingleWidth(borderChars);
 
-        const hChar = borderChars[@intFromEnum(BorderCharIndex.horizontal)];
-        const vChar = borderChars[@intFromEnum(BorderCharIndex.vertical)];
+        const hChar = borderChars[@backingInt(BorderCharIndex.horizontal)];
+        const vChar = borderChars[@backingInt(BorderCharIndex.vertical)];
         const bufWidth = self.width;
         const bufHeight = self.height;
         const bufWidthI32 = @as(i32, @intCast(bufWidth));
@@ -2978,7 +3045,7 @@ pub const OptimizedBuffer = struct {
     }
 
     fn gridBorderCharsSingleWidth(borderChars: [*]const u32) bool {
-        for (0..@typeInfo(BorderCharIndex).@"enum".fields.len) |index| {
+        for (0..@typeInfo(BorderCharIndex).@"enum".field_names.len) |index| {
             const char = borderChars[index];
             if (char == 0 or !isSingleWidthBorderChar(char)) return false;
         }
@@ -2997,22 +3064,22 @@ pub const OptimizedBuffer = struct {
     }
 
     fn tableBorderIntersectionByConnections(borderChars: [*]const u32, hasUp: bool, hasDown: bool, hasLeft: bool, hasRight: bool) u32 {
-        if (hasUp and hasDown and hasLeft and hasRight) return borderChars[@intFromEnum(BorderCharIndex.cross)];
+        if (hasUp and hasDown and hasLeft and hasRight) return borderChars[@backingInt(BorderCharIndex.cross)];
 
-        if (!hasUp and hasDown and !hasLeft and hasRight) return borderChars[@intFromEnum(BorderCharIndex.topLeft)];
-        if (!hasUp and hasDown and hasLeft and !hasRight) return borderChars[@intFromEnum(BorderCharIndex.topRight)];
-        if (hasUp and !hasDown and !hasLeft and hasRight) return borderChars[@intFromEnum(BorderCharIndex.bottomLeft)];
-        if (hasUp and !hasDown and hasLeft and !hasRight) return borderChars[@intFromEnum(BorderCharIndex.bottomRight)];
+        if (!hasUp and hasDown and !hasLeft and hasRight) return borderChars[@backingInt(BorderCharIndex.topLeft)];
+        if (!hasUp and hasDown and hasLeft and !hasRight) return borderChars[@backingInt(BorderCharIndex.topRight)];
+        if (hasUp and !hasDown and !hasLeft and hasRight) return borderChars[@backingInt(BorderCharIndex.bottomLeft)];
+        if (hasUp and !hasDown and hasLeft and !hasRight) return borderChars[@backingInt(BorderCharIndex.bottomRight)];
 
-        if (hasUp and hasDown and !hasLeft and hasRight) return borderChars[@intFromEnum(BorderCharIndex.leftT)];
-        if (hasUp and hasDown and hasLeft and !hasRight) return borderChars[@intFromEnum(BorderCharIndex.rightT)];
-        if (!hasUp and hasDown and hasLeft and hasRight) return borderChars[@intFromEnum(BorderCharIndex.topT)];
-        if (hasUp and !hasDown and hasLeft and hasRight) return borderChars[@intFromEnum(BorderCharIndex.bottomT)];
+        if (hasUp and hasDown and !hasLeft and hasRight) return borderChars[@backingInt(BorderCharIndex.leftT)];
+        if (hasUp and hasDown and hasLeft and !hasRight) return borderChars[@backingInt(BorderCharIndex.rightT)];
+        if (!hasUp and hasDown and hasLeft and hasRight) return borderChars[@backingInt(BorderCharIndex.topT)];
+        if (hasUp and !hasDown and hasLeft and hasRight) return borderChars[@backingInt(BorderCharIndex.bottomT)];
 
-        if ((hasLeft or hasRight) and !hasUp and !hasDown) return borderChars[@intFromEnum(BorderCharIndex.horizontal)];
-        if ((hasUp or hasDown) and !hasLeft and !hasRight) return borderChars[@intFromEnum(BorderCharIndex.vertical)];
+        if ((hasLeft or hasRight) and !hasUp and !hasDown) return borderChars[@backingInt(BorderCharIndex.horizontal)];
+        if ((hasUp or hasDown) and !hasLeft and !hasRight) return borderChars[@backingInt(BorderCharIndex.vertical)];
 
-        return borderChars[@intFromEnum(BorderCharIndex.cross)];
+        return borderChars[@backingInt(BorderCharIndex.cross)];
     }
 
     inline fn isSingleWidthBorderChar(char: u32) bool {
@@ -3057,12 +3124,12 @@ pub const OptimizedBuffer = struct {
             self.isPointInScissor(x + @as(i32, @intCast(width)) - 1, y + @as(i32, @intCast(height)) - 1) and
             !self.grapheme_tracker.hasAny() and
             !self.link_tracker.hasAny() and
-            isSingleWidthBorderChar(borderChars[@intFromEnum(BorderCharIndex.topLeft)]) and
-            isSingleWidthBorderChar(borderChars[@intFromEnum(BorderCharIndex.topRight)]) and
-            isSingleWidthBorderChar(borderChars[@intFromEnum(BorderCharIndex.bottomLeft)]) and
-            isSingleWidthBorderChar(borderChars[@intFromEnum(BorderCharIndex.bottomRight)]) and
-            isSingleWidthBorderChar(borderChars[@intFromEnum(BorderCharIndex.horizontal)]) and
-            isSingleWidthBorderChar(borderChars[@intFromEnum(BorderCharIndex.vertical)]) and
+            isSingleWidthBorderChar(borderChars[@backingInt(BorderCharIndex.topLeft)]) and
+            isSingleWidthBorderChar(borderChars[@backingInt(BorderCharIndex.topRight)]) and
+            isSingleWidthBorderChar(borderChars[@backingInt(BorderCharIndex.bottomLeft)]) and
+            isSingleWidthBorderChar(borderChars[@backingInt(BorderCharIndex.bottomRight)]) and
+            isSingleWidthBorderChar(borderChars[@backingInt(BorderCharIndex.horizontal)]) and
+            isSingleWidthBorderChar(borderChars[@backingInt(BorderCharIndex.vertical)]) and
             (self.image_placements.items.len == 0 or !self.rectOverlapsImagePlacement(x, y, width, height));
     }
 
@@ -3243,13 +3310,13 @@ pub const OptimizedBuffer = struct {
                             continue;
                         }
 
-                        var char = borderChars[@intFromEnum(BorderCharIndex.horizontal)];
+                        var char = borderChars[@backingInt(BorderCharIndex.horizontal)];
 
                         // Handle corners
                         if (drawX == startX and isAtActualLeft) {
-                            char = if (borderSides.left) borderChars[@intFromEnum(BorderCharIndex.topLeft)] else borderChars[@intFromEnum(BorderCharIndex.horizontal)];
+                            char = if (borderSides.left) borderChars[@backingInt(BorderCharIndex.topLeft)] else borderChars[@backingInt(BorderCharIndex.horizontal)];
                         } else if (drawX == endX and isAtActualRight) {
-                            char = if (borderSides.right) borderChars[@intFromEnum(BorderCharIndex.topRight)] else borderChars[@intFromEnum(BorderCharIndex.horizontal)];
+                            char = if (borderSides.right) borderChars[@backingInt(BorderCharIndex.topRight)] else borderChars[@backingInt(BorderCharIndex.horizontal)];
                         }
 
                         if (useTransparentBorderFastPath) {
@@ -3276,13 +3343,13 @@ pub const OptimizedBuffer = struct {
                             continue;
                         }
 
-                        var char = borderChars[@intFromEnum(BorderCharIndex.horizontal)];
+                        var char = borderChars[@backingInt(BorderCharIndex.horizontal)];
 
                         // Handle corners
                         if (drawX == startX and isAtActualLeft) {
-                            char = if (borderSides.left) borderChars[@intFromEnum(BorderCharIndex.bottomLeft)] else borderChars[@intFromEnum(BorderCharIndex.horizontal)];
+                            char = if (borderSides.left) borderChars[@backingInt(BorderCharIndex.bottomLeft)] else borderChars[@backingInt(BorderCharIndex.horizontal)];
                         } else if (drawX == endX and isAtActualRight) {
-                            char = if (borderSides.right) borderChars[@intFromEnum(BorderCharIndex.bottomRight)] else borderChars[@intFromEnum(BorderCharIndex.horizontal)];
+                            char = if (borderSides.right) borderChars[@backingInt(BorderCharIndex.bottomRight)] else borderChars[@backingInt(BorderCharIndex.horizontal)];
                         }
 
                         if (useTransparentBorderFastPath) {
@@ -3311,15 +3378,15 @@ pub const OptimizedBuffer = struct {
                 // Left border
                 if (borderSides.left and isAtActualLeft and startX >= 0 and startX < @as(i32, @intCast(self.width))) {
                     if (useTransparentBorderFastPath) {
-                        self.setTransparentBorderCell(@intCast(startX), @intCast(drawY), borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor);
+                        self.setTransparentBorderCell(@intCast(startX), @intCast(drawY), borderChars[@backingInt(BorderCharIndex.vertical)], borderColor);
                     } else if (useOpaqueBorderFastPath) {
                         self.set(
                             @intCast(startX),
                             @intCast(drawY),
-                            makeCell(borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor, backgroundColor, 0),
+                            makeCell(borderChars[@backingInt(BorderCharIndex.vertical)], borderColor, backgroundColor, 0),
                         );
                     } else {
-                        const cell = makeCell(borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor, backgroundColor, 0);
+                        const cell = makeCell(borderChars[@backingInt(BorderCharIndex.vertical)], borderColor, backgroundColor, 0);
                         if (image_aware)
                             self.setCellWithAlphaBlendingCell(@intCast(startX), @intCast(drawY), cell)
                         else
@@ -3330,15 +3397,15 @@ pub const OptimizedBuffer = struct {
                 // Right border
                 if (borderSides.right and isAtActualRight and endX >= 0 and endX < @as(i32, @intCast(self.width))) {
                     if (useTransparentBorderFastPath) {
-                        self.setTransparentBorderCell(@intCast(endX), @intCast(drawY), borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor);
+                        self.setTransparentBorderCell(@intCast(endX), @intCast(drawY), borderChars[@backingInt(BorderCharIndex.vertical)], borderColor);
                     } else if (useOpaqueBorderFastPath) {
                         self.set(
                             @intCast(endX),
                             @intCast(drawY),
-                            makeCell(borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor, backgroundColor, 0),
+                            makeCell(borderChars[@backingInt(BorderCharIndex.vertical)], borderColor, backgroundColor, 0),
                         );
                     } else {
-                        const cell = makeCell(borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor, backgroundColor, 0);
+                        const cell = makeCell(borderChars[@backingInt(BorderCharIndex.vertical)], borderColor, backgroundColor, 0);
                         if (image_aware)
                             self.setCellWithAlphaBlendingCell(@intCast(endX), @intCast(drawY), cell)
                         else
@@ -3445,10 +3512,10 @@ pub const OptimizedBuffer = struct {
         }
         if (clip_x0 >= clip_x1 or clip_y0 >= clip_y1) return false;
 
-        const left: u32 = @intCast(clip_x0 - @as(i64, pos_x));
-        const top: u32 = @intCast(clip_y0 - @as(i64, pos_y));
-        const right: u32 = @intCast(clip_x1 - @as(i64, pos_x));
-        const bottom: u32 = @intCast(clip_y1 - @as(i64, pos_y));
+        const left = unsigned(u32, clip_x0 - @as(i64, pos_x));
+        const top = unsigned(u32, clip_y0 - @as(i64, pos_y));
+        const right = unsigned(u32, clip_x1 - @as(i64, pos_x));
+        const bottom = unsigned(u32, clip_y1 - @as(i64, pos_y));
         const clipped_source_x = source_x + @as(u32, @intCast((@as(u64, left) * source_width) / width));
         const clipped_source_y = source_y + @as(u32, @intCast((@as(u64, top) * source_height) / height));
         const source_end_x = source_x + @as(u32, @intCast((@as(u64, right) * source_width + width - 1) / width));
@@ -3623,8 +3690,8 @@ pub const OptimizedBuffer = struct {
         // Each cell samples 2x2 source pixels. Draw only the source cells inside the buffer.
         const source_cells_x: i64 = (sourceWidth + 1) / 2;
         const source_cells_y: i64 = @intCast((pixels.len / alignedBytesPerRow + 1) / 2);
-        const start_x: u32 = @intCast(@max(0, posX));
-        const start_y: u32 = @intCast(@max(0, posY));
+        const start_x: u32 = @intCast(nonNegative(posX));
+        const start_y: u32 = @intCast(nonNegative(posY));
         const end_x = @min(@as(i64, self.width), @as(i64, posX) + source_cells_x);
         const end_y = @min(@as(i64, self.height), @as(i64, posY) + source_cells_y);
 
@@ -3694,8 +3761,8 @@ pub const OptimizedBuffer = struct {
         // Skip the source cells left of or above the buffer.
         const skip_x: u32 = @intCast(@min(terminalWidthCells, @max(0, -@as(i64, posX))));
         const skip_y: u32 = @intCast(@min(terminalHeightCells, @max(0, -@as(i64, posY))));
-        const start_x: u32 = @intCast(@max(0, posX));
-        const start_y: u32 = @intCast(@max(0, posY));
+        const start_x: u32 = @intCast(nonNegative(posX));
+        const start_y: u32 = @intCast(nonNegative(posY));
         if (start_x >= self.width or start_y >= self.height) return;
         const width = @min(terminalWidthCells - skip_x, self.width - start_x);
         const height = @min(terminalHeightCells - skip_y, self.height - start_y);
@@ -3778,8 +3845,8 @@ pub const OptimizedBuffer = struct {
         if (termWidth == 0 or termHeight == 0) return;
         if (posX >= @as(i32, @intCast(self.width)) or posY >= @as(i32, @intCast(self.height))) return;
 
-        const startX: u32 = if (posX < 0) @intCast(-@as(i64, posX)) else 0;
-        const startY: u32 = if (posY < 0) @intCast(-@as(i64, posY)) else 0;
+        const startX: u32 = if (posX < 0) @abs(posX) else 0;
+        const startY: u32 = if (posY < 0) @abs(posY) else 0;
 
         const destStartX: u32 = if (posX < 0) 0 else @intCast(posX);
         const destStartY: u32 = if (posY < 0) 0 else @intCast(posY);

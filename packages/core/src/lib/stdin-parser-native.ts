@@ -57,7 +57,7 @@ const FIELD = {
 }
 const C = nativeConstants
 const EMPTY = new Uint8Array(0)
-const UTF8 = new TextDecoder()
+const UTF8 = new TextDecoder("utf-8", { ignoreBOM: true })
 const MOUSE_TYPES: Record<number, MouseEventType> = {
   [C.OT_INPUT_MOUSE_DOWN]: "down",
   [C.OT_INPUT_MOUSE_UP]: "up",
@@ -446,7 +446,7 @@ function parsedKey(
   let name: string
   if (code === 0) {
     name = text
-  } else if (kittyKeyMap[code] !== undefined) {
+  } else if (kittyKeyMap[code] !== undefined && !(flags & C.OT_INPUT_KEY_TYPED)) {
     // Core distinguishes a raw line feed from Enter.
     name = code === C.OT_INPUT_KEY_ENTER && !kitty && raw.endsWith("\n") ? "linefeed" : kittyKeyMap[code]!
   } else if (code === 0x20) {

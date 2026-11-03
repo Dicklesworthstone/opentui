@@ -93,10 +93,10 @@ pub const Logger = union(enum) {
                 var buf: [Diagnostic.message_bytes_max]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, format, args) catch {
                     const fallback = "Log formatting failed";
-                    callback(@intFromEnum(LogLevel.err), fallback.ptr, fallback.len);
+                    callback(@backingInt(LogLevel.err), fallback.ptr, fallback.len);
                     return;
                 };
-                callback(@intFromEnum(level), msg.ptr, @intCast(msg.len));
+                callback(@backingInt(level), msg.ptr, @intCast(msg.len));
             },
         }
     }
@@ -125,6 +125,11 @@ var process_thread: std.atomic.Value(std.Thread.Id) = .init(0);
 
 pub fn processLogger() *const Logger {
     return &process_logger;
+}
+
+/// Whether a process log line from this thread reaches a callback now.
+pub fn processLogReady() bool {
+    return process_callback.load(.acquire) != null and process_thread.load(.monotonic) == std.Thread.getCurrentId();
 }
 
 pub fn setLogCallback(callback: ?LogCallback) void {

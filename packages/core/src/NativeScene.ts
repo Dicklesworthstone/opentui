@@ -1,7 +1,7 @@
 import type { NativeSession } from "./NativeSession.js"
 import type { Renderable, RenderableOptions } from "./Renderable.js"
 import type { ImageFit } from "./renderables/Image.js"
-import type { NativeImage } from "./image.js"
+import type { ExtractOptions, NativeImage } from "./image.js"
 import { OptimizedBuffer } from "./buffer.js"
 import type { ImageRenderProtocol } from "./types.js"
 import { RendererControlState, type CliRenderer } from "./renderer.js"
@@ -34,6 +34,8 @@ import {
   type ContextEditorViewHandle,
   type ContextTextBufferViewHandle,
   type SceneNodeHandle,
+  type NativeContextHandle,
+  type RenderLib,
   type SessionHandle,
 } from "./zig.js"
 
@@ -451,6 +453,23 @@ export class NativeScene {
       protocol,
       buffer?._getSceneHandle(this) ?? null,
     )
+  }
+
+  setVideo(renderable: Renderable, fit: ImageFit, buffer: OptimizedBuffer | null): void {
+    this.flushStaged()
+    const { renderLib: lib, context } = this.driver
+    lib.sceneSetVideo(context, renderable._getSceneHandle(this), fit, buffer?._getSceneHandle(this) ?? null)
+  }
+
+  setCrop(renderable: Renderable, crop: ExtractOptions | undefined): void {
+    this.flushStaged()
+    this.driver.renderLib.sceneSetCrop(this.driver.context, renderable._getSceneHandle(this), crop)
+  }
+
+  /** @internal Video control and state calls address the node after staged writes. */
+  videoNode(renderable: Renderable): { lib: RenderLib; context: NativeContextHandle; node: SceneNodeHandle } {
+    this.flushStaged()
+    return { lib: this.driver.renderLib, context: this.driver.context, node: renderable._getSceneHandle(this) }
   }
 
   /** @internal A scroll write moves the box's children, so it bumps the layout revision like a frame step. */

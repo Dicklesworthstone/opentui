@@ -385,9 +385,9 @@ pub const Engine = struct {
             .selected_capture_index = null,
             .selected_capture_device_id = undefined,
             .has_selected_capture_device = false,
-            .voices = [_]Voice{.{}} ** max_voices,
-            .streams = [_]?*Stream{null} ** max_voices,
-            .stream_generations = [_]u32{1} ** max_voices,
+            .voices = @splat(.{}),
+            .streams = @splat(null),
+            .stream_generations = @splat(1),
             .master_volume = 1,
             .sample_rate = normalized_sample_rate,
             .stats = .{
@@ -1685,6 +1685,14 @@ pub fn startMixer(engine: *Engine) i32 {
     engine.started = true;
     engine.lock.unlock(io);
     return Status.ok;
+}
+
+/// Silences the mixer without releasing the device; startMixer resumes. Streams keep their
+/// buffered audio because a stopped mixer does not read them.
+pub fn suspendMixer(engine: *Engine) void {
+    engine.lock.lockUncancelable(io);
+    engine.started = false;
+    engine.lock.unlock(io);
 }
 
 pub fn stop(engine: *Engine) i32 {

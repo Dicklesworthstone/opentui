@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const atomic = std.atomic;
 const assert = std.debug.assert;
 const ansi = @import("ansi.zig");
+const base64Encode = @import("utils.zig").base64Encode;
 const utf8 = @import("utf8.zig");
 
 const WidthMethod = utf8.WidthMethod;
@@ -51,6 +52,15 @@ pub const RemoteMode = enum(u8) {
     auto,
     local,
     remote,
+};
+
+/// Wraps frames in DEC mode 2026 (synchronized output). Once the startup replies have passed the
+/// 2026 query, `auto` leaves it out for a remote endpoint that did not report the mode or whose app
+/// runs inside tmux, screen or Zellij on its own host.
+pub const SynchronizedOutput = enum(u8) {
+    auto,
+    always,
+    never,
 };
 
 pub const ImageProtocol = enum(u8) {
@@ -194,9 +204,9 @@ pub const Options = struct {
 };
 
 pub const TerminalInfo = struct {
-    name: [64]u8 = [_]u8{0} ** 64,
+    name: [64]u8 = @splat(0),
     name_len: usize = 0,
-    version: [32]u8 = [_]u8{0} ** 32,
+    version: [32]u8 = @splat(0),
     version_len: usize = 0,
     from_xtversion: bool = false,
 };
@@ -219,6 +229,12 @@ startup_cursor_query_captured: bool = false,
 explicit_width_probe_reports_pending: u8 = 0,
 /// The host ends each query batch with DA1 and waits for its reply (sentinel mode).
 reply_sentinel: bool = false,
+synchronized_output: SynchronizedOutput = .auto,
+/// A reply ordered after the DECRQM 2026 query arrived, so `caps.sync` is final.
+sync_reply_settled: bool = false,
+/// The host says a multiplexer runs between the app and the link. Never derived from forwarded or
+/// client environment, which can describe the other side of the link.
+multiplexer_on_host: bool = false,
 unicode_wide_locked: ?bool = null,
 host_env_hyperlinks: bool = false,
 hyperlinks_override: ?bool = null,
@@ -1345,6 +1361,8 @@ pub fn processCapabilityResponse(self: *Terminal, response: []const u8) void {
         } else if (self.explicit_width_probe_reports_pending > 0) {
             const probe_index = 2 - self.explicit_width_probe_reports_pending;
             self.explicit_width_probe_reports_pending -= 1;
+            // Terminals answer in order, and the probes follow the capability queries.
+            self.sync_reply_settled = true;
 
             if (row == 1 and probe_index == 0 and col == 2) {
                 self.caps.explicit_width = true;
@@ -1356,6 +1374,8 @@ pub fn processCapabilityResponse(self: *Terminal, response: []const u8) void {
 
         scan_pos = pos + 1;
     }
+    // Every DA1 query follows the 2026 query, so its reply settles the synchronized-output decision.
+    if (device_attributes) self.sync_reply_settled = true;
     // The sentinel's reply follows every startup cursor report, so none is still coming.
     if (device_attributes and self.reply_sentinel) {
         self.startup_cursor_query_pending = false;
@@ -1503,6 +1523,16 @@ fn isHyperlinkHostEnv(env_map: *const std.process.Environ.Map) bool {
     return false;
 }
 
+pub fn synchronizedOutput(self: *const Terminal) bool {
+    return switch (self.synchronized_output) {
+        .always => true,
+        .never => false,
+        // A multiplexer on the app's host answers DECRQM 2026 from its own state and redraws every touched
+        // line when an update ends; between the app and a slow link that redraw costs more than partial frames.
+        .auto => !self.remote or !self.sync_reply_settled or (self.caps.sync and !self.multiplexer_on_host),
+    };
+}
+
 pub fn getCapabilities(self: *Terminal) Capabilities {
     return self.caps;
 }
@@ -1600,7 +1630,7 @@ fn writeOsc99Payload(allocator: std.mem.Allocator, writer: anytype, id: []const 
     const encoded_len = std.base64.standard.Encoder.calcSize(payload.len);
     const encoded_buf = try allocator.alloc(u8, encoded_len);
     defer allocator.free(encoded_buf);
-    const encoded = std.base64.standard.Encoder.encode(encoded_buf, payload);
+    const encoded = base64Encode(encoded_buf, payload);
 
     try writer.print("\x1b]99;i={s}:p={s}:e=1:d={d};", .{ id, payload_type, @intFromBool(done) });
     try writer.writeAll(encoded);
@@ -1763,7 +1793,7 @@ fn writeClipboardBase64(writer: anytype, source: []const u8) !void {
     while (offset < source.len) {
         const chunk_len = @min(source.len - offset, source_chunk_size);
         const chunk = source[offset .. offset + chunk_len];
-        const encoded = std.base64.standard.Encoder.encode(&encoded_buffer, chunk);
+        const encoded = base64Encode(&encoded_buffer, chunk);
         try writer.writeAll(encoded);
         offset += chunk_len;
     }

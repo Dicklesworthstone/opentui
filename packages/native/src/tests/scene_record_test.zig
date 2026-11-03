@@ -5,6 +5,7 @@ const Fixture = @import("scene_fixture_test.zig").Fixture;
 const context = @import("../context.zig");
 const scene = @import("../scene.zig");
 const ansi = @import("../ansi.zig");
+const utils = @import("../utils.zig");
 const scene_record = @import("../scene-record.zig");
 const transport: @import("../session.zig").Options = .{ .chunk_size = 4096, .control_capacity = 4096 };
 
@@ -36,9 +37,16 @@ pub fn drawHeader(comptime T: type, operation: u32) c.ot_buffer_draw_header {
     return .{ .struct_size = @sizeOf(T), .abi_version = c.OT_CONTEXT_ABI_VERSION, .operation = operation, .flags = 0 };
 }
 
+/// White text; the black background applies with OT_BUFFER_DRAW_HAS_BACKGROUND.
+fn textRecord(x: i32, y: i32, max_width: u32, flags: u32) c.ot_buffer_draw_text_record {
+    var header = drawHeader(c.ot_buffer_draw_text_record, c.OT_BUFFER_DRAW_TEXT);
+    header.flags = flags;
+    return .{ .header = header, .x = x, .y = y, .attributes = 0, .foreground = .{ 255, 255, 255, 255 }, .background = .{ 0, 0, 0, 255 }, .max_width = max_width };
+}
+
 /// Builds an 8-byte aligned paint recording.
 pub const Recording = struct {
-    bytes: [2048]u8 align(8) = undefined,
+    bytes: [8192]u8 align(8) = undefined,
     len: usize = 0,
 
     pub fn slot(self: *Recording, index: u32, phase: u32) void {
@@ -46,14 +54,7 @@ pub const Recording = struct {
     }
 
     pub fn text(self: *Recording, value: []const u8, x: i32, y: i32) void {
-        self.draw(c.ot_buffer_draw_text_record{
-            .header = drawHeader(c.ot_buffer_draw_text_record, c.OT_BUFFER_DRAW_TEXT),
-            .x = x,
-            .y = y,
-            .attributes = 0,
-            .foreground = .{ 255, 255, 255, 255 },
-            .background = .{ 0, 0, 0, 0 },
-        }, null, value, "");
+        self.draw(textRecord(x, y, 0, 0), null, value, "");
     }
 
     pub fn fill(self: *Recording, x: i32, y: i32, width: u32, background: [4]u16) void {
@@ -465,7 +466,7 @@ const Resources = struct {
         // Never placed, so never prepared: corrupted coordinates must still draw nothing.
         const scene_box = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_BOX, 10);
         try f.owner.sceneSetPaint(scene_box, .{ .borderSides = c.OT_BORDER_ALL });
-        const pixels = [_]u8{ 200, 40, 0, 255 } ** 4;
+        const pixels = utils.repeat(u8, &.{ 200, 40, 0, 255 }, 4).*;
         return .{
             .text = text,
             .edit = edit,
@@ -502,7 +503,7 @@ fn appendCommand(recording: *Recording, command: Command, resources: Resources) 
             recording.append(c.ot_scene_record_packed{ .header = recordHeader(c.OT_SCENE_RECORD_PACKED), .x = 3, .y = 1, .width = 2, .height = 1, .byte_count = @sizeOf(@TypeOf(cells)), .reserved = 0 }, std.mem.sliceAsBytes(&cells));
         },
         .supersample => {
-            const pixels = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 } ** 2;
+            const pixels = utils.repeat(u8, &.{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 }, 2).*;
             recording.append(c.ot_scene_record_supersample{ .header = recordHeader(c.OT_SCENE_RECORD_SUPERSAMPLE), .x = 6, .y = 2, .format = 1, .stride = 16, .byte_count = pixels.len, .reserved = 0 }, &pixels);
         },
         .grayscale => recording.append(c.ot_scene_record_grayscale{ .header = recordHeader(c.OT_SCENE_RECORD_GRAYSCALE), .x = 1, .y = 3, .width = 3, .height = 1, .flags = c.OT_SCENE_RECORD_GRAYSCALE_FOREGROUND | c.OT_SCENE_RECORD_GRAYSCALE_BACKGROUND, .sample_count = 3, .foreground = white, .background = blue }, std.mem.sliceAsBytes(&[_]f32{ 0.2, 0.6, 1.0 })),
@@ -537,7 +538,7 @@ fn paintScene(f: Fixture) !context.Handle {
     try f.owner.sceneSetSlider(try placed(f, c.OT_SCENE_SLIDER, 4, 6, 1, 4), .{ .value = 40 });
     _ = try placed(f, c.OT_SCENE_ARROW, 5, 11, 0, 1);
     // A wide picture takes the fit path and the cropping cover path.
-    const pixels = [_]u8{ 200, 40, 0, 255, 0, 40, 200, 255 } ** 4;
+    const pixels = utils.repeat(u8, &.{ 200, 40, 0, 255, 0, 40, 200, 255 }, 4).*;
     const picture = try f.owner.createImagePixels(&pixels, 4, 2, .{ .stride = 16 });
     try f.owner.sceneSetImage(try placed(f, c.OT_SCENE_IMAGE, 6, 0, 3, 2), picture, .fit, .blocks, null);
     const backed = try placed(f, c.OT_SCENE_IMAGE, 7, 2, 3, 2);
@@ -699,6 +700,7 @@ test "Scene record fails corrupted recordings cleanly and keeps the Session pain
     valid.stack(c.OT_BUFFER_STACK_PUSH_SCISSOR, 1, 3, 1);
     valid.slot(1, c.OT_SCENE_RECORD_PHASE_AFTER);
     valid.text("ok", 5, 2);
+    valid.draw(textRecord(4, 3, 5, c.OT_BUFFER_DRAW_HAS_BACKGROUND | c.OT_BUFFER_DRAW_FIT_ELLIPSIS), null, "\u{8a2d}\u{5b9a}\u{3068}", "");
     try f.owner.sceneFrameCancel(f.id, (try submit(f, try f.step(null, options, c.OT_SCENE_FRAME_RECORD, null), &valid)).frame_id);
     for (0..512) |seed| {
         var prng = std.Random.DefaultPrng.init(seed);
@@ -722,6 +724,88 @@ test "Scene record fails corrupted recordings cleanly and keeps the Session pain
     }
 }
 
+// A fitted text draw writes no cell at or past x + max_width, never splits a glyph, and puts "…" right
+// after the kept glyphs only when it cut the text. Each row draws over x cells, so a blank cell shows
+// where a tab drew. Rows decode as ot_buffer_draw does and draw into an owned buffer, and play as a
+// recorded DRAW; both give the row.
+test "Scene record and direct text draws fit text to a cell width" {
+    const Row = struct { text: []const u8, x: i32 = 0, max_width: u32, ellipsis: bool = false, scissor: bool = false, legacy: bool = false, row: []const u8 };
+    const rows = [_]Row{
+        .{ .text = "abcdef", .max_width = 4, .row = "abcdxxxxxx" },
+        .{ .text = "abcde", .max_width = 4, .ellipsis = true, .row = "abc…xxxxxx" },
+        .{ .text = "abcd", .max_width = 4, .ellipsis = true, .row = "abcdxxxxxx" },
+        .{ .text = "設定とオプション", .max_width = 8, .row = "設定とオxx" },
+        .{ .text = "設定とオプション", .max_width = 8, .ellipsis = true, .row = "設定と…xxx" },
+        .{ .text = "設定", .max_width = 4, .ellipsis = true, .row = "設定xxxxxx" },
+        .{ .text = "abcdef😀xy", .max_width = 7, .row = "abcdefxxxx" },
+        .{ .text = "abcdef😀xy", .max_width = 8, .ellipsis = true, .row = "abcdef…xxx" },
+        // A ZWJ family and a combining mark stay whole.
+        .{ .text = "a👨‍👩‍👧b", .max_width = 3, .ellipsis = true, .row = "a…xxxxxxxx" },
+        .{ .text = "e\u{301}abc", .max_width = 3, .ellipsis = true, .row = "e\u{301}a…xxxxxxx" },
+        // A tab clips cell by cell at the limit; with an ellipsis it is not kept.
+        .{ .text = "ab\tc", .max_width = 3, .row = "ab xxxxxxx" },
+        .{ .text = "ab\tc", .max_width = 3, .ellipsis = true, .row = "ab…xxxxxxx" },
+        // Four bytes, five cells.
+        .{ .text = "ab\tc", .max_width = 4, .ellipsis = true, .row = "ab…xxxxxxx" },
+        .{ .text = "界a", .max_width = 1, .row = "xxxxxxxxxx" },
+        .{ .text = "界a", .max_width = 1, .ellipsis = true, .row = "…xxxxxxxxx" },
+        .{ .text = "界ab", .max_width = 2, .row = "界xxxxxxxx" },
+        .{ .text = "界ab", .max_width = 2, .ellipsis = true, .row = "…xxxxxxxxx" },
+        // Cells left of column 0 and right of the target count toward the limit.
+        .{ .text = "abcdef", .x = -2, .max_width = 5, .ellipsis = true, .row = "cd…xxxxxxx" },
+        .{ .text = "設定とオプション", .x = -1, .max_width = 5, .ellipsis = true, .row = "x定…xxxxxx" },
+        .{ .text = "abcdefghijkl", .x = 8, .max_width = 5, .ellipsis = true, .row = "xxxxxxxxab" },
+        .{ .text = "abcdef", .max_width = 5, .ellipsis = true, .scissor = true, .row = "xbcxxxxxxx" },
+        // No limit: max_width 0, or a record from before max_width.
+        .{ .text = "abcdefghijkl", .max_width = 0, .row = "abcdefghij" },
+        .{ .text = "abcdefghijkl", .max_width = 5, .legacy = true, .row = "abcdefghij" },
+    };
+    const width = 10;
+    const f = try Fixture.init(testing.allocator, width, rows.len, .{ .output = transport });
+    defer f.deinit();
+    try f.owner.sceneSetHooks(try placed(f, c.OT_SCENE_CUSTOM, 2, 0, 0, width), c.OT_SCENE_HOOK_RENDER_AFTER, 1, width, 1);
+    const direct = try f.owner.createBuffer(width, rows.len, .{});
+    const target = try f.owner.raw().getBuffer(direct);
+    var recording: Recording = .{};
+    recording.slot(0, c.OT_SCENE_RECORD_PHASE_AFTER);
+    for (rows, 0..) |row, index| {
+        const y: i32 = @intCast(index);
+        var record = textRecord(row.x, y, row.max_width, c.OT_BUFFER_DRAW_HAS_BACKGROUND | @as(u32, if (row.ellipsis) c.OT_BUFFER_DRAW_FIT_ELLIPSIS else 0));
+        if (row.legacy) record.header.struct_size = @offsetOf(c.ot_buffer_draw_text_record, "max_width");
+        recording.text(utils.repeat(u8, "x", width), 0, y);
+        try f.owner.drawBufferText(direct, utils.repeat(u8, "x", width), 0, y, .{ 255, 255, 255, 255 }, null, 0);
+        if (row.scissor) {
+            recording.append(c.ot_scene_record_stack{ .header = recordHeader(c.OT_SCENE_RECORD_STACK), .operation = c.OT_BUFFER_STACK_PUSH_SCISSOR, .x = 1, .y = y, .width = 2, .height = 1, .opacity = 1 }, &.{});
+            try target.pushScissorRect(1, y, 2, 1);
+        }
+        if (row.legacy) recording.draw(std.mem.asBytes(&record)[0..@offsetOf(c.ot_buffer_draw_text_record, "max_width")].*, null, row.text, "") else recording.draw(record, null, row.text, "");
+        var draw: context.BufferDraw = undefined;
+        try scene_record.bufferDrawFromC(&record.header, &draw);
+        try f.owner.drawBuffer(direct, null, &draw, row.text, "");
+        if (row.scissor) {
+            recording.stack(c.OT_BUFFER_STACK_POP_SCISSOR, 0, 0, 1);
+            target.popScissorRect();
+        }
+    }
+    const done = try submit(f, try f.step(null, options, c.OT_SCENE_FRAME_RECORD, null), &recording);
+    var text: [1024]u8 = undefined;
+    for ([_]*const @import("../buffer.zig").OptimizedBuffer{ target, f.cli.getNextBuffer() }) |cells| {
+        var lines = std.mem.splitScalar(u8, text[0..try cells.writeResolvedChars(&text, true)], '\n');
+        for (rows) |row| {
+            errdefer std.debug.print("row={any}\n", .{row});
+            try testing.expectEqualStrings(row.row, lines.next().?);
+        }
+    }
+    try f.owner.sceneFrameCancel(f.id, done.frame_id);
+    // Other sizes, other flags, and an ellipsis without a limit are rejected.
+    for ([_][2]u32{ .{ 40, 0 }, .{ 52, 0 }, .{ 48, 32 }, .{ 48, c.OT_BUFFER_DRAW_FIT_ELLIPSIS } }) |invalid| {
+        var record = textRecord(0, 0, 0, invalid[1]);
+        record.header.struct_size = invalid[0];
+        var draw: context.BufferDraw = undefined;
+        try testing.expectError(error.InvalidOptions, scene_record.bufferDrawFromC(&record.header, &draw));
+    }
+}
+
 test "Scene image paints a fill wider than its pixel range" {
     const f = try Fixture.init(testing.allocator, 4, 2, .{ .output = transport });
     defer f.deinit();
@@ -738,6 +822,42 @@ test "Scene image paints a fill wider than its pixel range" {
     }
     try testing.expect(cells[0] != ' ');
     try testing.expectEqual([3]u32{ cells[0], cells[0], cells[0] }, cells);
+}
+
+// fit and cover apply to the crop, and a crop outside the source shows the whole source.
+test "Scene image crop selects the source rectangle it fits" {
+    const f = try Fixture.init(testing.allocator, 4, 2, .{ .output = transport });
+    defer f.deinit();
+    // Cells are 10x20 pixels, so the 2x1 cell node is square.
+    f.cli.image_resolution = .{ .terminal_width = 4, .terminal_height = 2, .pixel_width = 40, .pixel_height = 40 };
+    const pixels = utils.repeat(u8, &.{ 200, 40, 0, 255 }, 32).*;
+    const picture = try placed(f, c.OT_SCENE_IMAGE, 2, 0, 0, 2);
+    const Region = @import("../image.zig").Region;
+    const Row = struct { fit: @import("../image.zig").Fit, crop: ?Region, cells: u32, source: [4]u32 };
+    for ([_]Row{
+        .{ .fit = .fill, .crop = null, .cells = 2, .source = .{ 0, 0, 8, 4 } },
+        .{ .fit = .fill, .crop = .{ .left = 0, .top = 0, .width = 8, .height = 4 }, .cells = 2, .source = .{ 0, 0, 8, 4 } },
+        .{ .fit = .fill, .crop = .{ .left = 2, .top = 1, .width = 3, .height = 2 }, .cells = 2, .source = .{ 2, 1, 3, 2 } },
+        .{ .fit = .fill, .crop = .{ .left = 7, .top = 3, .width = 1, .height = 1 }, .cells = 2, .source = .{ 7, 3, 1, 1 } },
+        .{ .fit = .fill, .crop = .{ .left = 6, .top = 0, .width = 3, .height = 1 }, .cells = 2, .source = .{ 0, 0, 8, 4 } },
+        .{ .fit = .fill, .crop = .{ .left = 0, .top = 4, .width = 1, .height = 1 }, .cells = 2, .source = .{ 0, 0, 8, 4 } },
+        // A tall region fits one cell, where the whole 2:1 source fits two.
+        .{ .fit = .fit, .crop = .{ .left = 0, .top = 0, .width = 2, .height = 4 }, .cells = 1, .source = .{ 0, 0, 2, 4 } },
+        .{ .fit = .fit, .crop = null, .cells = 2, .source = .{ 0, 0, 8, 4 } },
+        // cover keeps the square centre of the region.
+        .{ .fit = .cover, .crop = .{ .left = 0, .top = 0, .width = 8, .height = 2 }, .cells = 2, .source = .{ 3, 0, 2, 2 } },
+        .{ .fit = .cover, .crop = .{ .left = 1, .top = 0, .width = 2, .height = 4 }, .cells = 2, .source = .{ 1, 1, 2, 2 } },
+        .{ .fit = .cover, .crop = .{ .left = 1, .top = 1, .width = 5, .height = 3 }, .cells = 2, .source = .{ 2, 1, 3, 3 } },
+    }) |row| {
+        // Setting the image keeps the crop.
+        try f.owner.sceneSetCrop(picture, row.crop);
+        try f.owner.sceneSetImage(picture, try f.owner.createImagePixels(&pixels, 8, 4, .{ .stride = 32 }), row.fit, .blocks, null);
+        try @import("scene_fixture_test.zig").repaint(f.owner, f.id, options.background, true, 0);
+        const placement = f.cli.getNextBuffer().image_placements.items[0];
+        try testing.expectEqual(row.cells, placement.width);
+        try testing.expectEqual(row.source, [4]u32{ placement.source_x, placement.source_y, placement.source_width, placement.source_height });
+    }
+    try testing.expectError(error.WrongKind, f.owner.sceneSetCrop(f.root, null));
 }
 
 fn fingerprint(f: Fixture, recording: *const Recording, hooks: u32) !scene_record.Fingerprint {
@@ -784,7 +904,7 @@ test "Scene record fingerprints bound the rows each command kind writes" {
         .{ .command = .{ .draw = .grid }, .print = .{ .top = 1, .bottom = 4 } },
         .{ .command = .{ .draw = .stack }, .print = .{} },
     };
-    var seen: std.EnumSet(scene_record.Command) = .initEmpty();
+    var seen: std.EnumSet(scene_record.Command) = .empty;
     for (rows) |row| {
         var recording: Recording = .{};
         recording.slot(0, c.OT_SCENE_RECORD_PHASE_AFTER);
@@ -807,7 +927,7 @@ test "Scene record fingerprints bound the rows each command kind writes" {
         try testing.expectEqual(row.print, print);
     }
     // Each command type needs a row.
-    try testing.expect(seen.eql(.initFull()));
+    try testing.expect(seen.eql(.full));
 }
 
 const FrameWork = @import("../renderer.zig").FrameWork;
@@ -818,7 +938,7 @@ const Hooked = enum { same, text, outside, back, above, below, offscreen, offscr
 // lists stay kept (B5a) and an unchanged recording paints nothing. The table runs without VERIFY,
 // then with it: VERIFY must pass and change no count.
 test "Scene record frames keep unchanged recordings and damage the rows changed ones write" {
-    var results: [2][std.meta.fields(Hooked).len]FrameWork = undefined;
+    var results: [2][@typeInfo(Hooked).@"enum".field_names.len]FrameWork = undefined;
     for ([_]bool{ false, true }, &results) |verify, *counts| try hookedTable(verify, counts);
     try testing.expectEqualSlices(FrameWork, &results[0], &results[1]);
 }
@@ -910,7 +1030,7 @@ fn hookedTable(verify: bool, counts: []FrameWork) !void {
         .{ .change = .image, .damage = 6, .reasons = FrameWork.full_path_images },
         .{ .change = .image_gone, .damage = 6, .reasons = FrameWork.full_path_images | FrameWork.full_path_unretained },
     };
-    comptime std.debug.assert(rows.len == std.meta.fields(Hooked).len);
+    comptime std.debug.assert(rows.len == @typeInfo(Hooked).@"enum".field_names.len);
     for (rows, counts) |row, *count| {
         errdefer std.debug.print("row {s}, verify {}\n", .{ @tagName(row.change), verify });
         var recording: Recording = .{};
