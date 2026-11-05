@@ -1,7 +1,7 @@
 // Generated from packages/native/include/opentui.h and scripts/native-abi-pointers.ts.
 // Run `bun run generate:abi` in packages/core. Do not edit.
 // Inspect audit input: bun scripts/native-abi.ts --audit
-// ABI audit SHA-256: 1f1e8424bc1216febc37ed16ad59186b66b331cff98c6f8390c1262d97d68142
+// ABI audit SHA-256: ac81013a568db2e887cdcfbfe0efb8280e54c23b367fc08c6e52682ffe1e627c
 
 export const nativeSymbols = {
   ot_scene_set_hooks: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
@@ -70,6 +70,7 @@ export const nativeSymbols = {
   ot_embedded_terminal_get_selected_text: { args: ["ptr", "buffer", "ptr", "u32", "buffer"], returns: "i32" },
   ot_embedded_terminal_compose: { args: ["ptr", "buffer", "buffer", "ptr", "i32", "i32"], returns: "i32" },
   ot_embedded_terminal_cursor_get: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
+  ot_embedded_terminal_scrollbar_get: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
   ot_embedded_terminal_encode_key: {
     args: ["ptr", "buffer", "buffer", "ptr", "u32", "ptr", "u32", "ptr", "u32", "buffer"],
     returns: "i32",
@@ -845,6 +846,18 @@ export const nativeLayouts = {
       color_g: { offset: 44, size: 4, alignment: 4, type: "u32" },
       color_b: { offset: 48, size: 4, alignment: 4, type: "u32" },
       reserved: { offset: 52, size: 4, alignment: 4, type: "u32" },
+    },
+  },
+  ot_embedded_terminal_scrollbar: {
+    size: 24,
+    alignment: 4,
+    fields: {
+      struct_size: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      abi_version: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      offset: { offset: 8, size: 4, alignment: 4, type: "u32" },
+      total: { offset: 12, size: 4, alignment: 4, type: "u32" },
+      visible: { offset: 16, size: 4, alignment: 4, type: "u32" },
+      reserved: { offset: 20, size: 4, alignment: 4, type: "u32" },
     },
   },
   ot_embedded_terminal_key: {
@@ -2119,6 +2132,7 @@ export const nativeConstants = {
   OT_INPUT_MOD_NUM_LOCK: 128,
   OT_INPUT_KEY_KITTY: 1,
   OT_INPUT_KEY_TEXT_TRUNCATED: 2,
+  OT_INPUT_KEY_TYPED: 4,
   OT_INPUT_PASTE_START: 1,
   OT_INPUT_PASTE_END: 2,
   OT_INPUT_REPLY_FRAGMENT: 1,

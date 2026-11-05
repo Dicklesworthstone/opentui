@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const clipboard_clock = @import("clock.zig");
 const linux = @import("linux.zig");
 const protocol = @import("wayland-protocol.zig");
+const test_env = @import("../tests/test-env.zig");
 
 const WlArgument = linux.WlArgument;
 const WlInterface = linux.WlInterface;
@@ -148,6 +149,9 @@ pub const Connection = struct {
     primary_provider: ?*Provider = null,
     provider_cursor: u8 = 0,
     is_wsl: bool = false,
+    // WSLg keeps its socket here, and an XDG_RUNTIME_DIR that does not link it hides it
+    // from libwayland (anomalyco/opencode#57724, #58466).
+    wslg_runtime_dir: []const u8 = "/mnt/wslg/runtime-dir",
     flush_outcome_override: ?FlushOutcome = null,
     test_marshal_count: u8 = 0,
     test_flush_marshal_count: u8 = 0,
@@ -203,9 +207,12 @@ pub const Connection = struct {
         switch (self.phase) {
             .idle => self.start() catch |err| switch (err) {
                 error.ConnectFailed => {
+                    const display = linux.bounded(posix_io.getEnv("WAYLAND_DISPLAY") orelse "WAYLAND_SOCKET");
+                    linux.recordCause(.wayland, .wayland_connect, "cannot connect to Wayland display {s}", .{display});
                     self.phase = .unsupported;
                     return .unsupported;
                 },
+                error.WouldBlock => return .pending,
                 else => return self.fail(.protocol),
             },
             .unsupported => return .unsupported,
@@ -226,6 +233,7 @@ pub const Connection = struct {
         switch (self.phase) {
             .registry => {
                 if (self.ext_global == null and self.wlr_global == null and !self.coreDataDeviceAvailable()) {
+                    linux.recordCause(.wayland, .wayland_protocol, "the Wayland compositor has no data-control protocol and no usable core data device", .{});
                     self.phase = .unsupported;
                     return .unsupported;
                 }
@@ -380,7 +388,11 @@ pub const Connection = struct {
 
     pub fn publishText(self: *Connection, primary: bool, data: []u8) SelectionResult {
         self.failure = .none;
-        if (self.core_data_device) return .unsupported;
+        if (self.core_data_device) {
+            // WSLg reads through the core data device, which cannot own a selection.
+            linux.recordCause(.wayland, .wayland_protocol, "the Wayland compositor has no data-control protocol, which writes need", .{});
+            return .unsupported;
+        }
         if (primary and !self.primary_supported) return .unsupported;
         const manager = self.manager orelse return self.selectionFailure(.protocol);
         const device = self.device orelse return self.selectionFailure(.protocol);
@@ -534,16 +546,23 @@ pub const Connection = struct {
     }
 
     fn start(self: *Connection) !void {
+        linux.clearCause(.wayland);
         // libwayland adopts and unsets an inherited WAYLAND_SOCKET, so record it before connecting.
         var inherited_socket = posix_io.getEnv("WAYLAND_SOCKET") != null;
-        // libwayland refuses a relative name without an absolute XDG_RUNTIME_DIR and logs each
-        // refusal to stderr, which is the terminal; skip the attempt instead of repeating the line.
+        // Like libwayland, take an absolute name as is and a relative one inside an absolute XDG_RUNTIME_DIR.
         const runtime_dir = posix_io.getEnv("XDG_RUNTIME_DIR") orelse "";
         const name = posix_io.getEnv("WAYLAND_DISPLAY") orelse "";
-        const absolute = std.mem.startsWith(u8, runtime_dir, "/") or std.mem.startsWith(u8, name, "/");
-        const display = (if (inherited_socket or absolute) self.symbols.wl_display_connect(null) else null) orelse wslg: {
+        const display = (if (inherited_socket)
+            self.symbols.wl_display_connect(null)
+        else if (std.mem.startsWith(u8, name, "/"))
+            try self.connectPath("{s}", .{name})
+        else if (std.mem.startsWith(u8, runtime_dir, "/"))
+            try self.connectPath("{s}/{s}", .{ runtime_dir, name })
+        else
+            null) orelse wslg: {
             inherited_socket = false;
-            break :wslg self.connectWslg() orelse return error.ConnectFailed;
+            if (!self.is_wsl) return error.ConnectFailed;
+            break :wslg try self.connectPath("{s}/{s}", .{ self.wslg_runtime_dir, name }) orelse return error.ConnectFailed;
         };
         self.inherited_socket = inherited_socket;
         // libwayland before 1.23 has no cap symbol and uses fixed-size bounded buffers instead.
@@ -560,14 +579,19 @@ pub const Connection = struct {
         if (self.queueFlush() == .failed) return error.FlushFailed;
     }
 
-    // WSLg keeps its socket here, and an XDG_RUNTIME_DIR that does not link it hides it
-    // from libwayland (anomalyco/opencode#57724, #58466).
-    fn connectWslg(self: *Connection) ?*linux.WlDisplay {
-        if (!self.is_wsl) return null;
-        const name = posix_io.getEnv("WAYLAND_DISPLAY") orelse return null;
-        var buffer: [std.fs.max_path_bytes:0]u8 = undefined;
-        const path = std.mem.printSentinel(&buffer, "/mnt/wslg/runtime-dir/{s}", .{name}, 0) catch return null;
-        return self.symbols.wl_display_connect(path);
+    // libwayland's own connect blocks the thread while a stuck compositor's accept queue is full.
+    // A full queue fails with WouldBlock instead, so the operation waits out its deadline and the next drive retries.
+    fn connectPath(self: *Connection, comptime format: []const u8, args: anytype) !?*linux.WlDisplay {
+        var address: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = @splat(0) };
+        _ = std.fmt.bufPrint(address.path[0 .. address.path.len - 1], format, args) catch return null;
+        const fd = posix_io.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0) catch return null;
+        posix_io.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+            posix_io.close(fd);
+            return if (err == error.WouldBlock) err else null;
+        };
+        // libwayland owns the fd from here and closes it on failure. Its I/O passes MSG_DONTWAIT and
+        // polls before reading, so the fd may stay non-blocking.
+        return self.symbols.wl_display_connect_to_fd(fd);
     }
 
     fn sendSync(self: *Connection) bool {
@@ -1452,20 +1476,51 @@ test "Wayland core helper destroys its role before its surface" {
 test "Wayland connection setup caps the receive buffer, records an inherited socket, and tries WSLg on WSL" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const Environment = struct {
-        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-        var refused: enum { none, default, all } = .none;
-        var path: [64]u8 = undefined;
-        var path_length: usize = 0;
+        extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+        // `default` leaves only the WSLg socket, and `backlog` fills the display's accept queue.
+        var refused: enum { none, default, all, backlog } = .none;
+        var peer: std.posix.sockaddr.un = undefined;
         var count: u8 = 0;
+        // A failure inside the callback, kept for the test to report: a panic would skip its cleanup.
+        var peer_failed: bool = false;
+        var inheritable: bool = false;
         // Like libwayland, connecting consumes an inherited WAYLAND_SOCKET.
-        fn connect(name: ?[*:0]const u8) callconv(.c) ?*linux.WlDisplay {
-            _ = unsetenv("WAYLAND_SOCKET");
+        fn connect(_: ?[*:0]const u8) callconv(.c) ?*linux.WlDisplay {
+            test_env.set("WAYLAND_SOCKET", null);
             count += 1;
-            const explicit = name orelse return if (refused == .none) @ptrFromInt(1) else null;
-            path_length = std.mem.len(explicit);
-            @memcpy(path[0..path_length], explicit[0..path_length]);
-            return if (refused == .all) null else @ptrFromInt(1);
+            return if (refused == .none) @ptrFromInt(1) else null;
+        }
+        fn connectToFd(fd: c_int) callconv(.c) ?*linux.WlDisplay {
+            count += 1;
+            var length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
+            if (std.c.getpeername(fd, @ptrCast(&peer), &length) != 0) peer_failed = true;
+            // wl_display_connect_to_fd keeps the fd as it is, so a child process would inherit it.
+            inheritable = std.c.fcntl(fd, std.posix.F.GETFD) & std.posix.FD_CLOEXEC == 0;
+            posix_io.close(fd);
+            return @ptrFromInt(1);
+        }
+        fn peerDir() []const u8 {
+            return std.fs.path.dirname(std.mem.sliceTo(&peer.path, 0)) orelse "";
+        }
+        // A leaked descriptor holds the lowest free number.
+        fn lowestFreeFd() !std.posix.fd_t {
+            const fd = try posix_io.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+            posix_io.close(fd);
+            return fd;
+        }
+        // Listens at <dir>/<sub>/wayland-7, or connects to it when `backlog` is null.
+        fn socket(dir: []const u8, sub: []const u8, backlog: ?u31) !std.posix.fd_t {
+            var address: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = @splat(0) };
+            const path = try std.fmt.bufPrintSentinel(address.path[0 .. address.path.len - 1], "{s}/{s}", .{ dir, sub }, 0);
+            if (backlog != null) try std.Io.Dir.cwd().createDir(std.testing.io, path, .default_dir);
+            _ = try std.fmt.bufPrint(address.path[path.len..], "/wayland-7", .{});
+            const fd = try posix_io.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+            errdefer posix_io.close(fd);
+            if (backlog) |length| {
+                try posix_io.bind(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un));
+                try posix_io.listen(fd, length);
+            } else try posix_io.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un));
+            return fd;
         }
     };
     const Case = struct {
@@ -1475,37 +1530,59 @@ test "Wayland connection setup caps the receive buffer, records an inherited soc
         refused: @TypeOf(Environment.refused) = .none,
         wsl: bool = false,
         progress: Progress = .pending,
-        wslg_path: []const u8 = "",
+        peer: enum { none, display, wslg } = .display,
         connects: u8 = 1,
-        runtime_dir: [*:0]const u8 = "/run/user/test",
-        display: [*:0]const u8 = "wayland-7",
+        runtime_dir: enum { set, empty, relative } = .set,
+        // `longest` and `too_long` are absolute names of 107 and 108 bytes; sun_path holds 107 and the NUL.
+        display: enum { name, absolute, unset, longest, too_long } = .name,
     };
-    const wslg_path = "/mnt/wslg/runtime-dir/wayland-7";
     const cases = [_]Case{
-        .{ .inherited = true, .runtime_dir = "" },
+        .{ .inherited = true, .runtime_dir = .empty, .peer = .none },
         .{ .cap = false },
-        .{ .refused = .default, .progress = .unsupported },
+        .{ .refused = .default, .progress = .unsupported, .peer = .none, .connects = 0 },
         .{ .wsl = true },
-        .{ .refused = .default, .wsl = true, .inherited = true, .wslg_path = wslg_path, .connects = 2 },
-        .{ .refused = .all, .wsl = true, .progress = .unsupported, .wslg_path = wslg_path, .connects = 2 },
-        // libwayland would refuse the relative name and log to stderr on every operation.
-        .{ .runtime_dir = "", .wsl = true, .wslg_path = wslg_path },
-        .{ .runtime_dir = "run/user/test", .wsl = true, .wslg_path = wslg_path },
-        .{ .runtime_dir = "", .display = "/run/user/test/wayland-7" },
+        .{ .refused = .default, .wsl = true, .inherited = true, .peer = .wslg, .connects = 2 },
+        .{ .refused = .all, .wsl = true, .progress = .unsupported, .peer = .none, .connects = 0 },
+        // A relative name needs an absolute XDG_RUNTIME_DIR, as in libwayland.
+        .{ .runtime_dir = .empty, .wsl = true, .peer = .wslg },
+        .{ .runtime_dir = .relative, .wsl = true, .peer = .wslg },
+        .{ .runtime_dir = .empty, .display = .absolute },
+        .{ .display = .absolute },
+        .{ .runtime_dir = .empty, .display = .longest },
+        .{ .runtime_dir = .empty, .display = .too_long, .progress = .unsupported, .peer = .none, .connects = 0 },
+        // Only an inherited socket, and it is refused: the line names the socket.
+        .{ .inherited = true, .display = .unset, .refused = .default, .progress = .unsupported, .peer = .none },
+        // A compositor that stops accepting: each drive tries again without blocking, and an accepting WSLg waits.
+        .{ .refused = .backlog, .wsl = true, .peer = .none, .connects = 0 },
+        .{ .refused = .backlog, .runtime_dir = .empty, .display = .absolute, .wsl = true, .peer = .none, .connects = 0 },
+        .{ .refused = .backlog, .runtime_dir = .empty, .display = .absolute, .peer = .none, .connects = 0 },
+        .{ .refused = .backlog, .runtime_dir = .empty, .wsl = true, .peer = .none, .connects = 0 },
     };
-    const names = [_][*:0]const u8{ "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR" };
-    var saved: [names.len]?[:0]u8 = undefined;
-    for (names, &saved) |name, *value| {
-        value.* = if (posix_io.getEnv(name)) |current| try std.testing.allocator.dupeSentinel(u8, current, 0) else null;
-    }
-    defer for (names, saved) |name, value| {
-        if (value) |restored| {
-            _ = Environment.setenv(name, restored, 1);
-            std.testing.allocator.free(restored);
-        } else _ = Environment.unsetenv(name);
+    const saved = try test_env.save(&.{ "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "WAYLAND_SOCKET" });
+    defer saved.restore();
+    // A socket path must fit sun_path, which the test cache directory can exceed.
+    var dir_buffer = "/tmp/opentui-wayland-XXXXXX".*;
+    const dir = std.mem.span(Environment.mkdtemp(&dir_buffer) orelse return error.MkdtempFailed);
+    // Directory names that make <dir>/<name>/wayland-7 107 and 108 bytes long.
+    const long: [107]u8 = @splat('l');
+    const longest = long[0 .. long.len - dir.len - "//wayland-7".len];
+    const too_long = long[0 .. longest.len + 1];
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    // The listeners never accept, and a closed client stays queued; `none` has no socket. A queue
+    // of length 0 holds one connection, so the last client fills it.
+    const sockets = [_]std.posix.fd_t{
+        try Environment.socket(dir, "display", 64),
+        try Environment.socket(dir, "wslg", 64),
+        try Environment.socket(dir, "backlog", 0),
+        try Environment.socket(dir, "backlog", null),
+        try Environment.socket(dir, longest, 64),
+        try Environment.socket(dir, too_long, 64),
     };
+    defer for (sockets) |fd| posix_io.close(fd);
+    var paths: [3][std.fs.max_path_bytes:0]u8 = undefined;
     var symbols = testSymbols();
     symbols.wl_display_connect = Environment.connect;
+    symbols.wl_display_connect_to_fd = Environment.connectToFd;
     for (cases) |case| {
         symbols.wl_display_set_max_buffer_size = if (case.cap) testSetMaxBufferSize else null;
         var connection = Connection.init(std.testing.allocator, &symbols, "", "", 1);
@@ -1513,23 +1590,77 @@ test "Wayland connection setup caps the receive buffer, records an inherited soc
         connection.flush_outcome_override = .{ .result = 0, .errno = .SUCCESS };
         test_max_buffer_size = 0;
         Environment.refused = case.refused;
-        Environment.path_length = 0;
+        Environment.peer = .{ .family = std.posix.AF.UNIX, .path = @splat(0) };
         Environment.count = 0;
-        try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("WAYLAND_DISPLAY", case.display, 1));
-        try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("XDG_RUNTIME_DIR", case.runtime_dir, 1));
-        if (case.inherited) try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("WAYLAND_SOCKET", "99", 1));
-        defer _ = Environment.unsetenv("WAYLAND_SOCKET");
+        const display_dir = switch (case.refused) {
+            .none => "display",
+            .backlog => "backlog",
+            .default, .all => "none",
+        };
+        const runtime_dir = try std.fmt.bufPrintSentinel(&paths[0], "{s}/{s}", .{ dir, display_dir }, 0);
+        // With a full display queue, WSLg is full too when there is no display path, and accepts otherwise.
+        const wslg_dir = switch (case.refused) {
+            .all => "none",
+            .backlog => if (case.runtime_dir == .empty and case.display == .name) "backlog" else "wslg",
+            .none, .default => "wslg",
+        };
+        connection.wslg_runtime_dir = try std.fmt.bufPrint(&paths[1], "{s}/{s}", .{ dir, wslg_dir });
+        const display_path = switch (case.display) {
+            .longest => try std.fmt.bufPrintSentinel(&paths[2], "{s}/{s}/wayland-7", .{ dir, longest }, 0),
+            .too_long => try std.fmt.bufPrintSentinel(&paths[2], "{s}/{s}/wayland-7", .{ dir, too_long }, 0),
+            else => try std.fmt.bufPrintSentinel(&paths[2], "{s}/wayland-7", .{runtime_dir}, 0),
+        };
+        const display: ?[:0]const u8 = switch (case.display) {
+            .name => "wayland-7",
+            .unset => null,
+            .absolute, .longest, .too_long => display_path,
+        };
+        test_env.set("WAYLAND_DISPLAY", if (display) |name| name.ptr else null);
+        const runtime_value: [:0]const u8 = switch (case.runtime_dir) {
+            .set => runtime_dir,
+            .empty => "",
+            .relative => runtime_dir[1..],
+        };
+        test_env.set("XDG_RUNTIME_DIR", runtime_value);
+        if (case.inherited) test_env.set("WAYLAND_SOCKET", "99");
+        defer test_env.set("WAYLAND_SOCKET", null);
+        linux.test_log.begin();
+        defer _ = linux.test_log.end();
+        // A new connection attempt replaces the cause an earlier one left.
+        linux.recordCause(.wayland, .wayland_connect, "stale", .{});
+        const free_fd = try Environment.lowestFreeFd();
 
         try std.testing.expectEqual(case.progress, connection.drive());
+        linux.reportUnavailable();
+        var refused_line: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const refused = try std.fmt.bufPrint(&refused_line, "Clipboard: cannot connect to Wayland display {s}\n", .{display orelse "WAYLAND_SOCKET"});
+        try std.testing.expectEqualStrings(if (case.progress == .unsupported) refused else "", linux.test_log.end());
+        try std.testing.expectEqual(if (case.progress == .unsupported) linux.Report.wayland_connect else null, linux.testCauseReport(.wayland));
 
-        const cap: usize = if (case.cap and case.progress != .unsupported) WAYLAND_CONNECTION_BUFFER_SIZE_MAX else 0;
-        try std.testing.expectEqual(cap, test_max_buffer_size);
-        try std.testing.expectEqualStrings(case.wslg_path, Environment.path[0..Environment.path_length]);
+        const connected = case.connects > 0 and case.progress != .unsupported;
+        try std.testing.expectEqual(@as(usize, if (case.cap and connected) WAYLAND_CONNECTION_BUFFER_SIZE_MAX else 0), test_max_buffer_size);
+        const peer = switch (case.peer) {
+            .none => "",
+            .display => std.fs.path.dirname(display_path) orelse "",
+            .wslg => connection.wslg_runtime_dir,
+        };
+        try std.testing.expectEqualStrings(peer, Environment.peerDir());
         // A WSLg connection is not the inherited socket, so the idle drain may close it.
         try std.testing.expectEqual(case.inherited and case.refused == .none, connection.inherited_socket);
         // Later drives reuse the result; only the host's idle close lets an operation connect again.
-        for (0..3) |_| _ = connection.drive();
+        for (0..3) |_| try std.testing.expectEqual(case.progress, connection.drive());
         try std.testing.expectEqual(case.connects, Environment.count);
+        try std.testing.expect(!Environment.peer_failed and !Environment.inheritable);
+        try std.testing.expectEqual(free_fd, try Environment.lowestFreeFd());
+        if (case.refused == .backlog) {
+            // Once the compositor accepts again, the next drive connects.
+            const accepted = std.c.accept(sockets[2], null, null);
+            try std.testing.expect(accepted >= 0);
+            posix_io.close(accepted);
+            try std.testing.expectEqual(Progress.pending, connection.drive());
+            try std.testing.expectEqual(@as(u8, 1), Environment.count);
+            try std.testing.expectEqualStrings(runtime_dir, Environment.peerDir());
+        }
     }
 }
 
@@ -1906,6 +2037,36 @@ fn testOfferConnection(proxy: *WlProxy) Connection {
 }
 
 test "Wayland core data-device fallback is WSL-gated and read-only" {
+    const symbols = testSymbols();
+    const expected_line = "Clipboard: " ++ "the Wayland compositor has no data-control protocol and no usable core data device" ++ "\n";
+    // Driving a connection dispatches events, which only the Linux backend does; elsewhere the
+    // host never creates a Wayland connection.
+    if (comptime builtin.os.tag == .linux) for ([_]struct { wsl: bool, ext: bool, progress: Progress }{
+        .{ .wsl = false, .ext = false, .progress = .unsupported },
+        .{ .wsl = true, .ext = false, .progress = .pending },
+        .{ .wsl = false, .ext = true, .progress = .pending },
+    }) |case| {
+        linux.test_log.begin();
+        defer _ = linux.test_log.end();
+        var registry = testReadyConnection(&symbols, .{ .result = 0, .errno = .SUCCESS });
+        defer registry.deinit();
+        registry.manager = null;
+        registry.device = null;
+        registry.phase = .registry;
+        registry.sync_done = true;
+        registry.is_wsl = case.wsl;
+        registry.ext_global = if (case.ext) 5 else null;
+        registry.core_manager_global = 1;
+        registry.compositor_global = 2;
+        registry.shm_global = 3;
+        registry.shell_global = 4;
+        try std.testing.expectEqual(case.progress, registry.drive());
+        // Driving never logs; the host reports only when no backend serves an operation.
+        try std.testing.expectEqualStrings("", linux.test_log.buffer[0..linux.test_log.length]);
+        try std.testing.expectEqual(if (case.progress == .unsupported) linux.Report.wayland_protocol else null, linux.testCauseReport(.wayland));
+        linux.reportUnavailable();
+        try std.testing.expectEqualStrings(if (case.progress == .unsupported) expected_line else "", linux.test_log.end());
+    };
     var connection: Connection = undefined;
     connection.is_wsl = false;
     connection.core_manager_global = 1;
@@ -1918,9 +2079,15 @@ test "Wayland core data-device fallback is WSL-gated and read-only" {
 
     connection.core_data_device = true;
     connection.failure = .provider;
+    linux.test_log.begin();
+    defer _ = linux.test_log.end();
     try std.testing.expectEqual(SelectionResult.unsupported, connection.publishText(false, &.{}));
     try std.testing.expectEqual(SelectionResult.unsupported, connection.clearSelection(false));
     try std.testing.expectEqual(Failure.none, connection.failure);
+    // A WSLg write with no X11 to fall back to says why.
+    try std.testing.expectEqual(linux.Report.wayland_protocol, linux.testCauseReport(.wayland).?);
+    linux.reportUnavailable();
+    try std.testing.expectEqualStrings("Clipboard: the Wayland compositor has no data-control protocol, which writes need\n", linux.test_log.end());
 }
 
 test "Wayland core helper acquisition fails closed outside Linux" {

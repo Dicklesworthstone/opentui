@@ -584,7 +584,7 @@ typedef struct ot_scene_paint_slot {
 
 /* All phase records require exact size/version and zero reserved fields. Hook
  * generations are nonzero and must increase on every change. Initial dimensions
- * seed the resize baseline only before the first layout. Later subscriptions use
+ * seed the resize baseline on the node's first publication. Later subscriptions use
  * completed dimensions. Only the root accepts LAYOUT_CHANGED.
  * IDLE_UPDATE uses up the node's update for a frame without a host request or callback.
  * It does not count as a host hook and cannot be combined with UPDATE.
@@ -1290,6 +1290,19 @@ typedef struct ot_embedded_terminal_cursor {
     uint32_t reserved;
 } ot_embedded_terminal_cursor;
 
+/* The active screen's viewport, in rows. offset is the distance from the live
+ * screen (0 there; total - visible at the top of history). total includes the
+ * visible rows; the alternate screen has no history. Output, resizes, scrollback
+ * clears, and screen switches move the viewport too; read it after each. */
+typedef struct ot_embedded_terminal_scrollbar {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t offset;
+    uint32_t total;
+    uint32_t visible;
+    uint32_t reserved;
+} ot_embedded_terminal_scrollbar;
+
 typedef struct ot_embedded_terminal_key {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -1336,6 +1349,7 @@ ot_status ot_embedded_terminal_get_selected_text(ot_context *, const ot_handle *
 ot_status ot_embedded_terminal_compose(ot_context *, const ot_handle *terminal, const ot_handle *target,
     const ot_scene_frame_request *frame, int32_t x, int32_t y);
 ot_status ot_embedded_terminal_cursor_get(ot_context *, const ot_handle *terminal, ot_embedded_terminal_cursor *out_cursor);
+ot_status ot_embedded_terminal_scrollbar_get(ot_context *, const ot_handle *terminal, ot_embedded_terminal_scrollbar *out_scrollbar);
 ot_status ot_embedded_terminal_encode_key(ot_context *, const ot_handle *terminal, const ot_embedded_terminal_key *,
     const uint8_t *key, uint32_t key_count, const uint8_t *text, uint32_t text_count,
     uint8_t *bytes, uint32_t capacity, uint32_t *out_count);
@@ -2508,6 +2522,7 @@ typedef struct ot_session_pump_result {
 
 #define OT_INPUT_KEY_KITTY UINT32_C(1)
 #define OT_INPUT_KEY_TEXT_TRUNCATED UINT32_C(2)
+#define OT_INPUT_KEY_TYPED UINT32_C(4)
 #define OT_INPUT_PASTE_START UINT32_C(1)
 #define OT_INPUT_PASTE_END UINT32_C(2)
 #define OT_INPUT_REPLY_FRAGMENT UINT32_C(1)
@@ -2521,8 +2536,10 @@ typedef struct ot_session_pump_result {
 
 /* Key codes are Unicode scalars; functional keys use the Kitty keyboard protocol
  * assignments. Escape, Enter, Tab, and Backspace are 27, 13, 9, and 127. A key
- * typed from the private-use area shares the Kitty range, as in every Kitty
- * protocol terminal. Code 0 is a text-only key (input method output). */
+ * typed from the private-use area shares the Kitty range: OT_INPUT_KEY_TYPED
+ * marks a code that is a printable character the terminal sent as text or as
+ * xterm's CSI 27 ; mods ; code ~, never a functional key. Code 0 is a text-only
+ * key (input method output). */
 #define OT_INPUT_KEY_ESCAPE UINT32_C(27)
 #define OT_INPUT_KEY_ENTER UINT32_C(13)
 #define OT_INPUT_KEY_TAB UINT32_C(9)
