@@ -682,6 +682,9 @@ ot_status ot_scene_create_node(ot_context *, const ot_handle *session, uint32_t 
  * RESET still succeed. */
 ot_status ot_scene_destroy_node(ot_context *, const ot_handle *node);
 ot_status ot_scene_move_node(ot_context *, const ot_handle *node, const ot_handle *parent, uint32_t index);
+/* Detaches every child of node, as moving each to NULL from first to last would, in
+ * time linear in the child count. On error no child is detached. */
+ot_status ot_scene_clear_children(ot_context *, const ot_handle *node);
 /* Synchronous owner-thread measurement on leaves. The callback is borrowed until
  * replacement, unset, node destruction, or Context destruction. NULL clears the
  * single provider slot; it does not restore built-in measurement. Each set or clear
@@ -2351,7 +2354,7 @@ ot_status ot_scene_frame_commit(ot_context *, const ot_handle *session,
  * must be zero. REPLY_SENTINEL ends the startup query packet with DA1 (CSI c),
  * also inside tmux, and sends no other DA1; the host waits for its reply instead
  * of a timer. A DA1 reply then also ends the startup cursor-report probes.
- * Frames are wrapped in synchronized output (DEC mode 2026) unless the terminal
+ * Frames that paint are wrapped in synchronized output (DEC mode 2026) unless the terminal
  * is remote and, once its replies passed the 2026 query (a width-probe report
  * or DA1), either did not report the mode or HOST_MULTIPLEXER is set: the host
  * runs inside tmux, screen or Zellij between the app and the link.
