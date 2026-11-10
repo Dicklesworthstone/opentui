@@ -38,8 +38,6 @@ fn main() -> opentui::Result<()> {
 }
 ```
 
-The work follows [PLAN.md](PLAN.md).
-
 ## Build
 
 The crates link the native library of this checkout,
@@ -56,24 +54,37 @@ To link other artifacts, such as an npm platform package or a native archive
 of a release, set `OPENTUI_LIB_DIR` to their directory. It wins over the
 checkout's build. Give an absolute path: Cargo reads a relative one from
 `crates/opentui-sys`. A Cargo `git` dependency on this repository has no native
-build, so it needs `OPENTUI_LIB_DIR`.
+build, so it needs `OPENTUI_LIB_DIR`. An npm platform package ships only the
+shared library, so on Linux and macOS it needs the default features off (see
+below).
 
 These platforms are supported:
 
-| Platform                       | Rust target                                       | Artifact directory |
-| ------------------------------ | ------------------------------------------------- | ------------------ |
-| Linux x86_64 with glibc        | `x86_64-unknown-linux-gnu`                        | `x86_64-linux`     |
-| macOS 13 or later, Apple chips | `aarch64-apple-darwin`                            | `aarch64-macos`    |
-| macOS 13 or later, Intel chips | `x86_64-apple-darwin`                             | `x86_64-macos`     |
-| Windows 10 1809 or later       | `x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu` | `x86_64-windows`   |
+| Platform                       | Rust target                                             | Artifact directory   |
+| ------------------------------ | ------------------------------------------------------- | -------------------- |
+| Linux x86_64 with glibc        | `x86_64-unknown-linux-gnu`                              | `x86_64-linux`       |
+| Linux arm64 with glibc         | `aarch64-unknown-linux-gnu`                             | `aarch64-linux`      |
+| Linux x86_64 with musl         | `x86_64-unknown-linux-musl`                             | `x86_64-linux-musl`  |
+| Linux arm64 with musl          | `aarch64-unknown-linux-musl`                            | `aarch64-linux-musl` |
+| macOS 13 or later, Apple chips | `aarch64-apple-darwin`                                  | `aarch64-macos`      |
+| macOS 13 or later, Intel chips | `x86_64-apple-darwin`                                   | `x86_64-macos`       |
+| Windows 10 1809 or later       | `x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`       | `x86_64-windows`     |
+| Windows 10 1809 or later, Arm  | `aarch64-pc-windows-msvc`, `aarch64-pc-windows-gnullvm` | `aarch64-windows`    |
 
 The build picks the directory for the target it builds.
+Rust's musl targets build static executables (`crt-static`), which cannot load
+`libopentui.so`, so the build refuses the shared library there: keep the
+default `static` feature, or turn the default features off and build with
+`RUSTFLAGS='-C target-feature=-crt-static'`.
 OpenTUI's macOS build needs the macOS SDK, which comes with the Xcode Command
 Line Tools (`xcode-select --install`). On a Mac, `bun run build` in
 `packages/native` builds the Mac's own architecture; add the other one with
 `zig build -Doptimize=ReleaseFast -Dlibrary-target=x86_64-macos.13.0` (or
 `aarch64-macos.13.0`). The Windows build needs no SDK, so Zig makes it on any
 system: `zig build -Doptimize=ReleaseFast -Dlibrary-target=x86_64-windows-gnu`.
+`VideoView` needs a library built with FFmpeg: the native build links it from
+`packages/native/.cache/ffmpeg/prefix/<target>`, which `bun run build` makes for
+the host, and warns and leaves video out without it.
 
 `crates/opentui-sys/src/generated.rs` is generated from
 `packages/native/include/opentui.h`: `bun run generate:abi` in `packages/core`
@@ -81,14 +92,18 @@ writes it, and `bun run check:abi` fails when it is stale. Do not edit it. The
 bindings are valid only for the exact header they were generated from, and the
 build fails if the artifacts' header differs.
 
-By default the crate links the shared library: `libopentui.so` on Linux,
-`libopentui.dylib` on macOS, and `opentui.dll` on Windows, through its import
-library `opentui.lib`. On Linux and macOS, the workspace's tests and examples
-find it through an rpath; other executables need their own rpath,
-`LD_LIBRARY_PATH` on Linux, or `DYLD_LIBRARY_PATH` on macOS, or can link
-statically with the `static` feature. Windows has no rpath: the build copies
-`opentui.dll` where `cargo run` and `cargo test` find it, and other
-executables need it beside them or on `PATH`.
+By default the crate links `libopentui.a` on Linux and macOS, so an
+executable needs no OpenTUI file at run time, and on Linux no libc++ either.
+Windows always links `opentui.dll`, through its import library `opentui.lib`:
+ship `opentui.dll` beside the `.exe`. The build copies it where `cargo run`
+and `cargo test` find it.
+
+To link `libopentui.so` or `libopentui.dylib` instead, turn the default
+features off (`default-features = false`, or `--no-default-features`). Cargo
+merges features across the app's graph, so every crate in it that depends on
+`opentui` must turn them off. The workspace's tests and examples find the library through an rpath; other
+executables need their own rpath, `LD_LIBRARY_PATH` on Linux, or
+`DYLD_LIBRARY_PATH` on macOS.
 
 On Windows, the app turns on the console's virtual terminal input and output,
 so the input parser reads the same sequences as on Unix. Windows has no job
@@ -99,10 +114,13 @@ and `pty::shell()` is `%COMSPEC%`.
 
 Features:
 
-- `static`: link `libopentui.a`. On macOS this also links the system
-  frameworks OpenTUI uses for the clipboard and audio. Not supported on
-  Windows: OpenTUI's Windows archive is built for MinGW with libc++, which
-  neither Rust Windows toolchain links.
+- `static` (default): link `libopentui.a`. On Linux the archive carries its
+  own libc++, so the program needs only libc. That libc++ is private to
+  OpenTUI, so C++ code elsewhere in the program keeps its own runtime,
+  libstdc++ or libc++, shared or static. On macOS this also links the system
+  frameworks OpenTUI uses for the clipboard, audio, and video. Windows links
+  `opentui.dll` with or without it: OpenTUI's Windows archive is built for
+  MinGW with libc++, which neither Rust Windows toolchain links.
 - `tokio`: `App::spawn` runs futures on a Tokio runtime and finishes them on
   the UI thread.
 - `log`: `console::init_logger` shows the `log` crate's records in the debug
@@ -241,6 +259,7 @@ program status reports.
 | `Markdown`     | Rendered or source Markdown with nested lists, tables, code, and code-block renderers; streamed text updates only what changed. |
 | `TerminalView` | A shell or any program on a pseudo-terminal, emulated natively, with scrollback and selection.                                  |
 | `ImageView`    | A picture, drawn with the Kitty protocol, Sixel, or half blocks.                                                                |
+| `VideoView`    | An MP4 file played natively, with audio, looping, and seeking; events report the position, the end, and failures.               |
 | `FrameBuffer`  | A grid of cells you draw into yourself, which native code shows every frame.                                                    |
 | `Custom<T>`    | A widget you paint yourself by implementing `Component`.                                                                        |
 
@@ -602,6 +621,7 @@ sh run.sh tasks       # a task list you move through and toggle
 sh run.sh native      # the native layer and host, without the framework
 sh run.sh workbench   # a native-layer build queue with live progress and a debug pane
 sh run.sh terminal    # your shell in a terminal widget, beside a notes field
+sh run.sh video       # a video player; `cargo run --example video -- file.mp4` plays your own file
 sh run.sh chat        # an SSH chat server on 127.0.0.1:2222: run `ssh -p 2222 localhost` per participant
 sh run.sh tasks static
 cargo run --release --example bench   # headless frame timings
@@ -618,21 +638,26 @@ and delivering the output to memory.
 sh test.sh           # format, clippy, tests, and lifecycle checks, with shared and static linking
 sh test.sh shared
 cargo test --locked --workspace --features opentui/tokio,opentui/tree-sitter
-sh scripts/check-macos.sh     # from another system: clippy for both macOS targets
-sh scripts/check-windows.sh   # from another system: clippy for Windows
+sh scripts/check-targets.sh   # clippy for the macOS, arm64 and musl Linux, and Arm Windows targets
 ```
 
-On Windows, run `sh test.sh` from Git Bash; it checks the shared linkage only.
+On Windows, run `sh test.sh` from Git Bash; it runs one pass, which links
+`opentui.dll`.
 `cargo test` also works from any shell.
 
 After a change to `opentui.h`, run `bun run generate:abi` in `packages/core`,
 then `sh test.sh shared`, and fix the crates in the same change.
 
-`scripts/check-macos.sh` and `scripts/check-windows.sh` keep that code
-compiling while you work elsewhere. They need the standard library's source
-(`rust-src`), and the macOS one needs Zig; their headers say how they use them.
-They do not link or run anything, so `sh test.sh` on the platform is still the
-real check.
+`scripts/check-targets.sh` keeps the code of the other targets compiling
+while you work on one. It needs Zig and the targets' standard libraries, which
+it adds with rustup, or `rust-src` without rustup; its header says how it uses
+them. It does not link or run anything. `sh test.sh` runs on x86_64 Linux,
+macOS, and x86_64 Windows; arm64 Linux, Linux with musl, and Windows on Arm
+are only compile-checked.
+
+CI runs `test.sh` on Linux, Windows and macOS for each pull request that
+changes the crates, native code or the ABI generator, and `check-targets.sh` on
+Linux. `rust-toolchain.toml` pins the toolchain it uses.
 
 Widget tests in `crates/opentui/tests/` drive headless apps and compare
 rendered frames. Native tests drive real Sessions into memory with a virtual

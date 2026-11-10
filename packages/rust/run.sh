@@ -3,7 +3,7 @@ set -eu
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 usage() {
-    printf '%s\n' "usage: sh $0 [hello|showcase|effects|tasks|native|workbench|lifecycle|terminal|split|chat] [shared|static]" >&2
+    printf '%s\n' "usage: sh $0 [hello|showcase|effects|tasks|native|workbench|lifecycle|terminal|split|video|chat] [shared|static]" >&2
     exit 2
 }
 case $(uname -s)/$(uname -m) in
@@ -17,20 +17,17 @@ esac
 example=hello
 package=opentui
 case ${1:-} in
-    hello|showcase|effects|tasks|native|workbench|lifecycle|terminal|split) example=$1; shift ;;
+    hello|showcase|effects|tasks|native|workbench|lifecycle|terminal|split|video) example=$1; shift ;;
     # An SSH chat server on 127.0.0.1:2222; connect with `ssh -p 2222 localhost`.
     chat) example=chat; package=opentui-ssh; shift ;;
 esac
 [ "$#" -le 1 ] || usage
+# The static feature is a default one; Windows links opentui.dll either way.
 case ${1:-shared} in
-    shared) features=opentui/tree-sitter ;;
-    static) features=opentui/static,opentui/tree-sitter ;;
+    shared) defaults=--no-default-features ;;
+    static) defaults= ;;
     *) usage ;;
 esac
-if [ "$platform" = x86_64-windows ] && [ "${1:-shared}" = static ]; then
-    printf '%s\n' 'Static linking is not supported on Windows.' >&2
-    exit 2
-fi
 # Without OPENTUI_LIB_DIR, the crates link this checkout's packages/native/lib/$platform.
 if [ -n "${OPENTUI_LIB_DIR:-}" ]; then
     # Cargo on Windows needs a Windows path, which MSYS's `pwd -W` prints.
@@ -38,4 +35,4 @@ if [ -n "${OPENTUI_LIB_DIR:-}" ]; then
     export OPENTUI_LIB_DIR
 fi
 exec "${CARGO:-cargo}" run --locked --manifest-path "$here/Cargo.toml" -p "$package" --example "$example" \
-    ${features:+--features "$features"}
+    $defaults --features opentui/tree-sitter

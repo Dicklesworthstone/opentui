@@ -213,6 +213,18 @@ fn styled_links_present_only_after_completed_output_then_restore() -> Result<()>
         let output = session.pump_until_quiet(&mut now_ns)?;
         assert_eq!((contains(&output, b";1;2;3m"), contains(&output, b"clear.test")), (styled, linked), "{clear:?}");
     }
+    // A link target with a control character keeps its text but gets no hyperlink; UTF-8 targets keep theirs.
+    for (label, url, linked) in [
+        ("esc", "https://x.test/a\x1b]52;c;cHduZWQ=\x07", false),
+        ("csi", "https://x.test/\u{9b}0m", false),
+        ("eur", "https://x.test/\u{20ac}", true),
+    ] {
+        buffer.set_spans(&[label.into_span().link(url)])?;
+        session.present()?;
+        let output = session.pump_until_quiet(&mut now_ns)?;
+        let found = [label.as_bytes(), b"]52;", url.as_bytes()].map(|part| contains(&output, part));
+        assert_eq!(found, [true, false, linked], "{label}");
+    }
 
     session.close()?;
     let restored = session.pump_until_quiet(&mut now_ns)?;
@@ -381,7 +393,7 @@ fn input_parses_into_caller_records_until_they_run_low() -> Result<()> {
     let drain = session.input_feed(b"", 10 + sys::OT_INPUT_TIMEOUT_NS, &mut records, &mut payload)?;
     assert_eq!((drain.count, drain.deadline_ns), (0, 0));
     assert_eq!(status(session.input_feed(b"", 9, &mut records, &mut payload)), Status::InvalidArgument);
-    assert_eq!(status(session.input_expect(16)), Status::InvalidArgument);
+    assert_eq!(status(session.input_expect(32)), Status::InvalidArgument);
     session.input_expect(sys::OT_INPUT_EXPECT_REPLIES)?;
     session.close()?;
     assert_eq!(status(session.input_feed(b"a", 20, &mut records, &mut payload)), Status::SessionClosed);
@@ -739,11 +751,13 @@ fn capabilities_name_width_methods_multiplexers_and_forced_image_protocols() -> 
     assert_eq!(capabilities.width_method, WidthMethod::Wcwidth);
     assert_eq!(capabilities.image_protocol, ImageProtocol::Sixel);
     // A host forwards only FORWARDED_ENVIRONMENT, which must hold every key native code reads.
+    assert!(crate::host::FORWARDED_ENVIRONMENT.contains(&"OPENTUI_FORCE_TRUECOLOR"));
     for (environment, hyperlinks) in [
         (&[("VTE_VERSION", "5202")][..], true),
         (&[("VTE_VERSION", "5000")], false),
         (&[("TERM_PROGRAM", "vscode"), ("FORCE_HYPERLINK", "0")], false),
         (&[("FORCE_HYPERLINK", "1")], true),
+        (&[("WT_SESSION", "1"), ("TERM", "xterm-256color")], true),
         (&[("XTERM_VERSION", "XTerm(390)"), ("KONSOLE_VERSION", "240202")], false),
     ] {
         assert!(environment.iter().all(|(key, _)| crate::host::FORWARDED_ENVIRONMENT.contains(key)), "{environment:?}");

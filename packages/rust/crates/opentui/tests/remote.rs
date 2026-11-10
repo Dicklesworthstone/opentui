@@ -374,32 +374,159 @@ fn a_color_scheme_notice_lets_the_app_read_the_new_palette() {
     client.finish().expect("the app thread").expect("the app");
 }
 
+// Expected: widgets, including a scrollback writer's, measure text with the width method native drawing uses, also
+// after a reply changes it, as Core's `widthMethod` follows the renderer.
+// Actual: `App::width_method` kept the method from before the reply, a scrollback writer's app kept it until its next
+// render, and `NoZwj` was reported although native draws it as `Unicode`. Under ConPTY's DECRPM 2027 "unrecognized"
+// reply, a ZWJ emoji measured 2 cells and drew 4: the table cell blanked it, the gutter sign was clipped, the input
+// wrote over "💻", and a snapshot lost its wrapped row.
+#[test]
+fn widgets_measure_text_with_the_width_method_a_reply_switches_to() {
+    use opentui::split::{Scrollback, SnapshotOptions};
+    use opentui::widget::{LineNumbers, LineSign, WrapMode};
+    let zwj = "👩\u{200d}💻";
+    // An environment variable, the replies and keys, the text, the method native draws with, the text's cells under it,
+    // the link snapshot, and the screen rows to check. Native draws NoZwj as Unicode but the emulator splits the emoji,
+    // so only the method's row and the cursor show the app's measurement.
+    // Only Ghostty's reply turns hyperlinks on; "l" updates the link before anything else reads the terminal state.
+    let ghostty = &b"\x1b[?2027;2$y\x1bP>|ghostty 1.3.0\x1b\\lw"[..];
+    let cases = [
+        (("TERM", "xterm-256color"), &b"\x1b[?2027;0$yw"[..], zwj, "Wcwidth", 4, "go (https://a.b)", 0..5),
+        (("TERM_PROGRAM", "vscode"), b"\x1b[?2027;2$yw", zwj, "Unicode", 2, "go", 0..5),
+        (("TERM", "xterm-256color"), ghostty, "বাংলা", "UnicodeWide", 4, "go!", 0..5),
+        (("OPENTUI_FORCE_NOZWJ", "1"), b"w", zwj, "Unicode", 2, "go (https://a.b)", 2..3),
+    ];
+    for (variable, input, text, method, cells, link, checked) in cases {
+        let environment = vec![("TERM".into(), "xterm-256color".into()), (variable.0.into(), variable.1.into())];
+        let options = RemoteOptions { width: 48, height: 5, environment };
+        let mut client = Client::start(options, quiet(), move |app| {
+            let editor = Textarea::new(app);
+            editor.set_text("x");
+            let gutter = LineNumbers::new(app, &editor).height(1).line_sign(0, LineSign::before(text, None));
+            let table = Table::new(app)
+                .set_columns([Column::new("").width(ColumnWidth::Cells(6)).align(Alignment::Right)])
+                .show_header(false)
+                .set_rows([[text]])
+                .size(6, 1);
+            let row = View::new(app).row().height(1).child(&table).child(&Text::new(app, "|"));
+            app.root().add(&row).add(&gutter);
+            // Made before the reply, as apps make their scrollback writer.
+            let scrollback = Scrollback::new(app).unwrap();
+            let link = Markdown::new(scrollback.app()).set_markdown("[go](https://a.b)");
+            app.on_key(move |cx, key| {
+                if key.matches("l") {
+                    // Updates a paragraph without making a node, so only `hyperlinks` reads the terminal state.
+                    link.append("!");
+                } else if key.matches("w") {
+                    // Text and Markdown prose measure through the detached Session, Code through the app. Text comes
+                    // first, before anything asks the app for its width method.
+                    let line = format!("{text}abcd");
+                    let shots = [
+                        Text::new(scrollback.app(), &line).wrap(WrapMode::Char).as_any(),
+                        Markdown::new(scrollback.app()).set_markdown(&line).as_any(),
+                        Code::new(scrollback.app()).wrap(WrapMode::Char).set_code(&line).as_any(),
+                    ]
+                    .map(|widget| {
+                        let options = SnapshotOptions { width: Some(6), ..SnapshotOptions::default() };
+                        let shot = scrollback.snapshot(&widget, options).unwrap().buffer.capture().unwrap().text();
+                        shot.replace('\n', "/")
+                    });
+                    let link =
+                        scrollback.snapshot(&link, SnapshotOptions::default()).unwrap().buffer.capture().unwrap();
+                    let error = scrollback.app().session().context().last_error().unwrap();
+                    let label = format!("m={:?} {} {error:?}", cx.app().width_method(), link.text().trim_end());
+                    let label = Text::new(cx.app(), label);
+                    cx.app().root().add(&label).add(&Text::new(cx.app(), shots.join(" ")));
+                } else if key.matches("i") {
+                    let input = Input::new(cx.app()).set_value(format!("{text}yz"));
+                    cx.app().root().add(&input);
+                    input.focus();
+                }
+            });
+        });
+        client.wait_for("|");
+        client.send(input);
+        client.wait_for("m=");
+        client.send(b"i");
+        client.wait_for("yz");
+        let host = opentui::testing::TestApp::new(48, 5);
+        let screen = TerminalView::new(&host).size(48, 5).write(client.text()).screen();
+        // A 6-cell snapshot wraps "cd" after a 4-cell text.
+        let (pad, shot) = (" ".repeat(6 - cells as usize), if cells == 4 { "ab/cd" } else { "abcd" });
+        let shots = vec![format!("{text}{shot}"); 3].join(" ");
+        // The label ends with the Context's last error: the snapshots leave none.
+        let rows = [format!("{pad}{text}|"), format!("{text} 1 x"), format!("m={method} {link} None"), shots];
+        let rows = [&rows[..], &[format!("{text}yz")]].concat();
+        let expected = (&rows[checked.clone()], Some((cells + 2, 4)));
+        assert_eq!((&screen.lines[checked], screen.cursor.position), expected, "{variable:?}");
+        client.link.terminate();
+        client.finish().expect("the app thread").expect("the app");
+    }
+}
+
 // Expected: an image drawn before the terminal answers the capability queries switches to Kitty graphics once
 // Ghostty replies to XTVERSION and the Kitty graphics query, as Core repaints on each capability reply.
 // Actual: a reply forced the next frame but did not ask for one, so an app with nothing else to draw kept its
 // first-frame half blocks until some unrelated change painted again.
+// Expected too: the app asks for the pixel size (`CSI 14 t`) at setup and after a resize, as Core does, and a large
+// image goes out as a copy at its placement's pixel size. Actual: it never asked, so the full upload of a 1290x810
+// noise image was over the output budget and the image drew half blocks for good.
 #[test]
 fn images_switch_to_kitty_graphics_when_the_terminal_reports_support_after_the_first_frame() {
+    use opentui::native::{Image, ImageFit};
+    use opentui::widget::ImageView;
     let options = RemoteOptions {
         environment: vec![("TERM".into(), "xterm-256color".into()), ("TERM_PROGRAM".into(), "ghostty".into())],
         ..RemoteOptions::default()
     };
-    let mut client = Client::start(options, quiet(), |app| {
+    // Without the capability window, only the pixel size query makes the parser wait for the rest of a reply.
+    let mut app_options = quiet();
+    app_options.host.capability_window = Duration::ZERO;
+    let mut client = Client::start(options, app_options, |app| {
         let red = [255u8, 0, 0, 255].repeat(16 * 16);
-        let image = opentui::native::Image::from_rgba(app.session().context(), 16, 16, &red).unwrap();
-        app.root().add(&opentui::widget::ImageView::new(app).size(8, 4).image(Some(image)));
-        app.on_key(|cx, key| {
-            if key.matches("q") {
-                cx.quit();
-            }
-        });
+        let image = Image::from_rgba(app.session().context(), 16, 16, &red).unwrap();
+        let mut seed = 1u32;
+        let noise: Vec<u8> = (0..1290 * 810 * 4)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            })
+            .collect();
+        let large = Image::from_rgba(app.session().context(), 1290, 810, &noise).unwrap();
+        sizes(app);
+        app.root()
+            .add(&ImageView::new(app).size(8, 4).image(Some(image)))
+            .add(&ImageView::new(app).fit(ImageFit::Cover).size(16, 8).image(Some(large)));
     });
     client.wait_for("\x1b_Gi=31337");
     // The first frame draws half blocks: no reply has come yet.
     client.wait_for("\x1b[?2026l");
     assert!(!client.text().contains("\x1b_Ga="), "{:?}", client.text());
-    client.send(b"\x1bP>|ghostty 1.2.3\x1b\\\x1b_Gi=31337;OK\x1b\\\x1b[?62;22c");
-    client.wait_for("\x1b_Ga=t");
+    client.take_until("the pixel size query", |client| client.text().contains("\x1b[14t"));
+    // The setup query's window has passed, so a resize asks again. Its reply comes after the late one for 80 columns,
+    // and wins as in Core: cells of 10x20 pixels make the 16x8 box 160x160, not 128x128.
+    client.link.resize(100, 30);
+    client.wait_for("\x1b[14t");
+    client.send(b"\x1bP>|ghostty 1.2.3\x1b\\\x1b_Gi=31337;OK\x1b\\\x1b[?62;22c\x1b[4;480;800t");
+    client.send(b"\x1b[4;600;1000t");
+    client.wait_for("s=160,v=160,");
+    let text = client.text();
+    let last = text.split(",s=").skip(1).filter(|size| !size.starts_with("16,v=16,")).last();
+    assert!(last.is_some_and(|size| size.starts_with("160,v=160,")), "the last copy is not 160x160: {text:?}");
+    // Cells of 10x30 pixels after two more resizes. The second comes while the first's query waits, whose reply then
+    // describes the width before it: the app asks again instead of sizing the image by it (137x240).
+    client.link.resize(120, 30);
+    client.wait_for("\x1b[14t");
+    client.link.resize(140, 30);
+    client.wait_for("Hello remote 140x30");
+    client.send(b"\x1b[4;900;1200t");
+    client.wait_for("\x1b[14t");
+    // A reply cut in two still answers it, not typed as keys.
+    client.send(b"\x1b[4;900;14");
+    std::thread::sleep(opentui::input::ESCAPE_TIMEOUT * 3);
+    client.send(b"00t");
+    client.wait_for("s=160,v=240,");
+    assert!(!client.text().contains("s=137,v=240,"), "{:?}", client.text());
     client.send(b"q");
     client.finish().expect("the app thread").expect("the app");
 }

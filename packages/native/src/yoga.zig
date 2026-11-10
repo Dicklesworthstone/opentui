@@ -61,6 +61,7 @@ pub const YogaEnumKind = enum(u32) {
     overflow = api.OT_STYLE_ENUM_OVERFLOW,
     display = api.OT_STYLE_ENUM_DISPLAY,
     box_sizing = api.OT_STYLE_ENUM_BOX_SIZING,
+    layout_mode = api.OT_STYLE_ENUM_LAYOUT_MODE,
 };
 
 pub const YogaFloatKind = enum(u32) {
@@ -1057,7 +1058,7 @@ pub fn yogaNodeInvalidateMeasure(node: YGNodeRef) void {
     if (!getContext(node).?.poisoned) c.otYogaNodeInvalidateMeasure(node);
 }
 
-/// Drops cached sizes without marking the node or its ancestors dirty.
+/// Drops the cached sizes of the node and its ancestors without marking them dirty.
 pub fn yogaNodeForgetMeasurements(node: YGNodeRef) void {
     if (!getContext(node).?.poisoned) c.otYogaNodeForgetMeasurements(node);
 }
@@ -1112,6 +1113,9 @@ pub const testFailAfter = c.otYogaTestFailAfter;
 pub const testAllocationCount = c.otYogaTestAllocationCount;
 pub const testContentsChildCount = c.otYogaTestContentsChildCount;
 pub const testLogMessage = c.otYogaTestLogMessage;
+pub const testTakeRoundedNodes = c.otYogaTestTakeRoundedNodes;
+pub const testTakeListVisits = c.otYogaTestTakeListVisits;
+pub const testSetListMemo = c.otYogaTestSetListMemo;
 pub const testCacheMeasurement = c.otYogaTestCacheMeasurement;
 pub const testLargerHeightCap = c.otYogaTestLargerHeightCap;
 pub const TestCacheAxis = c.OTYogaCacheAxis;

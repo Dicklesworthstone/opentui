@@ -37,7 +37,8 @@ impl Default for SessionOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Remote {
     /// Detect remote sessions, such as SSH, and take only the color depth from forwarded hints for them: a `TERM`
-    /// containing `256color`, and a `COLORTERM` of `truecolor` or `24bit`.
+    /// containing `256color`, a `COLORTERM` of `truecolor` or `24bit` (ignored inside GNU screen, which gets 256
+    /// colors), and `OPENTUI_FORCE_TRUECOLOR` of `1` or `true`, which forces 24-bit color.
     #[default]
     Auto,
     Local,
@@ -1010,6 +1011,15 @@ impl Session {
     pub fn resize(&self, width: u32, height: u32) -> Result<()> {
         let (context, session) = self.raw();
         check("ot_session_resize_renderer", unsafe { sys::ot_session_resize_renderer(context, session, width, height) })
+    }
+
+    /// Sets the terminal's size in cells and in pixels, which images use to size their pixels and cells. All four are
+    /// positive, or all zero to forget the size.
+    pub fn set_image_resolution(&self, columns: u32, rows: u32, pixel_width: u32, pixel_height: u32) -> Result<()> {
+        let (context, session) = self.raw();
+        check("ot_session_set_image_resolution", unsafe {
+            sys::ot_session_set_image_resolution(context, session, columns, rows, pixel_width, pixel_height)
+        })
     }
 
     pub fn renderer_state(&self) -> Result<RendererState> {

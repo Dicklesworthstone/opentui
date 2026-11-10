@@ -5,7 +5,7 @@ use core::ffi::c_void;
 
 /// FNV-1a 64-bit hash of the `opentui.h` these declarations were generated from.
 /// The build script rejects native artifacts whose header has a different hash.
-pub const OPENTUI_HEADER_FNV1A64: u64 = 0x8d5bb00a3849e3fb;
+pub const OPENTUI_HEADER_FNV1A64: u64 = 0x6c8ca2888fec70e0;
 
 pub type ot_status = i32;
 
@@ -93,6 +93,7 @@ pub const OT_STYLE_ENUM_FLEX_WRAP: u32 = 7;
 pub const OT_STYLE_ENUM_OVERFLOW: u32 = 8;
 pub const OT_STYLE_ENUM_DISPLAY: u32 = 9;
 pub const OT_STYLE_ENUM_BOX_SIZING: u32 = 10;
+pub const OT_STYLE_ENUM_LAYOUT_MODE: u32 = 11;
 pub const OT_STYLE_FLOAT_FLEX: u32 = 0;
 pub const OT_STYLE_FLOAT_FLEX_GROW: u32 = 1;
 pub const OT_STYLE_FLOAT_FLEX_SHRINK: u32 = 2;
@@ -162,6 +163,8 @@ pub const OT_DISPLAY_FLEX: u32 = 0;
 pub const OT_DISPLAY_NONE: u32 = 1;
 pub const OT_BOX_SIZING_BORDER_BOX: u32 = 0;
 pub const OT_BOX_SIZING_CONTENT_BOX: u32 = 1;
+pub const OT_LAYOUT_MODE_FLEX: u32 = 0;
+pub const OT_LAYOUT_MODE_LIST: u32 = 1;
 pub const OT_STYLE_ENUM_DIRECTION_MAX: u32 = 2;
 pub const OT_STYLE_ENUM_FLEX_DIRECTION_MAX: u32 = 3;
 pub const OT_STYLE_ENUM_JUSTIFY_CONTENT_MAX: u32 = 5;
@@ -173,6 +176,7 @@ pub const OT_STYLE_ENUM_FLEX_WRAP_MAX: u32 = 2;
 pub const OT_STYLE_ENUM_OVERFLOW_MAX: u32 = 2;
 pub const OT_STYLE_ENUM_DISPLAY_MAX: u32 = 1;
 pub const OT_STYLE_ENUM_BOX_SIZING_MAX: u32 = 1;
+pub const OT_STYLE_ENUM_LAYOUT_MODE_MAX: u32 = 1;
 pub const OT_MEASURE_UNDEFINED: u32 = 0;
 pub const OT_MEASURE_EXACTLY: u32 = 1;
 pub const OT_MEASURE_AT_MOST: u32 = 2;
@@ -504,6 +508,7 @@ pub const OT_CONTROL_CURSOR: u32 = 8;
 pub const OT_CONTROL_RESET_BACKGROUND: u32 = 9;
 pub const OT_CONTROL_PALETTE_QUERY: u32 = 10;
 pub const OT_CONTROL_PROGRAM_STATUS: u32 = 11;
+pub const OT_CONTROL_END_REPLY_SENTINEL: u32 = 12;
 pub const OT_CURSOR_POSITION: u32 = 1;
 pub const OT_CURSOR_STYLE: u32 = 2;
 pub const OT_CURSOR_BLINKING: u32 = 4;
@@ -664,6 +669,7 @@ pub const OT_INPUT_EXPECT_REPLIES: u32 = 1;
 pub const OT_INPUT_EXPECT_KITTY_KEYBOARD: u32 = 2;
 pub const OT_INPUT_EXPECT_CURSOR_POSITION: u32 = 4;
 pub const OT_INPUT_EXPECT_SENTINEL: u32 = 8;
+pub const OT_INPUT_EXPECT_ESCAPE_PREFIX: u32 = 16;
 pub const OT_INPUT_EVENTS_MIN: u32 = 4;
 pub const OT_INPUT_PAYLOAD_BYTES_MIN: u32 = 4384;
 pub const OT_INPUT_TIMEOUT_NS: u64 = 20000000;

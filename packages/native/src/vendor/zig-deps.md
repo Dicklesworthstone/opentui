@@ -26,7 +26,7 @@ Both ports change only Zig code, and the update script gives both copies the sam
 generated tables do not change.
 The Yoga archive contains only the `yoga` source directory.
 
-The Yoga source is upstream Yoga `main` at commit `41118bd3a` with nine changes, applied in this order:
+The Yoga source is upstream Yoga `main` at commit `41118bd3a` with ten changes, applied in this order:
 
 - `yoga-error-boundary.patch` routes every Yoga allocation, including the Grid style storage, through
   `yoga/OTAllocator.h`, so a test build can inject allocation failures. It also makes style updates, child
@@ -39,18 +39,27 @@ The Yoga source is upstream Yoga `main` at commit `41118bd3a` with nine changes,
 - `yoga-absolute-edge-rounding.patch` adds a config option that rounds each node's position from the same
   absolute edges that Yoga already uses for its size. Upstream rounds the relative position on its own,
   so a child nested under fractional offsets can end one cell outside its parent. With the option, the
-  layout cache also compares available sizes exactly, because a subtree laid out for one fractional size
-  rounds differently at another size, even one within Yoga's 1e-4 tolerance. Each layout also keeps its
+  caches compare sizes exactly, also for measured nodes: at another size, even one within Yoga's 1e-4
+  tolerance, a subtree rounds differently and a text wraps at another cell. Each layout also keeps its
   unrounded left and top position beside the rounded one, as upstream keeps unrounded sizes, and rounding
   starts from the unrounded position and size: a subtree that a cache hit skips then rounds as a fresh one.
-  Only the scene's config in `src/context.zig` sets the option; other configs keep upstream rounding and
-  caching.
+  A baseline adds its child's unrounded top on every config, so a box that a cache hit skips aligns as a
+  fresh one.
+  Rounding then visits only the nodes that the solve laid out, and the subtrees whose parent's unrounded
+  absolute origin moved; it clears the new-layout flag of each node it visits. A move in
+  `src/yoga-bridge.cpp` flags the child's new path, because under `display: none` the moved subtree gets no
+  layout pass. A test build checks on every solve that each skipped subtree already holds the values a full
+  pass would write (except a `display: contents` node's own box, which the scene does not have). Clearing
+  the flags turns off upstream's zero-out skip for `display: none` subtrees: each layout of their parent
+  zeroes and rounds them again, which costs less than the skip's compare. Only the scene's config in
+  `src/context.zig` sets the option; other configs keep upstream rounding and caching.
 - `yoga-finite-percent.patch` clamps a resolved percentage to ±1e30 in each of Yoga's three percent
   resolve paths, so a deep percentage chain cannot overflow f32 and stop layout on an indefinite available
   size.
 - `yoga-measure-height-cap.patch` lets a node mark its measure function as one that uses an "at most"
   height only to clamp its result. Where Yoga would call such a function again because the cap grew,
-  it takes a cached size that was below the old cap at the same width, and stores it as a call's
+  it takes a cached size that was below the old cap at the same width. Under the scene's config, whose
+  cache compares exactly, it uses that entry as a cache hit. Otherwise it stores the size as a call's
   result, so later cache decisions are the same as without the patch. A node with a percent margin,
   padding, or minimum or maximum size keeps calling: this reuse does not compare the entry's owner size.
   The native text and editor measures set the mark; host measures do not.
@@ -67,6 +76,22 @@ The Yoga source is upstream Yoga `main` at commit `41118bd3a` with nine changes,
   percent padding. Yoga's flex steps resolve those against the parent's owner size, so the parent's layout
   depends on it. It checks only the axes whose owner size changed, and a hit at another owner size moves
   the entry to that size, so the next frame does not check again.
+- `yoga-list-layout.patch` adds a list mode to a node. A list box stacks its in-flow children top to bottom
+  with the steps flex takes for a child that does not flex in one column, in place of flex's STEPs 3 to 7,
+  and then runs flex's STEPs 9 to 11. Children never grow or shrink; the box's flex direction, wrap, and
+  justification, a child's flex basis, and vertical auto margins do not apply; children's percent
+  heights and vertical insets, and a percent gap without a definite height, resolve against an
+  indefinite height; and a child whose minimum size exceeds its maximum may take the other bound.
+  Children get no height cap: they lay out as in a flex column with overflow: scroll, so, for example,
+  percent heights and percent minimum and maximum heights inside a child resolve against no height, and
+  a box child of a 0-high list keeps its content's height. Elsewhere the result equals that of a flex
+  column with overflow: scroll. The mode's setter marks the node dirty. `src/yoga-bridge.cpp` sets the
+  mode only on configs that round from absolute edges, which only the scene's config does. A list keeps
+  each child's sizes for the inputs of up to one layout pass and three measure passes, and a pass
+  reuses them for a child that is not dirty instead of laying it out again: it moves such a child only
+  along the list, and only when an earlier child's size changed. A static child is laid out again in
+  each layout pass, as STEP 11 reads its size. A child's layout reset, a forgotten measurement, or a
+  change to the list's style or config resets the kept sizes.
 
 `src/tests/yoga_test.zig` tests each change.
 

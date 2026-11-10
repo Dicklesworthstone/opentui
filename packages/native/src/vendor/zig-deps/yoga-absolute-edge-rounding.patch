@@ -23,11 +23,67 @@ index 8b0873a5..38d17ea6 100644
  
        hasNewLayout = layoutAbsoluteDescendants(
                           containingNode,
+diff --git a/yoga/algorithm/Baseline.cpp b/yoga/algorithm/Baseline.cpp
+index b3002012..999abde7 100644
+--- a/yoga/algorithm/Baseline.cpp
++++ b/yoga/algorithm/Baseline.cpp
+@@ -55,7 +55,8 @@ float calculateBaseline(const yoga::Node* node) {
+   }
+ 
+   const float baseline = calculateBaseline(baselineChild);
+-  return baseline + baselineChild->getLayout().position(PhysicalEdge::Top);
++  // OpenTUI: a cached child holds a rounded top; add the unrounded one.
++  return baseline + baselineChild->getLayout().rawPosition(PhysicalEdge::Top);
+ }
+ 
+ bool isBaselineLayout(const yoga::Node* node) {
 diff --git a/yoga/algorithm/Cache.cpp b/yoga/algorithm/Cache.cpp
-index 130fe0d3..e62f4067 100644
+index 130fe0d3..c11750f0 100644
 --- a/yoga/algorithm/Cache.cpp
 +++ b/yoga/algorithm/Cache.cpp
-@@ -63,7 +63,10 @@ bool canUseCachedMeasurement(
+@@ -14,19 +14,21 @@ namespace facebook::yoga {
+ static inline bool sizeIsExactAndMatchesOldMeasuredSize(
+     SizingMode sizeMode,
+     float size,
+-    float lastComputedSize) {
++    float lastComputedSize,
++    const yoga::Config* config) {
+   return sizeMode == SizingMode::StretchFit &&
+-      yoga::inexactEquals(size, lastComputedSize);
++      sizesMatch(size, lastComputedSize, config);
+ }
+ 
+ static inline bool oldSizeIsMaxContentAndStillFits(
+     SizingMode sizeMode,
+     float size,
+     SizingMode lastSizeMode,
+-    float lastComputedSize) {
++    float lastComputedSize,
++    const yoga::Config* config) {
+   return sizeMode == SizingMode::FitContent &&
+       lastSizeMode == SizingMode::MaxContent &&
+-      (size >= lastComputedSize || yoga::inexactEquals(size, lastComputedSize));
++      (size >= lastComputedSize || sizesMatch(size, lastComputedSize, config));
+ }
+ 
+ static inline bool newSizeIsStricterAndStillValid(
+@@ -34,12 +36,13 @@ static inline bool newSizeIsStricterAndStillValid(
+     float size,
+     SizingMode lastSizeMode,
+     float lastSize,
+-    float lastComputedSize) {
++    float lastComputedSize,
++    const yoga::Config* config) {
+   return lastSizeMode == SizingMode::FitContent &&
+       sizeMode == SizingMode::FitContent && yoga::isDefined(lastSize) &&
+       yoga::isDefined(size) && yoga::isDefined(lastComputedSize) &&
+       lastSize > size &&
+-      (lastComputedSize <= size || yoga::inexactEquals(size, lastComputedSize));
++      (lastComputedSize <= size || sizesMatch(size, lastComputedSize, config));
+ }
+ 
+ bool canUseCachedMeasurement(
+@@ -63,7 +66,10 @@ bool canUseCachedMeasurement(
  
    const float pointScaleFactor = config->getPointScaleFactor();
  
@@ -39,32 +95,98 @@ index 130fe0d3..e62f4067 100644
    bool hasSameWidthSpec = false;
    if (lastWidthMode == widthMode) {
      const float effectiveWidth = useRoundedComparison
-diff --git a/yoga/algorithm/CalculateLayout.cpp b/yoga/algorithm/CalculateLayout.cpp
-index 30ec5db6..9762ca4b 100644
---- a/yoga/algorithm/CalculateLayout.cpp
-+++ b/yoga/algorithm/CalculateLayout.cpp
-@@ -2752,6 +2752,20 @@ static bool isCachedForOwnerSize(
-        yoga::inexactEquals(cachedMeasurement.ownerHeight, ownerHeight));
- }
+@@ -73,24 +79,26 @@ bool canUseCachedMeasurement(
+         ? roundValueToPixelGrid(
+               lastAvailableWidth, pointScaleFactor, false, false)
+         : lastAvailableWidth;
+-    hasSameWidthSpec = yoga::inexactEquals(effectiveLastWidth, effectiveWidth);
++    hasSameWidthSpec = sizesMatch(effectiveLastWidth, effectiveWidth, config);
+   }
  
-+// OpenTUI: with absolute-edge rounding, a subtree laid out for one size can
-+// round differently at a size within 1e-4 of it, so the cache of nodes without
-+// a measure function compares exactly.
-+static bool hasSameAvailableSize(
-+    const yoga::Node* const node,
-+    const float cachedSize,
-+    const float availableSize) {
-+  if (!node->getConfig()->roundsPositionsFromAbsoluteEdges()) {
-+    return yoga::inexactEquals(cachedSize, availableSize);
+   const bool widthIsCompatible =
+       hasSameWidthSpec ||
+       sizeIsExactAndMatchesOldMeasuredSize(
+-          widthMode, availableWidth - marginRow, lastComputedWidth) ||
++          widthMode, availableWidth - marginRow, lastComputedWidth, config) ||
+       oldSizeIsMaxContentAndStillFits(
+           widthMode,
+           availableWidth - marginRow,
+           lastWidthMode,
+-          lastComputedWidth) ||
++          lastComputedWidth,
++          config) ||
+       newSizeIsStricterAndStillValid(
+           widthMode,
+           availableWidth - marginRow,
+           lastWidthMode,
+           lastAvailableWidth,
+-          lastComputedWidth);
++          lastComputedWidth,
++          config);
+ 
+   if (!widthIsCompatible) {
+     return false;
+@@ -105,23 +113,26 @@ bool canUseCachedMeasurement(
+         ? roundValueToPixelGrid(
+               lastAvailableHeight, pointScaleFactor, false, false)
+         : lastAvailableHeight;
+-    hasSameHeightSpec = yoga::inexactEquals(effectiveLastHeight, effectiveHeight);
++    hasSameHeightSpec = sizesMatch(effectiveLastHeight, effectiveHeight, config);
+   }
+ 
+   const bool heightIsCompatible = hasSameHeightSpec ||
+       sizeIsExactAndMatchesOldMeasuredSize(
+                                       heightMode,
+                                       availableHeight - marginColumn,
+-                                      lastComputedHeight) ||
++                                      lastComputedHeight,
++                                      config) ||
+       oldSizeIsMaxContentAndStillFits(heightMode,
+                                       availableHeight - marginColumn,
+                                       lastHeightMode,
+-                                      lastComputedHeight) ||
++                                      lastComputedHeight,
++                                      config) ||
+       newSizeIsStricterAndStillValid(heightMode,
+                                      availableHeight - marginColumn,
+                                      lastHeightMode,
+                                      lastAvailableHeight,
+-                                     lastComputedHeight);
++                                     lastComputedHeight,
++                                     config);
+ 
+   return heightIsCompatible;
+ }
+diff --git a/yoga/algorithm/Cache.h b/yoga/algorithm/Cache.h
+index f8857eaf..f9f257ae 100644
+--- a/yoga/algorithm/Cache.h
++++ b/yoga/algorithm/Cache.h
+@@ -9,9 +9,20 @@
+ 
+ #include <yoga/algorithm/SizingMode.h>
+ #include <yoga/config/Config.h>
++#include <yoga/numeric/Comparison.h>
+ 
+ namespace facebook::yoga {
+ 
++// OpenTUI: with absolute-edge rounding, sizes match only exactly: at a size
++// within 1e-4 of another, a subtree can round differently and a measured text
++// can wrap at another cell.
++inline bool sizesMatch(float a, float b, const yoga::Config* config) {
++  if (!config->roundsPositionsFromAbsoluteEdges()) {
++    return yoga::inexactEquals(a, b);
 +  }
-+  return cachedSize == availableSize ||
-+      (yoga::isUndefined(cachedSize) && yoga::isUndefined(availableSize));
++  return a == b || (yoga::isUndefined(a) && yoga::isUndefined(b));
 +}
 +
- bool calculateLayoutInternal(
-     yoga::Node* const node,
-     const float availableWidth,
-@@ -2847,10 +2861,10 @@ bool calculateLayoutInternal(
+ bool canUseCachedMeasurement(
+     SizingMode widthMode,
+     float availableWidth,
+diff --git a/yoga/algorithm/CalculateLayout.cpp b/yoga/algorithm/CalculateLayout.cpp
+index 30ec5db6..b82aa3ed 100644
+--- a/yoga/algorithm/CalculateLayout.cpp
++++ b/yoga/algorithm/CalculateLayout.cpp
+@@ -2847,10 +2847,10 @@ bool calculateLayoutInternal(
        }
      }
    } else if (performLayout) {
@@ -72,14 +194,14 @@ index 30ec5db6..9762ca4b 100644
 -            layout->cachedLayout.availableWidth, availableWidth) &&
 -        yoga::inexactEquals(
 -            layout->cachedLayout.availableHeight, availableHeight) &&
-+    if (hasSameAvailableSize(
-+            node, layout->cachedLayout.availableWidth, availableWidth) &&
-+        hasSameAvailableSize(
-+            node, layout->cachedLayout.availableHeight, availableHeight) &&
++    if (sizesMatch(
++            layout->cachedLayout.availableWidth, availableWidth, node->getConfig()) &&
++        sizesMatch(
++            layout->cachedLayout.availableHeight, availableHeight, node->getConfig()) &&
          layout->cachedLayout.widthSizingMode == widthSizingMode &&
          layout->cachedLayout.heightSizingMode == heightSizingMode &&
          isCachedForOwnerSize(
-@@ -2859,10 +2873,12 @@ bool calculateLayoutInternal(
+@@ -2859,10 +2859,14 @@ bool calculateLayoutInternal(
      }
    } else {
      for (uint32_t i = 0; i < layout->nextCachedMeasurementsIndex; i++) {
@@ -87,20 +209,103 @@ index 30ec5db6..9762ca4b 100644
 -              layout->cachedMeasurements[i].availableWidth, availableWidth) &&
 -          yoga::inexactEquals(
 -              layout->cachedMeasurements[i].availableHeight, availableHeight) &&
-+      if (hasSameAvailableSize(
-+              node, layout->cachedMeasurements[i].availableWidth, availableWidth) &&
-+          hasSameAvailableSize(
-+              node,
++      if (sizesMatch(
++              layout->cachedMeasurements[i].availableWidth,
++              availableWidth,
++              node->getConfig()) &&
++          sizesMatch(
 +              layout->cachedMeasurements[i].availableHeight,
-+              availableHeight) &&
++              availableHeight,
++              node->getConfig()) &&
            layout->cachedMeasurements[i].widthSizingMode == widthSizingMode &&
            layout->cachedMeasurements[i].heightSizingMode == heightSizingMode &&
            isCachedForOwnerSize(
 diff --git a/yoga/algorithm/PixelGrid.cpp b/yoga/algorithm/PixelGrid.cpp
-index 997e96f6..9517b461 100644
+index 997e96f6..2fc03bd1 100644
 --- a/yoga/algorithm/PixelGrid.cpp
 +++ b/yoga/algorithm/PixelGrid.cpp
-@@ -94,11 +94,22 @@ void roundLayoutResultsToPixelGrid(
+@@ -11,6 +11,12 @@
+ #include <yoga/numeric/Comparison.h>
+ 
+ #include <cmath>
++#ifdef OT_YOGA_TEST_ALLOCATOR
++#include <cstdio>
++#include <cstdlib>
++#include <tuple>
++#include <vector>
++#endif
+ 
+ namespace facebook::yoga {
+ 
+@@ -76,6 +82,67 @@ double roundValueToPixelGridDouble(
+       : scaledValue / pointScaleFactor;
+ }
+ 
++#ifdef OT_YOGA_TEST_ALLOCATOR
++// OpenTUI: makes the next pass round every node, for the check below.
++thread_local bool testRoundAll = false;
++
++void saveSubtree(
++    yoga::Node* node,
++    std::vector<std::tuple<yoga::Node*, LayoutResults, bool>>& saved) {
++  saved.emplace_back(node, node->getLayout(), node->getHasNewLayout());
++  for (yoga::Node* child : node->getChildren()) {
++    if (child->getOwner() == node) {
++      saveSubtree(child, saved);
++    }
++  }
++}
++
++bool sameValue(float a, float b) {
++  return a == b || (std::isnan(a) && std::isnan(b));
++}
++
++// OpenTUI: aborts unless a full pass over a skipped subtree writes back the
++// values it holds, then restores the subtree as the full pass found it. A
++// display: contents node's own box is not checked: a measure-only pass zeroes
++// it without a flag, and only a non-finite origin rounds zeros to other values.
++// The scene has no display: contents nodes.
++void checkSkippedSubtree(
++    yoga::Node* node,
++    double absoluteLeft,
++    double absoluteTop) {
++  std::vector<std::tuple<yoga::Node*, LayoutResults, bool>> saved;
++  saveSubtree(node, saved);
++  const uint32_t rounds = testPixelGridRoundCount;
++  const uint32_t nodes = testPixelGridNodeCount;
++  testRoundAll = true;
++  roundLayoutResultsToPixelGrid(node, absoluteLeft, absoluteTop);
++  testRoundAll = false;
++  testPixelGridRoundCount = rounds;
++  testPixelGridNodeCount = nodes;
++  for (auto& [savedNode, layout, hasNewLayout] : saved) {
++    const auto& rounded = savedNode->getLayout();
++    if (savedNode->style().display() != Display::Contents &&
++        !(sameValue(
++              rounded.position(PhysicalEdge::Left),
++              layout.position(PhysicalEdge::Left)) &&
++          sameValue(
++              rounded.position(PhysicalEdge::Top),
++              layout.position(PhysicalEdge::Top)) &&
++          sameValue(
++              rounded.dimension(Dimension::Width),
++              layout.dimension(Dimension::Width)) &&
++          sameValue(
++              rounded.dimension(Dimension::Height),
++              layout.dimension(Dimension::Height)))) {
++      std::fprintf(stderr, "Yoga: a skipped subtree rounds differently\n");
++      std::abort();
++    }
++    savedNode->setLayout(layout);
++    savedNode->setHasNewLayout(hasNewLayout);
++  }
++}
++#endif
++
+ } // namespace
+ 
+ float roundValueToPixelGrid(
+@@ -94,11 +161,22 @@ void roundLayoutResultsToPixelGrid(
    const auto pointScaleFactor =
        static_cast<double>(node->getConfig()->getPointScaleFactor());
  
@@ -127,7 +332,7 @@ index 997e96f6..9517b461 100644
  
    const double absoluteNodeLeft = absoluteLeft + nodeLeft;
    const double absoluteNodeTop = absoluteTop + nodeTop;
-@@ -111,13 +122,27 @@ void roundLayoutResultsToPixelGrid(
+@@ -111,13 +189,27 @@ void roundLayoutResultsToPixelGrid(
      // size as this could lead to unwanted text truncation.
      const bool textRounding = node->getNodeType() == NodeType::Text;
  
@@ -161,6 +366,54 @@ index 997e96f6..9517b461 100644
  
      // We multiply dimension by scale factor and if the result is close to the
      // whole number, we don't have any fraction To verify if the result is close
+@@ -161,10 +253,34 @@ void roundLayoutResultsToPixelGrid(
+                       absoluteNodeTop, pointScaleFactor, false, textRounding)));
+   }
+ 
++  // OpenTUI: opted-in configs clear the flag of each node they round, and round
++  // a child again only if the solve laid it out or this node's unrounded origin
++  // moved. Rounding is a function of the two, so a skipped subtree already
++  // holds what this pass would write; test builds check that. Clearing flags
++  // turns off upstream's zero-out skip for display: none subtrees (see
++  // zeroOutLayoutRecursively): each layout of their parent zeroes and rounds
++  // them again, which costs less than the skip's compare.
++  bool roundAll = true;
++  if (absoluteEdges) {
++    node->setHasNewLayout(false);
++    auto& origin = node->getLayout().roundedOrigin;
++    roundAll = origin[0] != absoluteNodeLeft || origin[1] != absoluteNodeTop;
++    origin = {{absoluteNodeLeft, absoluteNodeTop}};
++#ifdef OT_YOGA_TEST_ALLOCATOR
++    ++testPixelGridNodeCount;
++    roundAll = roundAll || testRoundAll;
++#endif
++  }
+   for (yoga::Node* child : node->getChildren()) {
+     if (child->getOwner() != node) {
+       continue;
+     }
++    if (!roundAll && !child->getHasNewLayout()) {
++#ifdef OT_YOGA_TEST_ALLOCATOR
++      checkSkippedSubtree(child, absoluteNodeLeft, absoluteNodeTop);
++#endif
++      continue;
++    }
+     roundLayoutResultsToPixelGrid(child, absoluteNodeLeft, absoluteNodeTop);
+   }
+ }
+diff --git a/yoga/algorithm/PixelGrid.h b/yoga/algorithm/PixelGrid.h
+index 1baa1b3a..9fee0ab1 100644
+--- a/yoga/algorithm/PixelGrid.h
++++ b/yoga/algorithm/PixelGrid.h
+@@ -14,6 +14,8 @@ namespace facebook::yoga {
+ 
+ #ifdef OT_YOGA_TEST_ALLOCATOR
+ inline thread_local uint32_t testPixelGridRoundCount = 0;
++// OpenTUI: nodes that absolute-edge rounding visited.
++inline thread_local uint32_t testPixelGridNodeCount = 0;
+ #endif
+ 
+ // Round a point value to the nearest physical pixel based on DPI
 diff --git a/yoga/config/Config.h b/yoga/config/Config.h
 index 95f63e87..ed0a5715 100644
 --- a/yoga/config/Config.h
@@ -190,10 +443,21 @@ index 95f63e87..ed0a5715 100644
    uint32_t version_ = 0;
    ExperimentalFeatureSet experimentalFeatures_{};
 diff --git a/yoga/node/LayoutResults.h b/yoga/node/LayoutResults.h
-index 5a0111eb..7ce3ecdc 100644
+index 5a0111eb..9dab7278 100644
 --- a/yoga/node/LayoutResults.h
 +++ b/yoga/node/LayoutResults.h
-@@ -103,6 +103,19 @@ struct LayoutResults {
+@@ -55,6 +55,10 @@ struct LayoutResults {
+ 
+   CachedMeasurement cachedLayout{};
+ 
++  // OpenTUI: the unrounded absolute origin that pixel-grid rounding last passed
++  // to this node's children; NaN before the first pass and after a reset.
++  std::array<double, 2> roundedOrigin = {{YGUndefined, YGUndefined}};
++
+   Direction direction() const {
+     return direction_;
+   }
+@@ -103,6 +107,19 @@ struct LayoutResults {
      position_[yoga::to_underlying(physicalEdge)] = dimension;
    }
  
@@ -213,7 +477,7 @@ index 5a0111eb..7ce3ecdc 100644
    float margin(PhysicalEdge physicalEdge) const {
      return margin_[yoga::to_underlying(physicalEdge)];
    }
-@@ -137,6 +150,7 @@ struct LayoutResults {
+@@ -137,6 +154,7 @@ struct LayoutResults {
    std::array<float, 2> measuredDimensions_ = {{YGUndefined, YGUndefined}};
    std::array<float, 2> rawDimensions_ = {{YGUndefined, YGUndefined}};
    std::array<float, 4> position_ = {};

@@ -12,8 +12,8 @@
 //!   [`Slider`](widget::Slider), [`ScrollBox`](widget::ScrollBox), [`Table`](widget::Table),
 //!   [`TextTable`](widget::TextTable), [`Code`](widget::Code), [`LineNumbers`](widget::LineNumbers),
 //!   [`Diff`](widget::Diff), [`Markdown`](widget::Markdown), [`TerminalView`](widget::TerminalView),
-//!   [`ImageView`](widget::ImageView), [`FrameBuffer`](widget::FrameBuffer), and [`Custom`](widget::Custom) for your
-//!   own.
+//!   [`ImageView`](widget::ImageView), [`VideoView`](widget::VideoView), [`FrameBuffer`](widget::FrameBuffer), and
+//!   [`Custom`](widget::Custom) for your own.
 //! - [`post`] has post-processing: color matrices, filters, and animated effects for a widget's area or the screen.
 //! - [`pty`] runs programs on pseudo-terminals, for a [`TerminalView`](widget::TerminalView) or on their own.
 //! - [`testing`] runs apps without a terminal for tests.
@@ -73,7 +73,9 @@ pub mod prelude {
     pub use crate::input::{
         Event, KeyCode, KeyEvent, Keymap, Modifiers, MouseButton, MouseEvent, MouseEventKind, Shortcut,
     };
-    pub use crate::layout::{Align, Edge, FlexDirection, Justify, Length, Overflow, PositionType, Rect, Wrap};
+    pub use crate::layout::{
+        Align, Edge, FlexDirection, Justify, LayoutMode, Length, Overflow, PositionType, Rect, Wrap,
+    };
     pub use crate::native::{MousePointer, SelectionColors, WrapMode};
     pub use crate::post::{Channels, ColorMatrix, Filter, Surface};
     pub use crate::style::{Alignment, Attributes, BorderStyle, Color, Sides, Span, Style, Stylize};
@@ -82,7 +84,7 @@ pub mod prelude {
         AnyWidget, Code, Column, ColumnWidth, Component, Container, Content, Custom, Diff, DiffView, EditorAction,
         ExtmarkOptions, FrameBuffer, ImageView, Input, LineNumbers, Markdown, Painter, ScrollAction, ScrollBox, Select,
         SelectAction, SelectOption, Slider, SliderAction, TabSelect, TabSelectAction, Table, TableAction, TerminalView,
-        Text, TextTable, Textarea, View, Widget,
+        Text, TextTable, Textarea, VideoEvent, VideoView, View, Widget,
     };
     pub use crate::{Error, Result};
 }
