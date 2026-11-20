@@ -22,9 +22,12 @@ pub fn ot_text_buffer_create(context: ?*Owner, options: ?*const c.ot_edit_buffer
     if (status != c.OT_OK) return status;
     const owner = context.?;
     const value = record(c.ot_edit_buffer_options, options) catch |err| return fail(owner, err);
-    if (out == null or value.reserved != 0) return fail(owner, error.InvalidOptions);
+    if (out == null) return fail(owner, error.InvalidOptions);
     const width_method = abi.widthMethodFromC(value.width_method) catch |err| return fail(owner, err);
-    out.?.* = abi.handleToC(owner.core.createTextBuffer(width_method) catch |err| return fail(owner, err));
+    const follow = abi.followSessionWidth(value.*) catch |err| return fail(owner, err);
+    const handle = owner.core.createTextBuffer(width_method) catch |err| return fail(owner, err);
+    (owner.core.raw().getTextBuffer(handle) catch unreachable).follow_width = follow;
+    out.?.* = abi.handleToC(handle);
     return c.OT_OK;
 }
 
@@ -186,11 +189,28 @@ pub fn ot_text_buffer_set_tab_width(context: ?*Owner, id: ?*const c.ot_handle, w
     return c.OT_OK;
 }
 
+pub fn ot_text_buffer_set_width_method(context: ?*Owner, id: ?*const c.ot_handle, width_method: u32) callconv(.c) c.ot_status {
+    const owner = admit(context, false) catch |err| return fail(context, err);
+    if (id == null) return fail(owner, error.InvalidOptions);
+    const method = abi.widthMethodFromC(width_method) catch |err| return fail(owner, err);
+    owner.core.textBufferSetWidthMethod(abi.handleFromC(id.?.*), method) catch |err| return fail(owner, err);
+    return c.OT_OK;
+}
+
 pub fn ot_text_buffer_highlight(context: ?*Owner, id: ?*const c.ot_handle, operation: u32, argument: u32, highlight: ?*const c.ot_edit_highlight) callconv(.c) c.ot_status {
     const owner = admit(context, false) catch |err| return fail(context, err);
     if (id == null) return fail(owner, error.InvalidOptions);
     const decoded = editor.highlightFromC(operation, argument, highlight) catch |err| return fail(owner, err);
     owner.core.textBufferHighlight(abi.handleFromC(id.?.*), decoded) catch |err| return fail(owner, err);
+    return c.OT_OK;
+}
+
+pub fn ot_text_buffer_set_layer(context: ?*Owner, id: ?*const c.ot_handle, layer_id: u32, start_byte: u32, end_byte: u32, runs: ?[*]const c.ot_highlight_run, run_count: u32) callconv(.c) c.ot_status {
+    const owner = admit(context, false) catch |err| return fail(context, err);
+    const value = text(owner, id) catch |err| return fail(owner, err);
+    const decoded = editor.layerRunsFromC(owner, runs, run_count, value.buffer.getByteSize()) catch |err| return fail(owner, err);
+    defer owner.core.allocator.free(decoded);
+    owner.core.textBufferSetLayer(abi.handleFromC(id.?.*), .{ .layer_id = layer_id, .start_byte = start_byte, .end_byte = end_byte, .runs = decoded }) catch |err| return fail(owner, err);
     return c.OT_OK;
 }
 
@@ -660,7 +680,8 @@ test "Context shared text batch rejects every allocation failure including the f
         rejected += 1;
     }
     try std.testing.expect(completed);
-    try std.testing.expect(rejected > 20);
+    // Styled text builds no span lists of its own, so the batch has 19 allocation points.
+    try std.testing.expect(rejected > 16);
 }
 
 test "Context shared text batch validates identities limits admission and attached styles" {
@@ -746,6 +767,64 @@ test "Context shared text batch validates identities limits admission and attach
         try std.testing.expectEqual(@as(u32, 0), info.byte_count);
     }
     try std.testing.expectEqual(c.OT_OK, ot_text_buffer_replace_styled_batch(&owner, null, 0, null, 0, null, 0, null, 0, null));
+}
+
+test "Context shared text width method change keeps styled runs on their characters" {
+    var owner: Owner = .{ .gpa = .init, .io_threaded = .init_single_threaded, .core = undefined, .owner_thread = std.Thread.getCurrentId() };
+    defer owner.io_threaded.deinit();
+    owner.core = try ctx.Context.init(std.testing.allocator, owner.io_threaded.io(), .{});
+    defer owner.core.deinit() catch unreachable;
+    const ansi = @import("ansi.zig");
+    const colors = [_]ansi.RGBA{ ansi.rgbaFromFloats(1, 0, 0, 1), ansi.rgbaFromFloats(0, 1, 0, 1), ansi.rgbaFromFloats(0, 0, 1, 1) };
+    const chunks = [_]ctx.StyledTextChunk{ .{ .byte_count = 8, .foreground = colors[0] }, .{ .byte_count = 2, .foreground = colors[1] }, .{ .byte_count = 2, .foreground = colors[2] } };
+    for ([_][2]@import("utf8.zig").WidthMethod{ .{ .unicode, .wcwidth }, .{ .wcwidth, .unicode } }) |pair| {
+        errdefer std.debug.print("from={t} to={t}\n", .{ pair[0], pair[1] });
+        // Re-measured from pair[0], and made with pair[1]: drawn as a table draws its cells, the same colors per cell.
+        var painted: [2][10]ansi.RGBA = undefined;
+        for (pair, 0..) |method, row| {
+            const handle = try owner.core.createTextBuffer(method);
+            try owner.core.textBufferSetStyledText(handle, "\u{1f44d}\u{1f3fd}ABCD", &chunks);
+            const text_view = try owner.core.createTextBufferView(handle);
+            const target = try @import("buffer.zig").OptimizedBuffer.init(std.testing.allocator, 10, 1, .{ .pool = &owner.core.graphemes, .link_pool = &owner.core.links, .width_method = pair[1] });
+            defer target.deinit();
+            const measured = (try owner.core.raw().getTextBufferView(text_view)).view;
+            measured.setWrapMode(.word);
+            if (row == 0) {
+                _ = try measured.measureForDimensions(0, 100);
+                try owner.core.drawTextViewOn(target, text_view, 0, 0);
+                try owner.core.textBufferSetWidthMethod(handle, pair[1]);
+            }
+            _ = try measured.measureForDimensions(0, 100);
+            target.clear(ansi.rgbaFromFloats(0, 0, 0, 1), 32);
+            try owner.core.drawTextViewOn(target, text_view, 0, 0);
+            for (&painted[row], 0..) |*cell, x| cell.* = target.get(@intCast(x), 0).?.fg;
+        }
+        try std.testing.expectEqualSlices(ansi.RGBA, &painted[1], &painted[0]);
+    }
+}
+
+test "Context shared text ABI rejects width methods that NO_ZWJ is on either side of" {
+    var owner: Owner = .{ .gpa = .init, .io_threaded = .init_single_threaded, .core = undefined, .owner_thread = std.Thread.getCurrentId() };
+    defer owner.io_threaded.deinit();
+    owner.core = try ctx.Context.init(std.testing.allocator, owner.io_threaded.io(), .{});
+    defer owner.core.deinit() catch unreachable;
+    const bytes = "\u{1f469}\u{200d}\u{1f4bb}ab";
+    for ([_][2]u32{ .{ c.OT_WIDTH_METHOD_NO_ZWJ, c.OT_WIDTH_METHOD_UNICODE }, .{ c.OT_WIDTH_METHOD_UNICODE, c.OT_WIDTH_METHOD_NO_ZWJ } }) |ends| {
+        const options: c.ot_edit_buffer_options = .{ .struct_size = @sizeOf(c.ot_edit_buffer_options), .abi_version = c.OT_CONTEXT_ABI_VERSION, .width_method = ends[0] };
+        var text_id: c.ot_handle = undefined;
+        try std.testing.expectEqual(c.OT_OK, ot_text_buffer_create(&owner, &options, &text_id));
+        try std.testing.expectEqual(c.OT_OK, ot_text_buffer_set_text(&owner, &text_id, bytes, bytes.len));
+        const shared = try owner.core.raw().getTextBuffer(abi.handleFromC(text_id));
+        const selected = try owner.core.raw().getTextBufferView(try owner.core.createTextBufferView(abi.handleFromC(text_id)));
+        selected.view.setSelection(1, shared.buffer.lineWidthAt(0), null, null);
+        const before = .{ shared.buffer.widthMethod(), shared.buffer.lineWidthAt(0), selected.view.getSelection() };
+        try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_text_buffer_set_width_method(&owner, &text_id, ends[1]));
+        try std.testing.expectEqualDeep(before, .{ shared.buffer.widthMethod(), shared.buffer.lineWidthAt(0), selected.view.getSelection() });
+    }
+    // Other methods re-measure.
+    const text_id = abi.handleToC(try owner.core.createTextBuffer(.unicode));
+    try std.testing.expectEqual(c.OT_OK, ot_text_buffer_set_width_method(&owner, &text_id, c.OT_WIDTH_METHOD_WCWIDTH));
+    try std.testing.expectEqual(@import("utf8.zig").WidthMethod.wcwidth, (try owner.core.raw().getTextBuffer(abi.handleFromC(text_id))).buffer.widthMethod());
 }
 
 test "Context shared text ABI rejects tab expansion before changing accepted metrics" {

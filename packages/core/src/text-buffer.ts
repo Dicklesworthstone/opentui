@@ -45,7 +45,13 @@ export class TextBuffer {
     this.updateLengths()
   }
 
-  static create(widthMethod: WidthMethod, source: NativeResourceOwner): TextBuffer {
+  /**
+   * With `followSessionWidth`, the buffer measures with the width method of the renderer whose scene shows it,
+   * including when the terminal's replies change that method, and selections keep their text; otherwise it keeps
+   * `widthMethod`. One renderer at a time may show such a buffer: showing it in another one throws until the first
+   * stops showing it (`NativeError` with `status === NativeStatus.WrongSession`).
+   */
+  static create(widthMethod: WidthMethod, source: NativeResourceOwner, followSessionWidth = false): TextBuffer {
     const owner = source?.resourceContext
     if (!owner)
       throw new Error(
@@ -53,7 +59,7 @@ export class TextBuffer {
       )
     owner.assertAlive()
     const lib = owner.renderLib
-    const handle = lib.createContextTextBuffer(owner.context, { widthMethod })
+    const handle = lib.createContextTextBuffer(owner.context, { widthMethod, followSessionWidth })
     try {
       return new TextBuffer(lib, handle, owner)
     } catch (error) {
@@ -258,6 +264,18 @@ export class TextBuffer {
     this.highlight(NativeEditHighlightOperation.ClearAll)
   }
 
+  /** @internal The Context's group-set id for an ordered list of style names; later names win. */
+  public _groupSet(names: readonly string[]): number {
+    this.guard()
+    return this.lib.contextGroupSet(this.native.handle.context, names)
+  }
+
+  /** @internal Replaces layer `layerId` in `[start, end)` UTF-8 bytes with (start, end, group set) runs. */
+  public _setLayer(layerId: number, start: number, end: number, runs: Uint32Array): void {
+    this.guard()
+    this.lib.contextTextBufferSetLayer(this.native.handle.context, this.native.handle, layerId, start, end, runs)
+  }
+
   public getLineHighlights(lineIdx: number): Array<Highlight> {
     this.guard()
     return this.lib.contextTextBufferGetHighlights(this.native.handle.context, this.native.handle, lineIdx)
@@ -291,6 +309,15 @@ export class TextBuffer {
       this.lib.contextTextBufferSetTabWidth(this.native.handle.context, this.native.handle, width)
       this.updateLengths()
     })
+  }
+
+  /**
+   * Measures with `widthMethod` from now on; views keep their selections on the same text. For buffers created without
+   * `followSessionWidth` and drawn outside a scene; a following buffer throws.
+   */
+  public setWidthMethod(widthMethod: WidthMethod): void {
+    this.guard()
+    this.lib.contextTextBufferSetWidthMethod(this.native.handle.context, this.native.handle, widthMethod)
   }
 
   public getTabWidth(): number {

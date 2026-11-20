@@ -12,6 +12,8 @@ interface TextChunkOptions {
   enabled?: boolean
   baseHighlight?: string
   ranges?: Array<{ start: number; end: number }>
+  /** Receives, per chunk, the style names it merges in order (a native group set). */
+  names?: string[][]
 }
 
 interface Boundary {
@@ -111,14 +113,7 @@ export function treeSitterToTextChunks(
             text: replacementText,
             fg: defaultStyle?.fg,
             bg: defaultStyle?.bg,
-            attributes: defaultStyle
-              ? createTextAttributes({
-                  bold: defaultStyle.bold,
-                  italic: defaultStyle.italic,
-                  underline: defaultStyle.underline,
-                  dim: defaultStyle.dim,
-                })
-              : 0,
+            attributes: createTextAttributes(defaultStyle),
           })
           ranges?.push({ start: currentOffset, end: boundary.offset })
         }
@@ -162,12 +157,9 @@ export function treeSitterToTextChunks(
 
           if (styleForGroup) {
             // Merge properties - later styles override earlier ones
-            if (styleForGroup.fg !== undefined) mergedStyle.fg = styleForGroup.fg
-            if (styleForGroup.bg !== undefined) mergedStyle.bg = styleForGroup.bg
-            if (styleForGroup.bold !== undefined) mergedStyle.bold = styleForGroup.bold
-            if (styleForGroup.italic !== undefined) mergedStyle.italic = styleForGroup.italic
-            if (styleForGroup.underline !== undefined) mergedStyle.underline = styleForGroup.underline
-            if (styleForGroup.dim !== undefined) mergedStyle.dim = styleForGroup.dim
+            for (const [field, value] of Object.entries(styleForGroup)) {
+              if (value !== undefined) Reflect.set(mergedStyle, field, value)
+            }
           } else {
             if (group.includes(".")) {
               const baseName = group.split(".")[0]
@@ -185,40 +177,36 @@ export function treeSitterToTextChunks(
         }
 
         // Use merged style, falling back to default if nothing was merged
-        const finalStyle = Object.keys(mergedStyle).length > 0 ? mergedStyle : defaultStyle
+        const merged = Object.keys(mergedStyle).length > 0
+        const finalStyle = merged ? mergedStyle : defaultStyle
+        // A theme that defines neither `markup.strikethrough` nor `markup` strikes it with the default's colors here;
+        // native adds only the attribute, so the default goes before it.
+        const strikes = (group: string) =>
+          group === "markup.strikethrough" &&
+          !syntaxStyle.getRegisteredNames().some((name) => name === group || name === "markup")
+        options?.names?.push(
+          merged ? sortedGroups.flatMap(({ group }) => (strikes(group) ? ["default", group] : [group])) : ["default"],
+        )
 
         chunks.push({
           __isChunk: true,
           text: segmentText,
           fg: finalStyle?.fg,
           bg: finalStyle?.bg,
-          attributes: finalStyle
-            ? createTextAttributes({
-                bold: finalStyle.bold,
-                italic: finalStyle.italic,
-                underline: finalStyle.underline,
-                dim: finalStyle.dim,
-              })
-            : 0,
+          attributes: createTextAttributes(finalStyle),
         })
         ranges?.push({ start: currentOffset, end: boundary.offset })
       }
     } else if (currentOffset < boundary.offset) {
       const text = content.slice(currentOffset, boundary.offset)
       const style = baseStyle ?? defaultStyle
+      options?.names?.push(["default"])
       chunks.push({
         __isChunk: true,
         text,
         fg: style?.fg,
         bg: style?.bg,
-        attributes: style
-          ? createTextAttributes({
-              bold: style.bold,
-              italic: style.italic,
-              underline: style.underline,
-              dim: style.dim,
-            })
-          : 0,
+        attributes: createTextAttributes(style),
       })
       ranges?.push({ start: currentOffset, end: boundary.offset })
     }
@@ -265,19 +253,13 @@ export function treeSitterToTextChunks(
   if (currentOffset < content.length) {
     const text = content.slice(currentOffset)
     const style = baseStyle ?? defaultStyle
+    options?.names?.push(["default"])
     chunks.push({
       __isChunk: true,
       text,
       fg: style?.fg,
       bg: style?.bg,
-      attributes: style
-        ? createTextAttributes({
-            bold: style.bold,
-            italic: style.italic,
-            underline: style.underline,
-            dim: style.dim,
-          })
-        : 0,
+      attributes: createTextAttributes(style),
     })
     ranges?.push({ start: currentOffset, end: content.length })
   }

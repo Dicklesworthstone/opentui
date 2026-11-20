@@ -1,6 +1,6 @@
 {
   "name": "@opentui/web",
-  "version": "0.8.3",
+  "version": "0.9.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,10 +13,12 @@
     "api:current": "bun scripts/api.ts current",
     "api:diff": "bun scripts/api.ts diff",
     "api:check": "bun scripts/api.ts check",
+    "api:index": "bun scripts/api.ts index",
     "api:backfill": "bun scripts/api.ts backfill",
     "preview": "astro preview",
     "astro": "astro",
     "optimize:video": "bash scripts/optimize-landing-video.sh",
+    "fonts:update": "bun scripts/update-fonts.ts",
     "recordings:record": "bash scripts/recordings/bin/record",
     "recordings:build": "bun scripts/recordings/bin/build",
     "docs:visuals": "bun scripts/generate-doc-visuals.ts",

@@ -58,6 +58,7 @@ compile error. A key that does not continue a pending sequence clears it and is 
 | `getPendingSequence`, `hasPendingSequence`, `clearPendingSequence`, `popPendingSequence` | same names in snake case                                                                                    |
 | `getActiveKeys({ includeBindings, includeMetadata })`                                    | `active_keys(options)`                                                                                      |
 | `createKeyMatcher`, `parseKeySequence`, `formatKey`                                      | `parse_key` (compare its `stroke`), `parse_key_sequence`, `format_key`                                      |
+| a binding key as `registerLayer` expands it (no TypeScript call)                         | `parse_binding`: binding expanders, then one sequence per expanded key                                      |
 | `on("state")`, `on("pendingSequence")`, `on("warning" / "error")`                        | `on_state`, `on_pending_sequence`, `on_diagnostic`; `revision()` counts state changes                       |
 | `stringifyKeyStroke`                                                                     | `Stroke`'s `Display`                                                                                        |
 | extras `createBindingLookup`                                                             | `extras::BindingLookup`                                                                                     |
@@ -77,7 +78,7 @@ they mean in TypeScript.
 | `registerEscapeClearsPendingSequence`                 | `addons::escape_clears_pending_sequence`                                                                                                                                     |
 | `registerBackspacePopsPendingSequence`                | `addons::backspace_pops_pending_sequence`                                                                                                                                    |
 | `registerManagedTextareaLayer`                        | `addons::managed_textarea_layer`: the `input.*` commands and Core's default textarea bindings, with the app's overrides first; the commands call back with an `EditorAction` |
-| `registerTimedLeader`                                 | `addons::timed_leader`: returns a `TimedLeader` whose `deadline()` the app schedules and whose `expire(now)` clears the leader sequence                                      |
+| `registerTimedLeader`                                 | `addons::timed_leader`: a `TimedLeader`; any pending-sequence listener times `timeout()` (`set_timeout` changes it) for `armed()`'s generation, then `expire(generation)`    |
 
 ## Not ported
 

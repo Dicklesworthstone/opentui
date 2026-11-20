@@ -110,7 +110,8 @@ fn parse_range(text: &str) -> Option<(u64, u64)> {
     Some((start.parse().ok()?, count.parse().ok()?))
 }
 
-/// Parses the first file of a unified diff. Lines before its first hunk are headers.
+/// Parses the first file of a unified diff. Lines before its first hunk are headers. Lines after a hunk's counts, up to
+/// the next hunk or file, are ignored, as `git apply` and `patch` ignore them.
 fn parse(text: &str) -> Result<Vec<Hunk>, String> {
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut remaining = (0u64, 0u64);
@@ -127,8 +128,11 @@ fn parse(text: &str) -> Result<Vec<Hunk>, String> {
                 };
                 remaining = (old_count, new_count);
                 hunks.push(Hunk { old_start, new_start, lines: Vec::new() });
-            } else if !hunks.is_empty() && (line.starts_with("diff ") || line.starts_with("--- ")) {
-                // The next file: only the first one is shown.
+            } else if !hunks.is_empty()
+                && (line.starts_with("diff ")
+                    || line.strip_prefix("---").is_some_and(|name| name.starts_with([' ', '\t'])))
+            {
+                // The next file, whose `---` header has a space or a tab before its name: only the first one is shown.
                 break;
             }
             continue;
@@ -262,6 +266,7 @@ impl Side {
         }
         let (mut line_colors, mut signs, mut numbers, mut hidden) =
             (HashMap::new(), HashMap::new(), HashMap::new(), HashSet::new());
+        let (mut added, mut removed) = (None, None);
         for (index, line) in lines.iter().enumerate() {
             let index = index as u32;
             match line.number {
@@ -281,11 +286,12 @@ impl Side {
                 Kind::Empty => continue,
             };
             line_colors.insert(index, LineColor::new(gutter, content));
-            match line.kind {
-                Kind::Added => signs.insert(index, LineSign::after(" +", colors.added_sign)),
-                Kind::Removed => signs.insert(index, LineSign::after(" -", colors.removed_sign)),
-                _ => None,
+            let (sign, text, color) = match line.kind {
+                Kind::Added => (&mut added, " +", colors.added_sign),
+                Kind::Removed => (&mut removed, " -", colors.removed_sign),
+                _ => continue,
             };
+            signs.insert(index, Rc::clone(sign.get_or_insert_with(|| Rc::new(LineSign::after(text, color)))));
         }
         self.numbers.replace_lines(line_colors, signs, numbers, hidden);
     }
@@ -540,5 +546,23 @@ impl Diff {
     /// The code views: the only one in the unified view, and the old file in the split view; then the new file.
     pub fn code_views(&self) -> (Code, Code) {
         (self.0.left.code.clone(), self.0.right.code.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn diffs_parse_as_in_core() {
+        // Core's vectors, which its Diff test runs through DiffRenderable.
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../../core/src/renderables/diff.conformance.json")).unwrap();
+        for row in corpus["rows"].as_array().unwrap() {
+            let shown = super::parse(row[1].as_str().unwrap()).map_or(serde_json::json!("error"), |hunks| {
+                let lines =
+                    |hunk: &super::Hunk| hunk.lines.iter().map(|(kind, line)| format!("{kind}{line}")).collect();
+                serde_json::json!(hunks.iter().map(lines).collect::<Vec<Vec<String>>>())
+            });
+            assert_eq!(shown, row[2], "{}", row[0]);
+        }
     }
 }

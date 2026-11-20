@@ -2,12 +2,26 @@
 name = "opentui-sys"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
-publish = false
+rust-version.workspace = true
+# The crate's code is MIT; the native library it links includes FFmpeg (README.md).
+license = "MIT AND LGPL-2.1-or-later"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/opentui-sys"
+readme = "README.md"
+keywords = ["tui", "terminal", "ffi", "opentui"]
+categories = ["external-ffi-bindings"]
 links = "opentui"
 description = "Raw FFI declarations for OpenTUI's checked C ABI"
 
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lints]
+workspace = true
+
 [features]
 default = ["static"]
-# Link libopentui.a instead of libopentui.so or libopentui.dylib. Windows links opentui.dll either way.
+# Link libopentui.a instead of libopentui.so or libopentui.dylib, and on Windows MSVC opentui-static.lib instead of
+# opentui.dll. The Windows GNU targets link opentui.dll either way.
 static = []

@@ -63,20 +63,36 @@ pub mod testing;
 pub mod theme;
 pub mod widget;
 
+/// Tables that Core and `@opentui/keymap` own, generated from them.
+mod tables {
+    /// A filetype `match` over generated rows, and the rows themselves for tests.
+    macro_rules! filetypes {
+        ($name:ident, $rows:ident: $($key:literal => $filetype:literal,)*) => {
+            pub(crate) fn $name(key: &str) -> Option<&'static str> {
+                Some(match key { $($key => $filetype,)* _ => return None })
+            }
+            #[cfg(test)]
+            pub(crate) const $rows: &[(&str, &str)] = &[$(($key, $filetype)),*];
+        };
+    }
+
+    include!("generated.rs");
+}
+
 pub use app::{App, AppOptions};
 pub use error::{Error, Result, Status};
 
 /// The types most apps use.
 pub mod prelude {
     pub use crate::animation::{Easing, Timeline, Tween};
-    pub use crate::app::{App, AppOptions, AppProxy, Cx, HandlerId, TimerId};
+    pub use crate::app::{AnimationTick, App, AppOptions, AppProxy, Cx, HandlerId, Tick, TimerId};
     pub use crate::input::{
         Event, KeyCode, KeyEvent, Keymap, Modifiers, MouseButton, MouseEvent, MouseEventKind, Shortcut,
     };
     pub use crate::layout::{
-        Align, Edge, FlexDirection, Justify, LayoutMode, Length, Overflow, PositionType, Rect, Wrap,
+        Align, BoxSizing, Edge, FlexDirection, Justify, LayoutMode, Length, Overflow, PositionType, Rect, Wrap,
     };
-    pub use crate::native::{MousePointer, SelectionColors, WrapMode};
+    pub use crate::native::{MousePointer, PaintCell, SelectionColors, WrapMode};
     pub use crate::post::{Channels, ColorMatrix, Filter, Surface};
     pub use crate::style::{Alignment, Attributes, BorderStyle, Color, Sides, Span, Style, Stylize};
     pub use crate::theme::{Theme, ThemeMode};

@@ -39,6 +39,7 @@ export type {
 import type { ExtractOptions } from "./image.js"
 import { RGBA } from "./lib/RGBA.js"
 import { isStyledText, type StyledText } from "./lib/styled-text.js"
+import type { TextChunk } from "./text-buffer.js"
 import { YogaError, YogaStatus, type MeasureFunction } from "./yoga.js"
 import { YogaHost, rejectAsyncCallback } from "./yoga.internal.js"
 import { env, registerEnvVar } from "./lib/env.js"
@@ -151,6 +152,42 @@ export type ContextTextBufferViewHandle = ContextObjectHandle & { readonly [cont
 export type ContextImageHandle = ContextObjectHandle & { readonly [contextResourceBrand]: "image" }
 export type ContextImagePixelsHandle = ContextObjectHandle & { readonly [contextResourceBrand]: "image_pixels" }
 export type ContextUnicodeHandle = ContextObjectHandle & { readonly [contextResourceBrand]: "unicode" }
+export type ContextMarkdownHandle = ContextObjectHandle & { readonly [contextResourceBrand]: "markdown" }
+
+/** `ot_markdown_options`: OT_MD_* flags, the style bound nodes draw with, and the hook filter's substrings. */
+export interface NativeMarkdownOptions {
+  flags: number
+  syntaxStyle: ContextSyntaxStyleHandle | null
+  hookFilter?: readonly string[]
+  /** Lowers the 64 MiB source limit; 0 or absent keeps it. */
+  sourceByteLimit?: number
+}
+
+/** `ot_markdown_result`; `removedFrom` is undefined when nothing was removed. */
+export interface NativeMarkdownResult {
+  changed: number
+  committed: number
+  removedFrom: number | undefined
+}
+
+/** `ot_markdown_block`; `parent` is undefined at top level. */
+export interface NativeMarkdownBlock {
+  index: number
+  parent: number | undefined
+  kind: number
+  flags: number
+  sourceStart: number
+  sourceEnd: number
+  infoStart: number
+  infoEnd: number
+  number: number
+}
+
+/** A leaf's parser output: its display text as chunks, and OT_MD_SPAN_* flags per chunk. */
+export interface NativeMarkdownLeaf {
+  chunks: TextChunk[]
+  spans: Uint32Array
+}
 export type ContextEmbeddedTerminalHandle = ContextObjectHandle & {
   readonly [contextResourceBrand]: "embedded_terminal"
 }
@@ -158,6 +195,17 @@ export type SessionBuffer = "current" | "next"
 
 export interface NativeContextEditBufferOptions {
   widthMethod?: WidthMethod | "no-zwj"
+  /** Measure with the width method of the session whose scene shows the buffer. */
+  followSessionWidth?: boolean
+}
+
+function editBufferOptions(options: NativeContextEditBufferOptions, kind: "text" | "editor"): Uint32Array {
+  const layout = nativeLayouts.ot_edit_buffer_options
+  const record = createContextRecord(layout)
+  record[layout.fields.width_method.offset / 4] = widthMethodId(options.widthMethod ?? "unicode", kind)
+  if (options.followSessionWidth)
+    record[layout.fields.flags.offset / 4] = nativeConstants.OT_EDIT_BUFFER_FOLLOW_SESSION_WIDTH
+  return record
 }
 
 export interface NativeEditBufferInfo {
@@ -209,7 +257,12 @@ export enum NativeEditCommand {
   Clear = 10,
   ClearHistory = 11,
   DebugRope = 12,
+  CursorOffsetAtomic = 13,
+  KeepOutside = 14,
 }
+
+/** The argument that applies the cursor rules around atomic marks to Left, Right, Backspace, Delete, Up and Down. */
+export const NativeEditAtomic = 1
 
 export enum NativeEditPositionQuery {
   Cursor = 0,
@@ -234,6 +287,8 @@ export interface NativeEditorStyle {
   fg?: RGBA | null
   bg?: RGBA | null
   attributes?: number | null
+  /** Syntax styles only: the attribute bits the style sets or clears when a group set composes it. */
+  suppliedAttributes?: number | null
 }
 
 export enum NativeEditHighlightOperation {
@@ -242,6 +297,23 @@ export enum NativeEditHighlightOperation {
   RemoveRef = 2,
   ClearLine = 3,
   ClearAll = 4,
+}
+
+export enum NativeEditMarkOperation {
+  Add = 0,
+  Remove = 1,
+  Clear = 2,
+}
+
+/** An edit mark in cursor offsets; `style` is a SyntaxStyle id, 0 for none. */
+export interface NativeEditMark {
+  id: number
+  kind: number
+  atomic: boolean
+  style: number
+  priority: number
+  start: number
+  end: number
 }
 
 export interface NativeEditorViewport {
@@ -572,7 +644,7 @@ export interface NativeContextImageDraw {
 }
 
 export interface NativeSceneTextSelectionOptions {
-  operation: "reset" | "set" | "update"
+  operation: "reset" | "set" | "update" | "colors"
   anchorX: number
   anchorY: number
   focusX: number
@@ -1083,8 +1155,14 @@ registerEnvVar({
 })
 
 // Cursor & mouse pointer style mappings (avoid recreation on each call)
-const CURSOR_STYLE_TO_ID = { block: 0, line: 1, underline: 2, default: 3 } as const
-const CURSOR_ID_TO_STYLE = ["block", "line", "underline", "default"] as const
+const CURSOR_STYLE_TO_ID = {
+  block: nativeConstants.OT_CURSOR_STYLE_BLOCK,
+  line: nativeConstants.OT_CURSOR_STYLE_LINE,
+  underline: nativeConstants.OT_CURSOR_STYLE_UNDERLINE,
+  default: nativeConstants.OT_CURSOR_STYLE_DEFAULT,
+} as const
+const CURSOR_ID_TO_STYLE: CursorStyle[] = []
+for (const [style, id] of Object.entries(CURSOR_STYLE_TO_ID)) CURSOR_ID_TO_STYLE[id] = style as CursorStyle
 const PROGRAM_STATE_TO_ID: Record<string, number | undefined> = {
   idle: nativeConstants.OT_PROGRAM_STATE_IDLE,
   working: nativeConstants.OT_PROGRAM_STATE_WORKING,
@@ -1498,7 +1576,7 @@ function encodeDrawColors(
   return background !== undefined
 }
 
-const DIAGNOSTIC_QUEUE_MAX = 64 // Version 2 C Contexts hold at most 64 diagnostic records.
+const DIAGNOSTIC_QUEUE_MAX = nativeConstants.OT_DIAGNOSTIC_QUEUE_MAX
 const DIAGNOSTIC_BATCH = 8 // Eight 4 KiB records keep the cached drain storage near 33 KB.
 
 function createDiagnosticDrainRecord() {
@@ -1743,8 +1821,28 @@ function viewOrNull<T extends ArrayBufferView>(value: T): T | null {
   return value.byteLength === 0 ? null : value
 }
 
-// opentui.h limits each embedded terminal write and the retained replies to 1 MiB.
-const EMBEDDED_TERMINAL_IO_BYTES_MAX = 1024 * 1024
+const EMBEDDED_TERMINAL_IO_BYTES_MAX = nativeConstants.OT_EMBEDDED_TERMINAL_INPUT_BYTES_MAX
+const EMBEDDED_TERMINAL_KEY_ACTIONS = new Map<string, number>([
+  ["release", nativeConstants.OT_EMBEDDED_TERMINAL_KEY_RELEASE],
+  ["press", nativeConstants.OT_EMBEDDED_TERMINAL_KEY_PRESS],
+  ["repeat", nativeConstants.OT_EMBEDDED_TERMINAL_KEY_REPEAT],
+])
+const EMBEDDED_TERMINAL_MOUSE_ACTIONS = new Map<string, number>([
+  ["press", nativeConstants.OT_EMBEDDED_TERMINAL_MOUSE_PRESS],
+  ["release", nativeConstants.OT_EMBEDDED_TERMINAL_MOUSE_RELEASE],
+  ["motion", nativeConstants.OT_EMBEDDED_TERMINAL_MOUSE_MOTION],
+])
+const EMBEDDED_TERMINAL_BUTTONS = new Map<string | undefined, number>([
+  [undefined, nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_NONE],
+  ["unknown", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_UNKNOWN],
+  ["left", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_LEFT],
+  ["right", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_RIGHT],
+  ["middle", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_MIDDLE],
+  ["four", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_FOUR],
+  ["five", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_FIVE],
+  ["six", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_SIX],
+  ["seven", nativeConstants.OT_EMBEDDED_TERMINAL_BUTTON_SEVEN],
+])
 
 function embeddedTerminalDimension(value: number, name: string) {
   if (!Number.isInteger(value) || value < 1 || value > 0xffff) {
@@ -1767,7 +1865,9 @@ function contextBufferColor(value: RGBA, color: Uint16Array = new Uint16Array(4)
     color[offset + index] = channel
   }
   const intent = color[offset + 1] >>> 8
-  if (color[offset + 2] > 255 || color[offset + 3] > 255 || intent > 2 || (intent !== 1 && color[offset] > 255)) {
+  const indexed = intent === nativeConstants.OT_COLOR_INDEXED
+  const known = indexed || intent === nativeConstants.OT_COLOR_RGB || intent === nativeConstants.OT_COLOR_DEFAULT
+  if (color[offset + 2] > 255 || color[offset + 3] > 255 || !known || (!indexed && color[offset] > 255)) {
     throw new RangeError("Invalid terminal color intent")
   }
   return color
@@ -2766,11 +2866,15 @@ function recordedPixels(data: Uint8Array | PointerInput, length: number): Uint8A
   return input.subarray(0, count)
 }
 
+function isAttributeByte(value: number | null | undefined): boolean {
+  return Number.isInteger(value) && value! >= 0 && value! <= 0xff
+}
+
 function encodeEditorStyle(style: NativeEditorStyle): Uint32Array {
   const layout = nativeLayouts.ot_editor_style
   const record = new Uint32Array(layout.size / 4)
   const colors = new Uint16Array(record.buffer)
-  const { fg, bg, attributes } = style
+  const { fg, bg, attributes, suppliedAttributes } = style
   record[layout.fields.struct_size.offset / 4] = layout.size
   record[layout.fields.abi_version.offset / 4] = nativeConstants.OT_CONTEXT_ABI_VERSION
   if (fg != null) {
@@ -2784,6 +2888,14 @@ function encodeEditorStyle(style: NativeEditorStyle): Uint32Array {
   if (attributes != null) {
     record[layout.fields.flags.offset / 4] |= NativeEditorStyleMask.Attributes
     record[layout.fields.attributes.offset / 4] = toSafeFFIU32Length(attributes, "Editor style attributes")
+  }
+  if (suppliedAttributes != null) {
+    // Both share one word; a value past a byte would become mask bits.
+    if (!isAttributeByte(attributes) || !isAttributeByte(suppliedAttributes)) {
+      throw new RangeError("Masked editor style attributes must be integers from 0 to 255")
+    }
+    record[layout.fields.flags.offset / 4] |= nativeConstants.OT_EDITOR_STYLE_ATTRIBUTE_MASK
+    record[layout.fields.attributes.offset / 4] |= suppliedAttributes << 16
   }
   return record
 }
@@ -2804,6 +2916,8 @@ function drawRecordBottomTitle(options: NativeBufferDraw): string {
 }
 
 const drawTextEncoder = new TextEncoder()
+// Markdown text is the engine's bytes as given: a leading U+FEFF is text, not a byte order mark.
+const markdownDecoder = new TextDecoder("utf-8", { ignoreBOM: true })
 
 /** Encodes into a buffer sized to the native limit; text that does not fit exceeds that limit. */
 function encodeDrawText(text: string, output: Uint8Array): number {
@@ -2917,8 +3031,8 @@ function widthMethodId(widthMethod: WidthMethod | "no-zwj", label: string): numb
 }
 
 function widthMethodFromCode(code: number): WidthMethod {
-  if (code === 0) return "wcwidth"
-  return code === 3 ? "unicode-wide" : "unicode"
+  if (code === nativeConstants.OT_WIDTH_METHOD_WCWIDTH) return "wcwidth"
+  return code === nativeConstants.OT_WIDTH_METHOD_UNICODE_WIDE ? "unicode-wide" : "unicode"
 }
 
 const yogaSymbols = {
@@ -3467,6 +3581,7 @@ type ContextObjectDestroySymbol =
   | "ot_editor_view_destroy"
   | "ot_embedded_terminal_destroy"
   | "ot_image_destroy"
+  | "ot_markdown_destroy"
   | "ot_session_destroy"
   | "ot_syntax_style_destroy"
   | "ot_text_buffer_destroy"
@@ -3480,16 +3595,24 @@ type ContextObjectDestroySymbol =
  * Logical coordinates (logicalRow, logicalCol) are document-absolute.
  */
 export interface VisualCursor {
-  visualRow: number // Viewport-relative row (0 = top of viewport)
-  visualCol: number // Viewport-relative column (0 = left edge of viewport when not wrapping)
-  logicalRow: number // Document-absolute row
-  logicalCol: number // Document-absolute column
-  offset: number // Global display-width offset from buffer start
+  /** Wrapped row relative to the top of the viewport. */
+  visualRow: number
+  /** Display-cell column relative to the viewport. */
+  visualCol: number
+  /** Zero-based logical line in the document. */
+  logicalRow: number
+  /** Display-cell column relative to the logical line start. */
+  logicalCol: number
+  /** Display cells from the document start, counting each newline as one. */
+  offset: number
 }
 
 export interface LogicalCursor {
+  /** Zero-based logical line in the document. */
   row: number
+  /** Display cells from the logical line start. */
   col: number
+  /** Display cells from the document start, counting each newline as one. */
   offset: number
 }
 
@@ -3551,6 +3674,8 @@ export class FFIRenderLib {
     createEditorSelectionRecord()
   // Info reads never call back into JavaScript, so one output record serves every read.
   private readonly editorViewInfoRecord = createContextRecord(nativeLayouts.ot_editor_view_info)
+  // Kept between mark queries, which decode it before the next call.
+  private markRecords = new Uint32Array((16 * nativeLayouts.ot_edit_mark.size) / 4)
   private readonly videoStateRecord = new Uint8Array(nativeLayouts.ot_video_state.size)
   private readonly videoStateView = new DataView(this.videoStateRecord.buffer)
   private readonly selectionResetRecord = encodeEditorSelection({ operation: NativeEditorSelectionOperation.Reset })
@@ -3702,11 +3827,8 @@ export class FFIRenderLib {
     context: NativeContextHandle,
     options: NativeContextEditBufferOptions = {},
   ): ContextTextBufferHandle {
-    const layout = nativeLayouts.ot_edit_buffer_options
     this.getYogaHost().assertMutable()
-    const widthMethod = widthMethodId(options.widthMethod ?? "unicode", "text")
-    const record = createContextRecord(layout)
-    record[layout.fields.width_method.offset / 4] = widthMethod
+    const record = editBufferOptions(options, "text")
     const output = new Uint32Array(handleWords)
     const pointer = this.nativeContextPointer(context, "ot_text_buffer_create")
     nativeResult("ot_text_buffer_create", this.opentui.symbols.ot_text_buffer_create(pointer, record, output))
@@ -3782,7 +3904,8 @@ export class FFIRenderLib {
     const handle = encodeContextHandle(context, session)
     const ticket = frame ? encodeSceneFrameRequest(context, frame) : null
     const count = toSafeFFIU32Length(snapshots.length, "Split snapshot count")
-    if (count > 64) throw new RangeError("At most 64 split snapshots can be submitted together")
+    const max = nativeConstants.OT_SPLIT_SNAPSHOTS_MAX
+    if (count > max) throw new RangeError(`At most ${max} split snapshots can be submitted together`)
     const records = new BigUint64Array(count * (layout.size / 8))
     const fields = new Uint32Array(records.buffer)
     for (let index = 0; index < count; index++) {
@@ -4212,9 +4335,8 @@ export class FFIRenderLib {
     const layout = nativeLayouts.ot_embedded_terminal_key
     this.getYogaHost().assertMutable()
     const handle = encodeContextHandle(context, terminal)
-    const action = key.action ?? "press"
-    const actionCode = ["release", "press", "repeat"].indexOf(action)
-    if (actionCode < 0) throw new TypeError("Unknown embedded terminal key action")
+    const actionCode = EMBEDDED_TERMINAL_KEY_ACTIONS.get(key.action ?? "press")
+    if (actionCode === undefined) throw new TypeError("Unknown embedded terminal key action")
     const record = createContextRecord(layout)
     record[layout.fields.action.offset / 4] = actionCode
     record[layout.fields.composing.offset / 4] = toFFIBool(key.composing ?? false, "Key composing")
@@ -4253,13 +4375,9 @@ export class FFIRenderLib {
     const layout = nativeLayouts.ot_embedded_terminal_mouse
     this.getYogaHost().assertMutable()
     const handle = encodeContextHandle(context, terminal)
-    const action = ["press", "release", "motion"].indexOf(mouse.action)
-    const buttonName = mouse.button
-    const button =
-      buttonName === undefined
-        ? -1
-        : ["unknown", "left", "right", "middle", "four", "five", "six", "seven"].indexOf(buttonName)
-    if (action < 0 || (buttonName !== undefined && button < 0))
+    const action = EMBEDDED_TERMINAL_MOUSE_ACTIONS.get(mouse.action)
+    const button = EMBEDDED_TERMINAL_BUTTONS.get(mouse.button)
+    if (action === undefined || button === undefined)
       throw new TypeError("Unknown embedded terminal mouse action or button")
     const record = createContextRecord(layout)
     record[layout.fields.action.offset / 4] = action
@@ -4334,7 +4452,9 @@ export class FFIRenderLib {
   ): Uint8Array {
     this.getYogaHost().assertMutable()
     const handle = encodeContextHandle(context, terminal)
-    const output = (this.embeddedTerminalResponses ??= new Uint8Array(EMBEDDED_TERMINAL_IO_BYTES_MAX))
+    const output = (this.embeddedTerminalResponses ??= new Uint8Array(
+      nativeConstants.OT_EMBEDDED_TERMINAL_RESPONSE_BYTES_MAX,
+    ))
     const count = new Uint32Array(1)
     const pointer = this.nativeContextPointer(context, "ot_embedded_terminal_drain_responses")
     let status = this.opentui.symbols.ot_embedded_terminal_drain_responses(
@@ -4640,6 +4760,22 @@ export class FFIRenderLib {
     })
   }
 
+  public contextTextBufferSetWidthMethod(
+    context: NativeContextHandle,
+    text: ContextTextBufferHandle,
+    widthMethod: WidthMethod,
+  ): void {
+    const handle = encodeContextHandle(context, text)
+    const method = widthMethodId(widthMethod, "text")
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_text_buffer_set_width_method")
+      nativeResult(
+        "ot_text_buffer_set_width_method",
+        this.opentui.symbols.ot_text_buffer_set_width_method(pointer, handle, method),
+      )
+    })
+  }
+
   public contextTextBufferHighlight(
     context: NativeContextHandle,
     text: ContextTextBufferHandle,
@@ -4656,6 +4792,55 @@ export class FFIRenderLib {
       nativeResult(
         "ot_text_buffer_highlight",
         this.opentui.symbols.ot_text_buffer_highlight(pointer, handle, selector, value, record),
+      )
+    })
+  }
+
+  /** The Context's id for an ordered list of style names (`ot_context_group_set`). */
+  public contextGroupSet(context: NativeContextHandle, names: readonly string[]): number {
+    const encoded = names.map((name) => this.encoder.encode(name))
+    const ends = new Uint32Array(encoded.length)
+    const bytes = new Uint8Array(encoded.reduce((end, name, index) => (ends[index] = end + name.length), 0))
+    encoded.forEach((name, index) => bytes.set(name, ends[index]! - name.length))
+    const output = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_context_group_set")
+    nativeResult(
+      "ot_context_group_set",
+      this.opentui.symbols.ot_context_group_set(
+        pointer,
+        viewOrNull(bytes),
+        bytes.length,
+        viewOrNull(ends),
+        ends.length,
+        output,
+      ),
+    )
+    return output[0]!
+  }
+
+  /** Replaces layer `layerId` in `[start, end)` bytes with `runs`: (start, end, group set) triples. */
+  public contextTextBufferSetLayer(
+    context: NativeContextHandle,
+    text: ContextTextBufferHandle,
+    layerId: number,
+    start: number,
+    end: number,
+    runs: Uint32Array,
+  ): void {
+    const handle = encodeContextHandle(context, text)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_text_buffer_set_layer")
+      nativeResult(
+        "ot_text_buffer_set_layer",
+        this.opentui.symbols.ot_text_buffer_set_layer(
+          pointer,
+          handle,
+          layerId,
+          start,
+          end,
+          viewOrNull(runs),
+          runs.length / 3,
+        ),
       )
     })
   }
@@ -4965,11 +5150,8 @@ export class FFIRenderLib {
     context: NativeContextHandle,
     options: NativeContextEditBufferOptions = {},
   ): ContextEditBufferHandle {
-    const layout = nativeLayouts.ot_edit_buffer_options
     this.getYogaHost().assertMutable()
-    const widthMethod = widthMethodId(options.widthMethod ?? "unicode", "editor")
-    const record = createContextRecord(layout)
-    record[layout.fields.width_method.offset / 4] = widthMethod
+    const record = editBufferOptions(options, "editor")
     const output = new Uint32Array(handleWords)
     const pointer = this.nativeContextPointer(context, "ot_edit_buffer_create")
     nativeResult("ot_edit_buffer_create", this.opentui.symbols.ot_edit_buffer_create(pointer, record, output))
@@ -5261,6 +5443,25 @@ export class FFIRenderLib {
     )
   }
 
+  public contextEditBufferConvertOffset(
+    context: NativeContextHandle,
+    editBuffer: ContextEditBufferHandle,
+    value: number,
+    toCell: boolean,
+  ): number {
+    const operation = "ot_edit_buffer_convert_offset"
+    const handle = encodeContextHandle(context, editBuffer)
+    const input = toSafeFFIU32Length(value, "Edit buffer index or offset")
+    const conversion = toCell ? nativeConstants.OT_EDIT_UTF16_TO_CELL : nativeConstants.OT_EDIT_CELL_TO_UTF16
+    const output = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, operation)
+    nativeResult(
+      operation,
+      this.opentui.symbols.ot_edit_buffer_convert_offset(pointer, handle, conversion, input, output),
+    )
+    return output[0]
+  }
+
   public contextEditBufferMeasureText(
     context: NativeContextHandle,
     editBuffer: ContextEditBufferHandle,
@@ -5398,6 +5599,91 @@ export class FFIRenderLib {
     )
     if (count[0] !== capacity) throw new NativeError("ot_edit_buffer_get_highlights", NativeStatus.InternalError)
     return decodeContextHighlights(records)
+  }
+
+  /** Adds, removes or clears marks; returns the new id, the removed id or 0. */
+  public contextEditBufferMark(
+    context: NativeContextHandle,
+    editBuffer: ContextEditBufferHandle,
+    operation: NativeEditMarkOperation,
+    mark?: Partial<NativeEditMark>,
+  ): number {
+    const layout = nativeLayouts.ot_edit_mark
+    const handle = encodeContextHandle(context, editBuffer)
+    const fields = layout.fields
+    let record: Uint32Array | null = null
+    if (mark) {
+      record = createContextRecord(layout)
+      record[fields.id.offset / 4] = toSafeFFIU32Length(mark.id ?? 0, "Mark id")
+      record[fields.kind.offset / 4] = toSafeFFIU32Length(mark.kind ?? 0, "Mark type id")
+      record[fields.flags.offset / 4] = mark.atomic ? nativeConstants.OT_EDIT_MARK_ATOMIC : 0
+      record[fields.style.offset / 4] = toSafeFFIU32Length(mark.style ?? 0, "Mark style ID")
+      record[fields.priority.offset / 4] = toSafeFFIU32Length(mark.priority ?? 0, "Mark priority")
+      record[fields.start.offset / 4] = toSafeFFIU32Length(mark.start ?? 0, "Mark start")
+      record[fields.end.offset / 4] = toSafeFFIU32Length(mark.end ?? 0, "Mark end")
+    }
+    const output = record && new Uint32Array(1)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_edit_buffer_mark")
+      nativeResult(
+        "ot_edit_buffer_mark",
+        this.opentui.symbols.ot_edit_buffer_mark(pointer, handle, operation, record, output),
+      )
+    })
+    return output?.[0] ?? 0
+  }
+
+  /** Marks in (start, id) order: mark `id`, or all for 0, of type `kind`, or any when it is omitted. */
+  public contextEditBufferGetMarks(
+    context: NativeContextHandle,
+    editBuffer: ContextEditBufferHandle,
+    id = 0,
+    kind: number = nativeConstants.OT_EDIT_MARK_ANY_KIND,
+  ): NativeEditMark[] {
+    const layout = nativeLayouts.ot_edit_mark
+    const handle = encodeContextHandle(context, editBuffer)
+    const markId = toSafeFFIU32Length(id, "Mark id")
+    const markKind = toSafeFFIU32Length(kind, "Mark type id")
+    const count = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_edit_buffer_get_marks")
+    const words = layout.size / 4
+    const copy = () =>
+      this.opentui.symbols.ot_edit_buffer_get_marks(
+        pointer,
+        handle,
+        markId,
+        markKind,
+        this.markRecords,
+        this.markRecords.length / words,
+        count,
+      )
+    // One call while the marks fit the kept records; an undersized call fails without output, so count and grow.
+    let status = copy()
+    if (status !== NativeStatus.Ok) {
+      nativeResult(
+        "ot_edit_buffer_get_marks",
+        this.opentui.symbols.ot_edit_buffer_get_marks(pointer, handle, markId, markKind, null, 0, count),
+      )
+      if (count[0] * words <= this.markRecords.length) nativeResult("ot_edit_buffer_get_marks", status)
+      this.markRecords = new Uint32Array(count[0] * 2 * words)
+      status = copy()
+      nativeResult("ot_edit_buffer_get_marks", status)
+    }
+    const records = this.markRecords
+    const marks: NativeEditMark[] = []
+    for (let offset = 0; offset < count[0] * words; offset += words) {
+      const field = (name: keyof typeof layout.fields) => records[offset + layout.fields[name].offset / 4]
+      marks.push({
+        id: field("id"),
+        kind: field("kind"),
+        atomic: (field("flags") & nativeConstants.OT_EDIT_MARK_ATOMIC) !== 0,
+        style: field("style"),
+        priority: field("priority"),
+        start: field("start"),
+        end: field("end"),
+      })
+    }
+    return marks
   }
 
   public contextEditorViewSetViewport(
@@ -6749,7 +7035,8 @@ export class FFIRenderLib {
     const record = createContextRecord(layout)
     record[layout.fields.flags.offset / 4] = flags
     record[layout.fields.kitty_keyboard_flags.offset / 4] = toSafeFFIU32Length(
-      options.kittyKeyboardFlags ?? 5,
+      options.kittyKeyboardFlags ??
+        nativeConstants.OT_KITTY_KEYBOARD_DISAMBIGUATE | nativeConstants.OT_KITTY_KEYBOARD_ALTERNATE_KEYS,
       "Session kittyKeyboardFlags",
     )
     const pointer = this.nativeContextPointer(context, "ot_session_setup_terminal")
@@ -7390,6 +7677,22 @@ export class FFIRenderLib {
     return output[0] !== 0
   }
 
+  public sceneReachesHooks(context: NativeContextHandle, node: SceneNodeHandle): boolean {
+    const handle = encodeContextHandle(context, node)
+    const output = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_scene_reaches_hooks")
+    nativeResult("ot_scene_reaches_hooks", this.opentui.symbols.ot_scene_reaches_hooks(pointer, handle, output))
+    return output[0] !== 0
+  }
+
+  public scenePainted(context: NativeContextHandle, node: SceneNodeHandle): boolean {
+    const handle = encodeContextHandle(context, node)
+    const output = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_scene_painted")
+    nativeResult("ot_scene_painted", this.opentui.symbols.ot_scene_painted(pointer, handle, output))
+    return output[0] !== 0
+  }
+
   public sceneMarkDirty(context: NativeContextHandle, node: SceneNodeHandle): void {
     this.getYogaHost().assertMutable()
     const handle = encodeContextHandle(context, node)
@@ -7580,6 +7883,241 @@ export class FFIRenderLib {
         urlBytes.length,
       ),
     )
+  }
+
+  /** The byte the latest finished frame drew at cell (x, y) of a text node, or undefined. */
+  public sceneGetTextByteAt(
+    context: NativeContextHandle,
+    node: SceneNodeHandle,
+    x: number,
+    y: number,
+  ): number | undefined {
+    const output = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_scene_get_text_byte_at")
+    nativeResult(
+      "ot_scene_get_text_byte_at",
+      this.opentui.symbols.ot_scene_get_text_byte_at(pointer, encodeContextHandle(context, node), x, y, output),
+    )
+    return output[0] === 0xffff_ffff ? undefined : output[0]
+  }
+
+  private markdownOptions(context: NativeContextHandle, options: NativeMarkdownOptions): Uint32Array {
+    const { fields } = nativeLayouts.ot_markdown_options
+    const record = createContextRecord(nativeLayouts.ot_markdown_options)
+    record[fields.flags.offset / 4] = options.flags
+    record[fields.source_byte_limit.offset / 4] = options.sourceByteLimit ?? 0
+    if (options.syntaxStyle)
+      record.set(encodeContextHandle(context, options.syntaxStyle), fields.syntax_style.offset / 4)
+    const filter = this.encoder.encode((options.hookFilter ?? []).join("\0"))
+    if (filter.length > fields.hook_filter.size) throw new RangeError("Markdown hook filter is too long")
+    new Uint8Array(record.buffer, fields.hook_filter.offset).set(filter)
+    record[fields.hook_filter_byte_count.offset / 4] = filter.length
+    return record
+  }
+
+  private markdownCall(
+    context: NativeContextHandle,
+    operation: string,
+    call: (pointer: Pointer, output: Uint32Array) => NativeStatus,
+  ): NativeMarkdownResult {
+    const output = new Uint32Array(3)
+    this.getYogaHost().runMutation(() =>
+      nativeResult(operation, call(this.nativeContextPointer(context, operation), output)),
+    )
+    const removed = output[2]
+    return { changed: output[0], committed: output[1], removedFrom: removed === 0xffff_ffff ? undefined : removed }
+  }
+
+  public markdownCreate(context: NativeContextHandle, options: NativeMarkdownOptions): ContextMarkdownHandle {
+    const record = this.markdownOptions(context, options)
+    const output = new Uint32Array(handleWords)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_markdown_create")
+      nativeResult("ot_markdown_create", this.opentui.symbols.ot_markdown_create(pointer, record, output))
+    })
+    return decodeContextHandle(context, output) as ContextMarkdownHandle
+  }
+
+  public markdownDestroy(context: NativeContextHandle, doc: ContextMarkdownHandle): void {
+    this.destroyContextObject(context, doc, "ot_markdown_destroy")
+  }
+
+  public markdownSetOptions(
+    context: NativeContextHandle,
+    doc: ContextMarkdownHandle,
+    options: NativeMarkdownOptions,
+  ): NativeMarkdownResult {
+    const record = this.markdownOptions(context, options)
+    const handle = encodeContextHandle(context, doc)
+    return this.markdownCall(context, "ot_markdown_set_options", (pointer, output) =>
+      this.opentui.symbols.ot_markdown_set_options(pointer, handle, record, output),
+    )
+  }
+
+  /** Appends `bytes`, or with `replace` parses them as the whole document. */
+  public markdownWrite(
+    context: NativeContextHandle,
+    doc: ContextMarkdownHandle,
+    bytes: Uint8Array,
+    replace: boolean,
+  ): NativeMarkdownResult {
+    const handle = encodeContextHandle(context, doc)
+    const input = sessionBytes(bytes, "Markdown byte count")
+    const operation = replace ? "ot_markdown_set" : "ot_markdown_append"
+    return this.markdownCall(context, operation, (pointer, output) =>
+      this.opentui.symbols[operation](pointer, handle, viewOrNull(input), input.length, output),
+    )
+  }
+
+  public markdownFinish(context: NativeContextHandle, doc: ContextMarkdownHandle): NativeMarkdownResult {
+    const handle = encodeContextHandle(context, doc)
+    return this.markdownCall(context, "ot_markdown_finish", (pointer, output) =>
+      this.opentui.symbols.ot_markdown_finish(pointer, handle, output),
+    )
+  }
+
+  /** The source's bytes `start` to `end` (default: all), read in place. */
+  public markdownGetSource(context: NativeContextHandle, doc: ContextMarkdownHandle, start = 0, end?: number): string {
+    const bytes = new BigUint64Array(1)
+    const count = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_markdown_get_source")
+    nativeResult(
+      "ot_markdown_get_source",
+      this.opentui.symbols.ot_markdown_get_source(pointer, encodeContextHandle(context, doc), bytes, count),
+    )
+    const to = Math.min(end ?? count[0], count[0])
+    if (to <= start) return ""
+    return markdownDecoder.decode(new Uint8Array(toArrayBuffer(Number(bytes[0]) as Pointer, start, to - start)))
+  }
+
+  /** The blocks changed since the last read, in document order; reading acknowledges them. */
+  public markdownReadChanges(
+    context: NativeContextHandle,
+    doc: ContextMarkdownHandle,
+    count: number,
+  ): NativeMarkdownBlock[] {
+    const layout = nativeLayouts.ot_markdown_block
+    const words = new Uint32Array((count * layout.size) / 4)
+    const halves = new Uint16Array(words.buffer)
+    const output = new Uint32Array(1)
+    const handle = encodeContextHandle(context, doc)
+    const pointer = this.nativeContextPointer(context, "ot_markdown_read_changes")
+    nativeResult(
+      "ot_markdown_read_changes",
+      this.opentui.symbols.ot_markdown_read_changes(pointer, handle, viewOrNull(words), count, output),
+    )
+    if (output[0] > count) throw new NativeError("ot_markdown_read_changes", NativeStatus.InvalidArgument)
+    const { fields: f } = layout
+    const blocks: NativeMarkdownBlock[] = []
+    for (let at = 0; at < output[0] * (layout.size / 4); at += layout.size / 4) {
+      const parent = words[at + f.parent_index.offset / 4]
+      blocks.push({
+        index: words[at + f.index.offset / 4],
+        parent: parent === 0xffff_ffff ? undefined : parent,
+        kind: halves[at * 2 + f.kind.offset / 2],
+        flags: halves[at * 2 + f.flags.offset / 2],
+        sourceStart: words[at + f.source_start_byte.offset / 4],
+        sourceEnd: words[at + f.source_end_byte.offset / 4],
+        infoStart: words[at + f.info_start_byte.offset / 4],
+        infoEnd: words[at + f.info_end_byte.offset / 4],
+        number: words[at + f.number.offset / 4],
+      })
+    }
+    return blocks
+  }
+
+  /** A paragraph's, heading's or cell's inline source, as an inline hook gets it. */
+  public markdownReadSource(context: NativeContextHandle, doc: ContextMarkdownHandle, block: number): string {
+    const handle = encodeContextHandle(context, doc)
+    const count = new Uint32Array(1)
+    const pointer = this.nativeContextPointer(context, "ot_markdown_read_source")
+    nativeResult(
+      "ot_markdown_read_source",
+      this.opentui.symbols.ot_markdown_read_source(pointer, handle, block, null, 0, count),
+    )
+    if (count[0] === 0) return ""
+    const bytes = new Uint8Array(count[0])
+    nativeResult(
+      "ot_markdown_read_source",
+      this.opentui.symbols.ot_markdown_read_source(pointer, handle, block, bytes, bytes.length, count),
+    )
+    return markdownDecoder.decode(bytes)
+  }
+
+  /** A leaf's parser output with its styles resolved through the doc's style. */
+  public markdownReadLeaf(context: NativeContextHandle, doc: ContextMarkdownHandle, block: number): NativeMarkdownLeaf {
+    const handle = encodeContextHandle(context, doc)
+    const counts = new Uint32Array(3)
+    const [byteCount, chunkCount, urlCount] = [counts.subarray(0, 1), counts.subarray(1, 2), counts.subarray(2, 3)]
+    const pointer = this.nativeContextPointer(context, "ot_markdown_read_leaf")
+    const read = (
+      bytes: Uint8Array | null,
+      chunks: Uint32Array | null,
+      spans: Uint32Array | null,
+      urls: Uint8Array | null,
+    ) =>
+      nativeResult(
+        "ot_markdown_read_leaf",
+        this.opentui.symbols.ot_markdown_read_leaf(
+          pointer,
+          handle,
+          block,
+          bytes,
+          bytes?.length ?? 0,
+          byteCount,
+          chunks,
+          spans,
+          spans?.length ?? 0,
+          chunkCount,
+          urls,
+          urls?.length ?? 0,
+          urlCount,
+        ),
+      )
+    read(null, null, null, null)
+    const layout = nativeLayouts.ot_styled_text_chunk
+    const stride = layout.size / 4
+    const bytes = new Uint8Array(byteCount[0])
+    const records = new Uint32Array(chunkCount[0] * stride)
+    const spans = new Uint32Array(chunkCount[0])
+    const urls = new Uint8Array(urlCount[0])
+    if (chunkCount[0] > 0) read(viewOrNull(bytes), records, spans, viewOrNull(urls))
+    const colors = new Uint16Array(records.buffer)
+    const chunks: TextChunk[] = []
+    let at = 0
+    for (let index = 0; index < chunkCount[0]; index++) {
+      const base = index * stride
+      const flags = records[base + layout.fields.flags.offset / 4]
+      const end = at + records[base + layout.fields.byte_count.offset / 4]
+      const color = (offset: number) => RGBA.fromArray(colors.slice(base * 2 + offset / 2, base * 2 + offset / 2 + 4))
+      const chunk: TextChunk = { __isChunk: true, text: markdownDecoder.decode(bytes.subarray(at, end)) }
+      if (flags & nativeConstants.OT_SCENE_TEXT_FOREGROUND) chunk.fg = color(layout.fields.foreground.offset)
+      if (flags & nativeConstants.OT_SCENE_TEXT_BACKGROUND) chunk.bg = color(layout.fields.background.offset)
+      chunk.attributes = records[base + layout.fields.attributes.offset / 4]
+      if (flags & nativeConstants.OT_SCENE_TEXT_LINK) {
+        const offset = records[base + layout.fields.link_offset.offset / 4]
+        const url = urls.subarray(offset, offset + records[base + layout.fields.link_byte_count.offset / 4])
+        chunk.link = { url: markdownDecoder.decode(url) }
+      }
+      chunks.push(chunk)
+      at = end
+    }
+    return { chunks, spans }
+  }
+
+  /** Binds a scene text node to a paragraph or heading, which the doc then writes. */
+  public markdownBind(
+    context: NativeContextHandle,
+    doc: ContextMarkdownHandle,
+    block: number,
+    node: SceneNodeHandle,
+  ): void {
+    const handle = encodeContextHandle(context, doc)
+    const target = encodeContextHandle(context, node)
+    this.getYogaHost().runMutation(() => {
+      const pointer = this.nativeContextPointer(context, "ot_markdown_bind")
+      nativeResult("ot_markdown_bind", this.opentui.symbols.ot_markdown_bind(pointer, handle, block, target))
+    })
   }
 
   private encodeStyledText(content: StyledText, allowLinks = true, preserveChunkOrdinals = false) {
@@ -7916,7 +8454,7 @@ export class FFIRenderLib {
     this.getYogaHost().assertMutable()
     const handle = encodeContextHandle(context, node)
     const record = createContextRecord(layout)
-    const operation = ["reset", "set", "update"].indexOf(options.operation)
+    const operation = ["reset", "set", "update", "colors"].indexOf(options.operation)
     const behavior = ["cell", "word", "line"].indexOf(options.behavior)
     if (operation < 0 || behavior < 0) throw new TypeError("Unknown scene text selection operation or behavior")
     record[layout.fields.operation.offset / 4] = operation
@@ -8044,7 +8582,7 @@ export class FFIRenderLib {
   public sceneGetLayout(
     context: NativeContextHandle,
     node: SceneNodeHandle,
-    observation: boolean | "paint" = false,
+    observation: boolean | "paint" | "content" = false,
   ): NativeSceneLayout {
     const layout = nativeLayouts.ot_scene_layout
     const scratch = this.sceneLayoutRecord ?? createSceneLayoutRecord()
@@ -8054,9 +8592,11 @@ export class FFIRenderLib {
       const mode =
         observation === "paint"
           ? nativeConstants.OT_LAYOUT_PAINT
-          : toFFIBool(observation, "Scene Yoga layout observation")
-            ? nativeConstants.OT_LAYOUT_YOGA
-            : nativeConstants.OT_LAYOUT_PUBLIC
+          : observation === "content"
+            ? nativeConstants.OT_LAYOUT_CONTENT
+            : toFFIBool(observation, "Scene Yoga layout observation")
+              ? nativeConstants.OT_LAYOUT_YOGA
+              : nativeConstants.OT_LAYOUT_PUBLIC
       const { output, values, coordinates } = scratch
       output[layout.fields.struct_size.offset / 4] = layout.size
       output[layout.fields.abi_version.offset / 4] = nativeConstants.OT_CONTEXT_ABI_VERSION
@@ -8352,14 +8892,25 @@ export class FFIRenderLib {
     nativeResult("ot_scene_frame_cancel", this.opentui.symbols.ot_scene_frame_cancel(pointer, handle, id))
   }
 
-  public sceneHitTest(context: NativeContextHandle, session: SessionHandle, x: number, y: number): number {
+  /** `excluded` is a node's public number whose own hits the test skips, or zero. */
+  public sceneHitTest(
+    context: NativeContextHandle,
+    session: SessionHandle,
+    x: number,
+    y: number,
+    excluded = 0,
+  ): number {
     const handle = encodeContextHandle(context, session)
     toFFII32(x, "Scene hit x")
     toFFII32(y, "Scene hit y")
+    toSafeFFIU32Length(excluded, "Scene hit exclusion")
     // Hit tests never call back into JavaScript, so one output word serves every test.
     const output = this.hitTestOutput
-    const pointer = this.nativeContextPointer(context, "ot_scene_hit_test")
-    nativeResult("ot_scene_hit_test", this.opentui.symbols.ot_scene_hit_test(pointer, handle, x, y, output))
+    const pointer = this.nativeContextPointer(context, "ot_scene_hit_test_excluding")
+    nativeResult(
+      "ot_scene_hit_test_excluding",
+      this.opentui.symbols.ot_scene_hit_test_excluding(pointer, handle, x, y, excluded, output),
+    )
     return output[0]
   }
 

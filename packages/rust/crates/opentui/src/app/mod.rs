@@ -30,6 +30,7 @@ mod proxy;
 mod selection;
 #[cfg(feature = "tokio")]
 mod tasks;
+mod tick;
 mod timer;
 
 pub use crate::native::Corner;
@@ -38,6 +39,7 @@ pub use proxy::{AppProxy, PROXY_CAPACITY, ProxyError};
 
 #[cfg(feature = "tokio")]
 pub use tasks::TaskHandle;
+pub use tick::{AnimationTick, Tick};
 pub use timer::TimerId;
 
 use crate::error::{Error, Result, Status};
@@ -51,14 +53,20 @@ use crate::post::{Area, PostState};
 use crate::remote::RemoteTerminal;
 use crate::term::{QueryPort, TerminalPalette};
 use crate::theme::{Theme, ThemeMode};
-use crate::widget::{AnyWidget, Behavior, Callbacks, Element, Painter, View, Widget};
+use crate::widget::{AnyWidget, Behavior, Callbacks, Element, Painter, ScrollInner, View, Widget};
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// More environment the terminal of a headless app made on this thread reports
+    /// ([`crate::testing::TestApp::with_hyperlinks`]).
+    pub(crate) static HEADLESS_ENVIRONMENT: RefCell<Vec<(&'static str, &'static str)>> = const { RefCell::new(Vec::new()) };
+}
 
 /// How an [`App`] runs.
 #[derive(Clone, Debug)]
@@ -274,6 +282,17 @@ struct Animation {
     step: AnimationStep,
 }
 
+/// Work before each frame: [`App::animate`] steps, and the tick clock once anything subscribes. One cell, so a frame
+/// checks both in one borrow.
+#[derive(Default)]
+struct Animations {
+    steps: Vec<Animation>,
+    ticks: Option<Box<tick::Ticks>>,
+}
+
+// An app that never animates pays one pointer for the tick clock.
+const _: () = assert!(size_of::<Animations>() == size_of::<Vec<Animation>>() + size_of::<usize>());
+
 pub(crate) struct AppInner {
     session: Session,
     options: AppOptions,
@@ -303,8 +322,10 @@ pub(crate) struct AppInner {
     error: RefCell<Option<Error>>,
     clock: Clock,
     timers: RefCell<timer::Timers>,
-    animations: RefCell<Vec<Animation>>,
+    animations: RefCell<Animations>,
     timelines: RefCell<Vec<Weak<crate::animation::TimelineInner>>>,
+    /// Scroll boxes with scroll handlers that moved since the last report.
+    scrolled: RefCell<Vec<Weak<ScrollInner>>>,
     deferred: RefCell<VecDeque<Deferred>>,
     handlers: AppHandlers,
     messages: RefCell<HashMap<TypeId, MessageHandlers>>,
@@ -471,6 +492,7 @@ impl App {
     pub fn headless(options: HeadlessOptions) -> Result<Self> {
         let session = Self::headless_session(options.width, options.height, &options.app)?;
         let app = Self::with_session(session, options.app, Clock::Real(Instant::now()), None)?;
+        #[expect(clippy::let_underscore_must_use, reason = "a new app's cell is empty")]
         let _ = app.0.headless.set(headless::HeadlessState::default());
         Ok(app)
     }
@@ -485,12 +507,9 @@ impl App {
     fn headless_session(width: u16, height: u16, options: &AppOptions) -> Result<Session> {
         let context = Context::new(options.host.context)?;
         let session = Session::new(&context, options.host.session)?;
-        session.attach_renderer(
-            u32::from(width.max(1)),
-            u32::from(height.max(1)),
-            Remote::Remote,
-            &[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")],
-        )?;
+        let mut environment = vec![("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+        HEADLESS_ENVIRONMENT.with_borrow(|extra| environment.extend_from_slice(extra));
+        session.attach_renderer(u32::from(width.max(1)), u32::from(height.max(1)), Remote::Remote, &environment)?;
         Ok(session)
     }
 
@@ -498,6 +517,7 @@ impl App {
     pub(crate) fn detached(session: Session, parent: Session, options: AppOptions) -> Result<Self> {
         let start = Instant::now();
         let app = Self::with_session(session, options, Clock::Manual { start, now: Cell::new(start) }, None)?;
+        #[expect(clippy::let_underscore_must_use, reason = "a new app's cell is empty")]
         let _ = app.0.parent.set(parent);
         Ok(app)
     }
@@ -537,8 +557,9 @@ impl App {
             error: RefCell::new(None),
             clock,
             timers: RefCell::new(timer::Timers::default()),
-            animations: RefCell::new(Vec::new()),
+            animations: RefCell::default(),
             timelines: RefCell::new(Vec::new()),
+            scrolled: RefCell::new(Vec::new()),
             deferred: RefCell::new(VecDeque::new()),
             handlers: AppHandlers::default(),
             messages: RefCell::new(HashMap::new()),
@@ -634,7 +655,7 @@ impl App {
         if !self.0.in_frame.get()
             && let Some(parent) = self.0.parent.get()
         {
-            let _ = self.0.session.sync_detached(parent);
+            self.report(self.0.session.sync_detached(parent));
         }
         &self.0.session
     }
@@ -658,6 +679,11 @@ impl App {
     /// Frames painted so far.
     pub fn frame_number(&self) -> u64 {
         self.0.frame.get()
+    }
+
+    /// Frames finished so far: [`Self::frame_number`] counts the frame being painted from its start.
+    pub(crate) fn painted_frames(&self) -> u64 {
+        self.0.frame.get() - u64::from(self.0.in_frame.get())
     }
 
     /// The app's clock. Tests advance it manually.
@@ -723,8 +749,8 @@ impl App {
 
     /// Restores the terminal after the current turn, runs `task` while another program owns it (an external editor,
     /// for example), and sets the terminal up again when `task` returns. The event loop waits for `task`, and input the
-    /// terminal sent meanwhile is dropped. Without a running local terminal (a test, a remote app, Windows), `task` runs
-    /// after the current event with the terminal untouched. A second call before the first runs replaces it.
+    /// terminal sent meanwhile is dropped. Without a running local terminal (a test, a remote app), `task` runs after
+    /// the current event with the terminal untouched. A second call before the first runs replaces it.
     pub fn release_terminal(&self, task: impl FnOnce(&mut Cx<'_>) + 'static) {
         if !self.0.terminal_active.get() {
             self.defer(task);
@@ -792,7 +818,8 @@ impl App {
         self.0.terminal_active.get() && self.report(self.0.session.notify(message, title)).unwrap_or(false)
     }
 
-    /// Runs `task` after the current event finishes, before the next frame.
+    /// Runs `task` after the current event finishes, before the next frame. A task still queued when the app ends, or
+    /// deferred while it ends, is dropped without running.
     pub fn defer(&self, task: impl FnOnce(&mut Cx<'_>) + 'static) {
         self.0.deferred.borrow_mut().push_back(Box::new(task));
     }
@@ -908,14 +935,16 @@ impl App {
 
     /// Cancels a timer. Returns whether it was still scheduled.
     pub fn cancel_timer(&self, timer: TimerId) -> bool {
-        self.0.timers.borrow_mut().cancel(timer)
+        // The callback drops after the borrow: it may own a widget, whose drop ends its animation ticks.
+        let cancelled = self.0.timers.borrow_mut().cancel(timer);
+        cancelled.is_some()
     }
 
     /// Calls `step` before every frame with the time since its previous call, until it returns `false`. Frames run
     /// at up to [`AppOptions::max_fps`] while any animation is active. [`Timeline`](crate::animation::Timeline)
     /// builds eased tweens on this.
     pub fn animate(&self, step: impl FnMut(&mut Cx<'_>, Duration) -> bool + 'static) {
-        self.0.animations.borrow_mut().push(Animation { last: self.now(), step: Box::new(step) });
+        self.0.animations.borrow_mut().steps.push(Animation { last: self.now(), step: Box::new(step) });
         self.0.dirty.set(true);
     }
 
@@ -1155,6 +1184,9 @@ impl App {
                 | MouseEventKind::ScrollLeft
                 | MouseEventKind::ScrollRight
         );
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.drag_and_drop(event, None, None, false);
+        }
         let selecting = self.selection_mouse(event, hit.as_ref());
         let target = match event.kind {
             // As in Core, a selection drag goes to the widget under the pointer, so scroll boxes it passes over can
@@ -1204,7 +1236,10 @@ impl App {
                 self.set_focus(Some(focusable));
             }
         }
-        self.drag_and_drop(event, captured.as_ref(), hit.as_ref(), selecting);
+        // A left press ended the old drag before its handlers; a drag they started is the new gesture's.
+        if event.kind != MouseEventKind::Down(MouseButton::Left) {
+            self.drag_and_drop(event, captured.as_ref(), hit.as_ref(), selecting);
+        }
         if let MouseEventKind::Up(_) = event.kind {
             *self.0.capture.borrow_mut() = None;
             self.finish_selection_drag(event, hit.as_ref());
@@ -1213,7 +1248,8 @@ impl App {
     }
 
     /// Tracks a left-button drag from the captured widget: drag-over changes for the widgets under the pointer, then a
-    /// drop where it ends.
+    /// drop where it ends. A press during a drag means the drag's release was lost: the press ends it, before its own
+    /// handlers run and without a drop.
     fn drag_and_drop(
         &self,
         event: &MouseEvent,
@@ -1249,7 +1285,7 @@ impl App {
                     widget.element().handlers.drag_over.emit(&mut Cx::new(self), &(source.clone(), true));
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                 let Some((source, over)) = self.0.drag.borrow_mut().take() else { return };
                 let dragged = AnyWidget(Rc::clone(&source));
                 for widget in over.iter().filter_map(Weak::upgrade) {
@@ -1381,22 +1417,56 @@ impl App {
         self.0.timers.borrow().next_due()
     }
 
-    fn wants_frame(&self) -> bool {
-        self.0.dirty.get() || !self.0.animations.borrow().is_empty()
+    pub(crate) fn queue_scroll(&self, scroll: Weak<ScrollInner>) {
+        self.0.scrolled.borrow_mut().push(scroll);
     }
 
+    /// Runs the scroll handlers of the boxes that moved since the last report. Moves they make wait for the next one.
+    fn report_scrolls(&self) {
+        if self.0.scrolled.borrow().is_empty() {
+            return;
+        }
+        let scrolled = std::mem::take(&mut *self.0.scrolled.borrow_mut());
+        for scroll in scrolled.iter().filter_map(Weak::upgrade) {
+            scroll.report(&mut Cx::new(self));
+        }
+    }
+
+    /// Whether the turn asked to quit, fail, suspend, or release the terminal, which the top of the event loop does.
+    fn ends_turn(&self) -> bool {
+        self.0.quit.get()
+            || self.0.suspend.get()
+            || self.0.release.borrow().is_some()
+            || self.0.error.borrow().is_some()
+    }
+
+    fn wants_frame(&self) -> bool {
+        self.0.dirty.get() || !self.0.animations.borrow().steps.is_empty()
+    }
+
+    /// Runs the ticks due by this frame, then the animation steps. An app that never animates returns at the check.
     fn run_animations(&self) {
+        let (mut steps, ticking) = {
+            let mut animations = self.0.animations.borrow_mut();
+            let ticking = animations.ticks.is_some();
+            if !ticking && animations.steps.is_empty() {
+                return;
+            }
+            (std::mem::take(&mut animations.steps), ticking)
+        };
+        if ticking {
+            self.run_ticks();
+        }
         let now = self.now();
-        let mut animations = std::mem::take(&mut *self.0.animations.borrow_mut());
-        animations.retain_mut(|animation| {
+        steps.retain_mut(|animation| {
             let elapsed = now.saturating_duration_since(animation.last);
             animation.last = now;
             (animation.step)(&mut Cx::new(self), elapsed)
         });
         // Animations started during this pass were pushed to the emptied list.
         let mut current = self.0.animations.borrow_mut();
-        animations.append(&mut current);
-        *current = animations;
+        steps.append(&mut current.steps);
+        current.steps = steps;
     }
 
     // Frames.
@@ -1411,6 +1481,7 @@ impl App {
         let started = Instant::now();
         self.run_animations();
         self.drain_deferred();
+        self.report_scrolls();
         let callbacks = started.elapsed();
         self.check()?;
         self.0.dirty.set(false);
@@ -1418,12 +1489,46 @@ impl App {
         let options = FrameOptions { background: self.theme().background, preserve_unwritten, ..Default::default() };
         self.0.filter_areas.borrow_mut().clear();
         self.0.in_frame.set(true);
-        let draft = self.0.session.frame(&options, |request| self.host_request(request));
+        // Only an app with ticks tells them which widgets the frame draws, so the others pay nothing per request. A
+        // subscription made during the frame counts it as drawn already. A widget clipped out of view is not drawn;
+        // the root, which has no paint slot, always is.
+        let draft = if self.0.animations.borrow().ticks.is_some() {
+            let root = self.root().id();
+            self.0.session.frame(&options, |request| {
+                match &request {
+                    HostRequest::Update { num, .. } if *num == root => self.mark_drawn(|widget| widget == root),
+                    HostRequest::Record { slots, .. } => {
+                        // Drawn when its area, at least one cell per axis since children may overflow it, meets the
+                        // clip.
+                        let meets = |start: f64, size: f32, clip: i32, clip_size: u32| {
+                            start < f64::from(clip) + f64::from(clip_size)
+                                && start + f64::from(size.max(1.0)) > f64::from(clip)
+                        };
+                        let drawn: HashSet<u32> = slots
+                            .iter()
+                            .filter(|slot| {
+                                let ((x, y, width, height), paint) = (slot.clip, &slot.paint);
+                                meets(paint.screen_x, paint.width, x, width)
+                                    && meets(paint.screen_y, paint.height, y, height)
+                            })
+                            .map(|slot| slot.num)
+                            .collect();
+                        self.mark_drawn(|widget| drawn.contains(&widget));
+                    }
+                    _ => {}
+                }
+                self.host_request(request)
+            })
+        } else {
+            self.0.session.frame(&options, |request| self.host_request(request))
+        };
         self.0.in_frame.set(false);
         crate::native::resume_measure_panic();
         self.check()?;
         let draft = draft?;
         self.post_process(&draft)?;
+        // Moves made during the frame that no layout of their box reported.
+        self.report_scrolls();
         self.record_frame_stats(started, callbacks);
         Ok(draft)
     }
@@ -1527,6 +1632,7 @@ impl App {
         });
         if !captured.is_empty() {
             use std::io::Write;
+            #[expect(clippy::let_underscore_must_use, reason = "stderr is the last place to report to")]
             let _ = std::io::stderr().write_all(&captured);
         }
         self.teardown();
@@ -1546,7 +1652,7 @@ impl App {
             self.publish_palette(&palette);
         }
         self.request_redraw();
-        let interval = Duration::from_secs(1) / self.0.options.max_fps.max(1);
+        let interval = self.frame_interval();
         let mut last_frame: Option<Instant> = None;
         let mut presenting = false;
         let mut events = Vec::new();
@@ -1578,39 +1684,53 @@ impl App {
                 continue;
             }
             let now = Instant::now();
-            let mut deadline = match (self.next_timer(), clipboard) {
-                (Some(timer), Some(clipboard)) => Some(timer.min(clipboard)),
-                (timer, clipboard) => timer.or(clipboard),
-            };
-            if self.wants_frame() || host.wants_frame() {
-                let earliest = last_frame.map_or(now, |last| last + interval);
-                if now >= earliest && host.can_render()? {
-                    let draft = self.paint()?;
-                    let outcome = host.present(draft)?;
-                    self.committed(outcome)?;
-                    last_frame = Some(now);
-                    presenting = outcome.accepted();
-                }
-                if self.wants_frame() || host.wants_frame() {
-                    // The frame cap applies, or output is still draining: check back shortly. A terminal that stopped
-                    // taking output wakes the host itself when it takes more.
-                    let retry = if now < earliest {
-                        Some(earliest)
-                    } else if host.output_blocked() {
-                        None
-                    } else {
-                        Some(now + Duration::from_millis(2))
-                    };
-                    if let Some(retry) = retry {
-                        deadline = Some(deadline.map_or(retry, |deadline| deadline.min(retry)));
-                    }
-                }
+            // The first frame may wait for the cursor report; later frames wait for the frame cap's next slot.
+            let earliest = (self.wants_frame() || host.wants_frame()).then(|| match last_frame {
+                Some(last) => last + interval,
+                None => host.frame_deadline().unwrap_or(now),
+            });
+            let mut framed = false;
+            if earliest.is_some_and(|earliest| now >= earliest) && host.can_render()? {
+                let draft = self.paint()?;
+                let outcome = host.present(draft)?;
+                self.committed(outcome)?;
+                last_frame = Some(now);
+                presenting = outcome.accepted();
+                framed = true;
             }
             if presenting {
                 let renderer = self.0.session.renderer_state()?;
                 if !renderer.frame_pending {
                     presenting = false;
                     self.presented(renderer);
+                    framed = true;
+                }
+            }
+            // Tasks a frame deferred run now, so the deadline sees the timers and frames that it and they asked for, and
+            // the loop does not sleep on a quit they asked for.
+            let wants = if framed {
+                self.drain_deferred();
+                if self.ends_turn() {
+                    continue;
+                }
+                self.wants_frame() || host.wants_frame()
+            } else {
+                earliest.is_some()
+            };
+            let mut deadline = match (self.next_timer(), clipboard) {
+                (Some(timer), Some(clipboard)) => Some(timer.min(clipboard)),
+                (timer, clipboard) => timer.or(clipboard),
+            };
+            if wants {
+                // The frame cap applies, or output is still draining: check back shortly. A terminal that stopped
+                // taking output wakes the host itself when it takes more.
+                let retry = match earliest {
+                    Some(earliest) if now < earliest => Some(earliest),
+                    _ if host.output_blocked() => None,
+                    _ => Some(now + Duration::from_millis(2)),
+                };
+                if let Some(retry) = retry {
+                    deadline = Some(deadline.map_or(retry, |deadline| deadline.min(retry)));
                 }
             }
             host.poll(deadline, &mut events)?;
@@ -1634,36 +1754,41 @@ impl App {
         if let Some(headless) = self.0.headless.get() {
             headless.clear();
         }
-        self.0.messages.borrow_mut().clear();
-        self.0.timers.borrow_mut().clear();
-        self.0.animations.borrow_mut().clear();
-        self.0.filter_areas.borrow_mut().clear();
+        // Everything drops after its borrow: what it owns may call the app as it drops.
+        self.0.messages.take();
+        self.0.animations.take();
+        let timers = self.0.timers.borrow_mut().clear();
+        drop(timers);
+        self.0.filter_areas.take();
         let timelines = std::mem::take(&mut *self.0.timelines.borrow_mut());
         for timeline in timelines.iter().filter_map(Weak::upgrade) {
             timeline.teardown();
         }
-        self.0.deferred.borrow_mut().clear();
         self.0.proxy.close();
-        #[cfg(feature = "tokio")]
-        {
-            self.0.tasks.borrow_mut().clear();
-            *self.0.runtime.borrow_mut() = tasks::Runtime::default();
-        }
         self.close_clipboard();
         crate::console::unregister(self.0.console_id.get());
-        let console = std::mem::take(&mut *self.0.console.borrow_mut());
-        drop(console);
-        *self.0.focus.borrow_mut() = None;
-        *self.0.capture.borrow_mut() = None;
-        *self.0.selection.borrow_mut() = None;
-        *self.0.drag.borrow_mut() = None;
-        self.0.hover.borrow_mut().clear();
+        self.0.console.take();
+        self.0.focus.take();
+        self.0.capture.take();
+        self.0.selection.take();
+        self.0.drag.take();
+        self.0.hover.take();
         let live: Vec<Rc<dyn Behavior>> = self.0.registry.borrow().values().filter_map(Weak::upgrade).collect();
         for widget in &live {
             widget.teardown();
             widget.element().teardown();
         }
         crate::pty::teardown(self);
+        // Tasks deferred or spawned until now, also while the above dropped, are dropped without running.
+        for _ in 0..TURN_WORK_MAX {
+            #[cfg(feature = "tokio")]
+            self.0.tasks.take();
+            if self.0.deferred.take().is_empty() {
+                break;
+            }
+        }
+        #[cfg(feature = "tokio")]
+        self.0.runtime.take();
     }
 
     // Headless driving for tests.
@@ -1700,6 +1825,11 @@ impl App {
 
     pub(crate) fn needs_frame(&self) -> bool {
         self.wants_frame()
+    }
+
+    /// The shortest time between frames, from [`AppOptions::max_fps`].
+    pub(crate) fn frame_interval(&self) -> Duration {
+        Duration::from_secs(1) / self.0.options.max_fps.max(1)
     }
 
     pub(crate) fn set_size(&self, width: u16, height: u16) -> Result<()> {

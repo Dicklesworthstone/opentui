@@ -1239,8 +1239,9 @@ fn stream_replies_and_partial_sequences() {
     let (plain, kitty, probing) =
         (Expectations::NONE, Expectations::KITTY_KEYBOARD, Expectations::REPLIES | Expectations::CURSOR_POSITION);
     type Case = (Expectations, &'static [u8], &'static [u8], Vec<Input>);
-    let cases: [Case; 14] = [
+    let cases: [Case; 15] = [
         (plain, b"\x1b[<35;20", b";5m", vec![mouse(Mouse::Moved, 19, 4, NONE)]),
+        (plain, b"\x1b[20", b"0~a\rb\x1b[201~", vec![paste("a\rb")]),
         (kitty, b"\x1b[118;5", b";3u", vec![key(Char('v'), CTRL)]),
         (kitty, b"\x1b[97;", b"2u", vec![key(Char('A'), SHIFT)]),
         (kitty, b"\x1b[97:65;", b"6:1u", vec![key(Char('A'), CTRL | SHIFT)]),
@@ -1289,6 +1290,8 @@ fn stream_bracketed_paste() {
         assert_eq!(timed.feed(&end[index..]), [paste("hello")]);
     }
     assert_eq!(split(&[b"\x1b[200~abc\x1b", b"\x1b[201~"]), [paste("abc\x1b")]);
+    // Decoded as Core's `decodePasteBytes`: lossy UTF-8 without a leading byte order mark.
+    assert_eq!(parse(b"\x1b[200~\xef\xbb\xbfa\xff\x1b[201~"), [paste("a\u{fffd}")]);
     let payload = "x".repeat(100_000);
     assert_eq!(parse(format!("\x1b[200~{payload}\x1b[201~z").as_bytes()), [paste(&payload), ch('z')]);
     // Native code reports a paste in pieces of the payload buffer's size; joined, it keeps at most 4 MiB.

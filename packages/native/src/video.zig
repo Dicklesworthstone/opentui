@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const io = if (builtin.is_test) std.testing.io else @import("root").io;
 const audio = @import("audio.zig");
 const image = @import("image.zig");
-const utils = @import("utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -191,7 +190,7 @@ fn nowUs() i64 {
 }
 
 fn elapsedSince(started: i64) u32 {
-    return utils.unsigned(u32, @min(utils.nonNegative(nowUs() - started), std.math.maxInt(u32)));
+    return @intCast(std.math.clamp(nowUs() - started, 0, std.math.maxInt(u32)));
 }
 
 fn copyMessage(buffer: []u8, message: []const u8) usize {
@@ -1107,8 +1106,8 @@ pub const Player = struct {
     }
 
     /// Advances the media clock to now and ends or loops playback at the end; a loop
-    /// restarts at the time that ran past the end. It never decodes, so state reads
-    /// keep playback moving while the node is not painted.
+    /// restarts at the time that ran past the end. It starts no decode, so state reads keep
+    /// playback moving while the node is not painted; a failed decode still in flight fails it.
     fn tick(self: *Player) void {
         if (!self.playing) return;
         const state = self.video.getState();
@@ -1124,6 +1123,7 @@ pub const Player = struct {
         const media = if (audio_clock) state.current_time_us else self.wallTime();
         const total = self.duration();
         if (total <= 0 or media < total) return;
+        self.video.drainPreparation() catch return self.fail();
         if (self.loop) self.seek(@mod(media, total)) catch {} else self.finish();
     }
 

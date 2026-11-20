@@ -180,6 +180,14 @@ fn duplicate_command_names_across_layers_dedupe_by_name() {
     assert_eq!(reachable[0].title.as_deref(), Some("New"));
     assert_eq!(keymap.commands(&CommandQuery::visibility(Visibility::Active)).len(), 2);
     assert_eq!(keymap.commands(&CommandQuery::visibility(Visibility::Registered)).len(), 2);
+    // Past 20 entries, where an unstable sort stops keeping equal names in their order.
+    for index in 0..12 {
+        let commands = [record(&calls, "save").title(index.to_string()), record(&calls, &format!("z{}", index % 3))];
+        keymap.register_layer(Layer::new().commands(commands)).forget();
+    }
+    let reachable = keymap.commands(&CommandQuery::default());
+    let names: Vec<_> = reachable.iter().map(|command| format!("{}:{:?}", command.name, command.title)).collect();
+    assert_eq!(names, ["save:Some(\"11\")", "z2:None", "z1:None", "z0:None"]);
 }
 
 #[test]
@@ -738,6 +746,21 @@ fn strokes_follow_core_key_names() {
     assert_eq!(stroke(KeyCode::Char('?'), Modifiers::NONE), "?");
     assert_eq!(stroke(KeyCode::F(5), Modifiers::SUPER | Modifiers::HYPER), "super+hyper+f5");
     assert_eq!(stroke(KeyCode::Other(57441), Modifiers::NONE), "leftshift");
+    // Each Kitty key Core names is a key in binding syntax, and the Textarea's own keymap runs each of Core's
+    // textarea bindings on the key Core means: its meta is Alt.
+    let keymap = Keymap::<u32>::new();
+    let parsed = |key: &str| keymap.parse_key_sequence(key).unwrap().remove(0).stroke;
+    for code in crate::sys::OT_INPUT_KEY_MEDIA_PLAY..=crate::sys::OT_INPUT_KEY_ISO_LEVEL5_SHIFT {
+        let name = stroke(KeyCode::Other(code), Modifiers::NONE);
+        assert_eq!(parsed(&name).name, name);
+    }
+    let editor = crate::widget::Textarea::default_keymap();
+    assert_eq!(editor.len(), crate::tables::TEXTAREA_SHORTCUTS.len(), "one row per shortcut");
+    for &(key, action) in addons::TEXTAREA_BINDINGS {
+        let alt = key.replace("meta", "alt").replace("kpenter", "return");
+        let event = KeyEvent { keypad: key.ends_with("kpenter"), ..KeyEvent::from_shortcut(&alt).unwrap() };
+        assert_eq!((Stroke::from_event(&event), editor.get(&event)), (parsed(key), Some(action)), "{key}");
+    }
 }
 
 // enabled.test.ts and metadata.test.ts
@@ -748,12 +771,13 @@ fn enabled_conditions_gate_layers_and_commands() {
     let calls = calls();
     let layer_on = Rc::new(Cell::new(true));
     let command_on = Rc::new(Cell::new(true));
-    let (layer_gate, command_gate) = (layer_on.clone(), command_on.clone());
-    keymap
-        .register_layer(
-            Layer::new().command(record(&calls, "run").enabled(Condition::when(move || command_gate.get()))),
-        )
-        .forget();
+    let checks = Rc::new(Cell::new(0));
+    let (layer_gate, command_gate, counter) = (layer_on.clone(), command_on.clone(), checks.clone());
+    let gate = Condition::when(move || {
+        counter.set(counter.get() + 1);
+        command_gate.get()
+    });
+    keymap.register_layer(Layer::new().command(record(&calls, "run").enabled(gate))).forget();
     keymap
         .register_layer(
             Layer::new().enabled(Condition::when(move || layer_gate.get())).binding(Binding::new("r").cmd("run")),
@@ -761,6 +785,8 @@ fn enabled_conditions_gate_layers_and_commands() {
         .forget();
     keymap.register_layer(Layer::new().enabled(false).binding(Binding::new("s").cmd("run"))).forget();
     assert!(press(&keymap, "r").handled);
+    // One view per key: the command's condition runs once, not again before the command runs.
+    assert_eq!(checks.get(), 1);
     assert!(!press(&keymap, "s").handled);
     command_on.set(false);
     assert!(!press(&keymap, "r").stop_propagation);
@@ -769,6 +795,71 @@ fn enabled_conditions_gate_layers_and_commands() {
     layer_on.set(false);
     assert!(!press(&keymap, "r").handled);
     assert_eq!(taken(&calls), ["run"]);
+}
+
+#[test]
+fn conditions_that_flip_between_and_within_keys_dispatch_as_recorded() {
+    // A differential row: the trace was recorded on the keymap that built its view of enabled commands several times
+    // per key. Commands of one name chain across layers, reject, and flip the conditions of others while a key runs.
+    // `d` also matches `c`, so a pending leader advances on both and keeps the captures of the better match.
+    let keymap = Keymap::new();
+    leader(&keymap);
+    keymap
+        .append_event_match_resolver(|event| (event.code == KeyCode::Char('d')).then(|| vec![Stroke::new("c")]))
+        .forget();
+    let calls = calls();
+    let gates: Rc<[Cell<bool>; 4]> = Rc::new(Default::default());
+    for layer in 0..4 {
+        let commands = (0..4).map(|index| {
+            let (calls, gates, gate) = (calls.clone(), gates.clone(), gates.clone());
+            Command::new(format!("c{index}"), move |_| {
+                calls.borrow_mut().push(format!("{layer}.{index}"));
+                let flip = &gates[(layer + index) % 4];
+                flip.set(!flip.get());
+                (layer + index) % 3 != 0
+            })
+            .enabled(Condition::when(move || gate[layer * index % 4].get()))
+        });
+        let (gate, flip) = (gates.clone(), gates.clone());
+        keymap
+            .register_layer(
+                Layer::new()
+                    .enabled(Condition::when(move || layer != 3 || gate[3].get()))
+                    .commands(commands.collect::<Vec<_>>())
+                    .bindings([
+                        Binding::new("a").cmd(format!("c{layer}")).fallthrough(layer % 2 == 0),
+                        Binding::new("b").cmd("c1").fallthrough(true),
+                        Binding::new("e").cmd(format!("c{}", (4 - layer) % 4)).fallthrough(true),
+                        Binding::new("f").run(move |_| flip[layer].set(!flip[layer].get())).fallthrough(true),
+                        Binding::new("f").cmd(format!("c{layer}")),
+                        Binding::new(["<leader>c", "<leader>d"][layer % 2]).cmd(format!("c{}", 3 - layer)),
+                    ]),
+            )
+            .forget();
+    }
+    let keys =
+        "a b e f a ctrl+x c e f a ctrl+x d b e !c2 ctrl+x c f c e a b e f b !c0 a e ctrl+x d a e f b ctrl+x x a e f";
+    let mut trace = Vec::new();
+    for (step, key) in keys.split(' ').enumerate() {
+        gates[step % 4].set(step % 3 != 0);
+        let reason = match key.strip_prefix('!') {
+            Some(name) => format!("{:?}", keymap.dispatch_command(name)),
+            None => format!("{:?}", press(&keymap, key).reason),
+        };
+        trace.push(format!("{key}:{reason}:{}", taken(&calls).join(",")));
+    }
+    let recorded = "a:NoMatch: b:BindingHandled:1.1,2.1,1.1,3.1 e:BindingHandled:3.1,3.2,2.3 f:BindingHandled:2.0 \
+         a:BindingHandled:2.2,2.1 ctrl+x:SequencePending: c:BindingHandled:3.1 \
+         e:BindingHandled:3.1,3.3,1.3,3.0,2.0 f:BindingHandled:2.2 a:BindingHandled:1.2,3.1 \
+         ctrl+x:SequencePending: d:BindingHandled:3.0,2.0 b:NoMatch: e:NoMatch: !c2:Disabled:1.2 \
+         ctrl+x:SequencePending: c:BindingHandled:2.1,1.1 f:BindingHandled:0.3,3.2 c:NoMatch: \
+         e:BindingHandled:3.1,1.3,3.0,2.0 a:BindingHandled:2.2,2.1 b:BindingHandled:3.1,3.1,3.1,3.1 \
+         e:BindingHandled:3.1,3.2,3.3,2.3 f:BindingHandled:0.3,3.2 b:BindingHandled:3.1,3.1,3.1,3.1 \
+         !c0:Disabled: a:BindingHandled:3.3,2.3 e:NoMatch: ctrl+x:SequencePending: d:BindingHandled:2.2 \
+         a:BindingHandled:1.1 e:BindingHandled:3.1,3.2,2.3 f:BindingHandled:2.3 \
+         b:BindingHandled:2.1,0.1,3.1,3.1 ctrl+x:SequencePending: x:SequenceMiss: a:BindingHandled:3.3,2.3 \
+         e:BindingHandled:3.1,3.3,1.3 f:BindingHandled:2.3";
+    assert_eq!(trace.join(" "), recorded);
 }
 
 #[test]
@@ -905,10 +996,13 @@ fn key_aliases_replace_standalone_names() {
         press(&keymap, key);
     }
     assert_eq!(taken(&calls), ["submit", "submit", "close", "page"]);
-    // `escape` and `enterprise` keep their spelling.
-    let names: Vec<String> =
-        keymap.parse_key_sequence("escape").unwrap().into_iter().map(|part| part.stroke.name).collect();
-    assert_eq!(names, ["escape"]);
+    // A binding parses as the layer expanded it, one sequence per key; `escape` keeps its spelling.
+    let strokes = |parts: Vec<KeySequencePart>| -> Vec<Stroke> { parts.into_iter().map(|part| part.stroke).collect() };
+    let parse = |key| -> Vec<Vec<Stroke>> { keymap.parse_binding(key).unwrap().into_iter().map(strokes).collect() };
+    let plain = |key| strokes(keymap.parse_key_sequence(key).unwrap());
+    assert_eq!(parse("shift+enter,ESC"), [plain("shift+return"), plain("escape")]);
+    assert_eq!(plain("shift+return")[0].name, "return");
+    assert_eq!(parse("escape"), [plain("escape")]);
 }
 
 #[test]
@@ -979,28 +1073,102 @@ fn base_layout_fallback_matches_non_latin_layouts() {
 }
 
 #[test]
-fn timed_leader_expires_its_sequence() {
-    let keymap = Keymap::new();
-    let calls = calls();
-    let leader = addons::timed_leader(&keymap, "leader", "ctrl+x", Duration::from_millis(2000)).unwrap();
+fn timed_leader_expires_on_the_apps_clock() {
+    // Wired as an app wires it: a capture handler stops the keys the keymap handles, and each change of the pending
+    // sequence sets a timer on the app's clock for the leader's latest generation.
+    let app = crate::testing::TestApp::new(10, 2);
+    let (keymap, calls) = (Keymap::new(), calls());
+    // The app's listener registers before the leader: what `armed()` says doesn't depend on listener order.
+    let leader = Rc::new(std::cell::OnceCell::new());
+    let listener = keymap.on_pending_sequence({
+        let (app, leader) = (app.app().clone(), leader.clone());
+        move |_| {
+            let Some(generation) = leader.get().and_then(addons::TimedLeader::armed) else { return };
+            let leader = leader.clone();
+            app.set_timeout(leader.get().unwrap().timeout(), move |_| {
+                leader.get().unwrap().expire(generation);
+            });
+        }
+    });
+    assert!(
+        leader.set(addons::timed_leader(&keymap, "leader", "ctrl+x", Duration::from_millis(2000)).unwrap()).is_ok()
+    );
+    let timed = leader.get().unwrap();
     keymap
-        .register_layer(Layer::new().command(record(&calls, "new")).binding(Binding::new("<leader>gn").cmd("new")))
+        .register_layer(
+            Layer::new()
+                .command(record(&calls, "new"))
+                .bindings([Binding::new("<leader>gn").cmd("new"), Binding::new("dd").cmd("new")]),
+        )
         .forget();
-    assert!(leader.deadline().is_none());
-    press(&keymap, "ctrl+x");
-    let deadline = leader.deadline().expect("armed");
-    assert!(!leader.expire(Instant::now()));
-    press(&keymap, "g");
-    assert!(leader.deadline().unwrap() >= deadline);
-    assert!(leader.expire(Instant::now() + Duration::from_millis(2000)));
-    assert!(pending(&keymap).is_empty());
-    assert!(leader.deadline().is_none());
-    press(&keymap, "ctrl+x");
-    press(&keymap, "g");
-    press(&keymap, "n");
-    assert!(leader.deadline().is_none());
+    let other = Rc::new(Cell::new(true));
+    keymap
+        .register_layer(
+            Layer::new()
+                .enabled(Condition::when({
+                    let other = other.clone();
+                    move || other.get()
+                }))
+                .command(record(&calls, "other"))
+                .binding(Binding::new("<leader>a").cmd("other")),
+        )
+        .forget();
+    app.on_key_capture({
+        let keymap = keymap.clone();
+        move |cx, key| {
+            if keymap.handle_key(key).handled {
+                cx.stop_propagation();
+            }
+        }
+    });
+    // Only a sequence that starts with the leader arms it.
+    app.press("d");
+    assert_eq!((pending(&keymap).len(), timed.armed()), (1, None));
+    app.press("d");
     assert_eq!(taken(&calls), ["new"]);
-    leader.dispose();
+    app.press("ctrl+x");
+    app.advance(Duration::from_millis(1999));
+    assert_eq!(pending(&keymap).len(), 1);
+    app.advance(Duration::from_millis(1));
+    assert!(pending(&keymap).is_empty());
+    assert_eq!(timed.armed(), None);
+    // A new timeout applies from the next arming: the pending sequence keeps its timer, and the next stroke takes it.
+    app.press("ctrl+x");
+    timed.set_timeout(Duration::from_millis(250));
+    app.advance(Duration::from_millis(250));
+    app.press("g");
+    app.advance(Duration::from_millis(249));
+    assert_eq!(pending(&keymap).len(), 2);
+    app.advance(Duration::from_millis(1));
+    assert!(pending(&keymap).is_empty());
+    timed.set_timeout(Duration::from_millis(2000));
+    // A layer that turns off mid-sequence changes the sequence without a key, and the timeout starts again.
+    app.press("ctrl+x");
+    app.advance(Duration::from_millis(500));
+    other.set(false);
+    assert_eq!(pending(&keymap).len(), 1);
+    app.advance(Duration::from_millis(1999));
+    assert_eq!(pending(&keymap).len(), 1);
+    app.advance(Duration::from_millis(1));
+    assert!(pending(&keymap).is_empty(), "still pending 2,000 ms after the layer turned off");
+    other.set(true);
+    // A later stroke arms a new generation, which the old one's expiry leaves alone.
+    app.press("ctrl+x");
+    let first = timed.armed().expect("armed");
+    app.advance(Duration::from_millis(1000));
+    app.press("g");
+    assert!(!timed.expire(first));
+    app.advance(Duration::from_millis(1999));
+    assert_eq!(pending(&keymap).len(), 2);
+    // A completed sequence disarms the leader, and its last generation expires nothing.
+    let last = timed.armed().expect("armed");
+    app.press("n");
+    assert_eq!(taken(&calls), ["new"]);
+    assert_eq!(timed.armed(), None);
+    assert!(!timed.expire(last));
+    listener.dispose();
+    drop(app);
+    Rc::into_inner(leader).expect("the app's handlers are gone").into_inner().unwrap().dispose();
     assert!(keymap.parse_key_sequence("<leader>").unwrap().is_empty());
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, it, afterAll, beforeAll, spyOn } from "bun:test"
 import { InputRenderable, type InputRenderableOptions, InputRenderableEvents } from "./Input.js"
+import maxLengthConformance from "./input-max-length.conformance.json" with { type: "json" }
 import { decodePasteBytes } from "../lib/paste.js"
 import { createTestRenderer } from "../testing/test-renderer.js"
 import type { KeyEvent } from "../lib/KeyHandler.js"
@@ -64,8 +65,6 @@ describe("InputRenderable", () => {
     it("should initialize properly with default options", () => {
       const { input, root } = createInputRenderable({ width: 20 })
 
-      expect(input.x).toBeDefined()
-      expect(input.y).toBeDefined()
       expect(input.width).toBeGreaterThan(0)
       expect(input.height).toBeGreaterThan(0)
       expect(input.value).toBe("")
@@ -319,25 +318,24 @@ describe("InputRenderable", () => {
       expect(enterValue).toBe("test input")
     })
 
-    it("should respect maxLength", () => {
-      const { input } = createInputRenderable({
-        maxLength: 3,
-      })
-
+    // The insert replaces the `select` characters left of the cursor, so maxLength does not count them.
+    it.each([
+      ["key", "abc", 3, 0, "d", "abc"],
+      ["key", "hello", 5, 5, "x", "x"],
+      ["paste", "hello", 5, 5, "xyz", "xyz"],
+      ["insertText", "hello", 5, 2, "xy", "helxy"],
+      ["paste", "hello", 5, 1, "xyz", "hellx"],
+      ["key", "hello", 6, 2, "😀", "hel😀"],
+      ["paste", "hel日😀", 6, 2, "abcd", "helabc"],
+    ] as const)("%s %j, maxLength %d, select %d: %j gives %j", (how, value, maxLength, select, text, expected) => {
+      const { input } = createInputRenderable({ width: 20, value, maxLength })
       input.focus()
-
-      mockInput.pressKey("a")
-      expect(input.value).toBe("a")
-
-      mockInput.pressKey("b")
-      expect(input.value).toBe("ab")
-
-      mockInput.pressKey("c")
-      expect(input.value).toBe("abc")
-
-      // This should be ignored
-      mockInput.pressKey("d")
-      expect(input.value).toBe("abc")
+      for (let i = 0; i < select; i++) mockInput.pressArrow("left", { shift: true })
+      if (how === "key") mockInput.pressKey(text)
+      else if (how === "paste") mockInput.pasteBracketedText(text)
+      else input.insertText(text)
+      expect(input.value).toBe(expected)
+      input.destroy()
     })
 
     it("should respect minLength when submitting", () => {
@@ -602,20 +600,31 @@ describe("InputRenderable", () => {
       expect(input.cursorOffset).toBe("world".length) // Cursor should move to end
     })
 
-    // Controls take notation cells, so the cursor offset is a cell count, not the string length. maxLength counts the
-    // string length of the value, controls included.
-    it.each([
-      ["constructor", "a\fb\u0085c", "a\fb\u0085c!"],
-      ["value", "a\fb\u0085c", "a\fb\u0085c!"],
-      ["constructor", "日本", "日本!"],
-      ["value", "\u0000日本", "\u0000日本!"],
-      ["value", "a\fb\u0085c\u007f", "a\fb\u0085c\u007f"],
-    ] as const)("%s keeps %j and puts the cursor after it", (path, text, expected) => {
-      const { input } = createInputRenderable({ width: 20, maxLength: 6, value: path === "constructor" ? text : "" })
-      if (path === "value") input.value = text
+    // Controls are shared with Rust in editor-controls.conformance.json; a Rust string cannot hold a lone surrogate.
+    it("value keeps a lone surrogate under the limit as U+FFFD and puts the cursor after it", () => {
+      const { input } = createInputRenderable({ width: 20, maxLength: 6, value: "" })
+      input.value = "A\uD800"
       input.insertText("!")
-      expect(input.value).toBe(expected)
+      expect(input.value).toBe("A�!")
       input.destroy()
+    })
+
+    // The value comes through the constructor, the value setter, or before maxLength. The Rust crate runs the same rows.
+    it.each(maxLengthConformance.rows)("maxLength: %s", (_name, value, maxLength, select, insert, expected) => {
+      for (const path of ["constructor", "value", "maxLength"]) {
+        const { input } = createInputRenderable({
+          width: 20,
+          value: path === "value" ? "" : (value as string),
+          maxLength: path === "maxLength" ? undefined : (maxLength as number),
+        })
+        if (path === "value") input.value = value as string
+        if (path === "maxLength") input.maxLength = maxLength as number
+        input.focus()
+        for (let i = 0; i < (select as number); i++) mockInput.pressArrow("left", { shift: true })
+        input.insertText(insert as string)
+        expect([path, input.value]).toEqual([path, expected as string])
+        input.destroy()
+      }
     })
 
     it("should handle empty value setting", () => {

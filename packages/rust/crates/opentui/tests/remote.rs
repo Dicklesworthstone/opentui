@@ -49,6 +49,7 @@ impl Client {
     fn start(options: RemoteOptions, app_options: AppOptions, build: impl FnOnce(&App) + Send + 'static) -> Self {
         let (wake, woken) = mpsc::channel();
         let (terminal, link) = RemoteTerminal::new(options, move || {
+            #[expect(clippy::let_underscore_must_use, reason = "the test may stop listening first")]
             let _ = wake.send(());
         })
         .expect("create a remote terminal");
@@ -84,6 +85,7 @@ impl Client {
                 return;
             }
             assert!(Instant::now() < deadline, "timed out waiting for {what}; output so far: {:?}", self.text());
+            #[expect(clippy::let_underscore_must_use, reason = "a timeout only starts the next check")]
             let _ = self.woken.recv_timeout(Duration::from_millis(50));
         }
     }
@@ -197,22 +199,30 @@ fn a_slow_client_holds_output_back_without_stalling_the_app() {
     client.wait_for("Hello remote");
     // A transport learns how long the app's close may take, to wait that long before it gives up on the client.
     assert_eq!(client.link.close_bound(), bound);
-    // The client stops reading for a while; the app keeps running but its output waits.
-    std::thread::sleep(Duration::from_millis(300));
-    let held = client.link.take_output(usize::MAX);
-    assert!(held.len() <= OUTPUT_BYTES_MAX, "the link held {} bytes", held.len());
-    assert!(held.len() > OUTPUT_BYTES_MAX / 2, "the app filled the link: {} bytes", held.len());
+    // The client stops reading until the app fills the link; the app keeps running but its output waits. A loaded
+    // machine fills it more slowly, so each pause that leaves room is followed by one twice as long.
+    let mut pause = Duration::from_millis(300);
+    loop {
+        std::thread::sleep(pause);
+        let held = client.link.take_output(usize::MAX).len();
+        assert!(held <= OUTPUT_BYTES_MAX, "the link held {held} bytes");
+        if held == OUTPUT_BYTES_MAX {
+            break;
+        }
+        pause *= 2;
+        assert!(pause < Duration::from_secs(10), "the app filled {held} bytes of the link");
+    }
     // The link fills again, and the client quits and reads 64 bytes every 20 ms: the frame queued behind the link
-    // would take seconds. Bytes keep moving, so the close goes on until its cap of ten timeouts, then drops that
+    // would take over a minute. Bytes keep moving, so the close goes on until its cap of ten timeouts, then drops that
     // frame and restores the terminal behind what the link holds.
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(pause);
     client.send(b"q");
     let quit = Instant::now();
     while !client.app.as_ref().expect("the app thread").is_finished() {
+        assert!(quit.elapsed() < bound * 3 / 2, "the close took {:?}", quit.elapsed());
         client.output.extend(client.link.take_output(64));
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(quit.elapsed() < Duration::from_secs(2), "the close took {:?}", quit.elapsed());
     client.wait_for(LEAVE_ALT);
     client.finish().expect("the app thread").expect("the app");
 }
@@ -221,6 +231,7 @@ fn a_slow_client_holds_output_back_without_stalling_the_app() {
 fn a_message_before_the_app_goes_straight_to_the_client() {
     let (wake, woken) = mpsc::channel();
     let (terminal, link) = RemoteTerminal::new(RemoteOptions::default(), move || {
+        #[expect(clippy::let_underscore_must_use, reason = "the test may stop listening first")]
         let _ = wake.send(());
     })
     .expect("create a remote terminal");
@@ -340,8 +351,10 @@ fn a_remote_app_copies_and_reports_status_through_the_client_terminal() {
 }
 
 // Expected: after the terminal says its color scheme changed (`?997`), an app can ask for the palette again and gets
-// the new colors, as Core's `getPalette` does after `clearPaletteCache`.
-// Actual: the palette was read only at startup, and the notice reached no handler.
+// the new colors, as Core's `getPalette` does after `clearPaletteCache`. Default colors the terminal did not report
+// get Core's fallbacks, so native code takes the palette.
+// Actual: the palette was read only at startup, and the notice reached no handler. Native code rejected a palette
+// without default colors, here the startup one and the refresh without OSC 10, as an invalid argument.
 #[test]
 fn a_color_scheme_notice_lets_the_app_read_the_new_palette() {
     let options = AppOptions { palette_size: 2, ..quiet() };
@@ -361,13 +374,14 @@ fn a_color_scheme_notice_lets_the_app_read_the_new_palette() {
             }
         });
     });
-    // The startup query: answer only the device attributes, so the app starts with no palette.
+    // The startup query: answer only the device attributes, so the app starts with no colors.
     client.wait_for("\x1b]4;1;?\x07");
     client.send(b"\x1b[?62;22c");
     client.wait_for("waiting");
     client.send(b"\x1b[?997;2n");
     client.wait_for("\x1b]4;0;?\x07\x1b]4;1;?\x07\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07");
-    client.send(b"\x1b]4;0;rgb:ffff/0000/0000\x07\x1b]4;1;rgb:00/ff/00\x1b\\\x1b]10;rgb:00/00/00\x07");
+    // No OSC 10 answer: the refresh ends on its wait.
+    client.send(b"\x1b]4;0;rgb:ffff/0000/0000\x07\x1b]4;1;rgb:00/ff/00\x1b\\");
     client.send(b"\x1b]11;rgb:ff/ff/ff\x07\x1b]12;rgb:80/80/80\x07");
     client.wait_for("new palette");
     client.send(b"q");
@@ -380,28 +394,34 @@ fn a_color_scheme_notice_lets_the_app_read_the_new_palette() {
 // render, and `NoZwj` was reported although native draws it as `Unicode`. Under ConPTY's DECRPM 2027 "unrecognized"
 // reply, a ZWJ emoji measured 2 cells and drew 4: the table cell blanked it, the gutter sign was clipped, the input
 // wrote over "💻", and a snapshot lost its wrapped row.
+// Expected too: a surface rendered before the reply commits no rows until it renders again, as Core's `commitRows`.
+// Actual: it committed the old cells, so the footer's tail column was 4 where the terminal drew 6.
 #[test]
 fn widgets_measure_text_with_the_width_method_a_reply_switches_to() {
     use opentui::split::{Scrollback, SnapshotOptions};
     use opentui::widget::{LineNumbers, LineSign, WrapMode};
     let zwj = "👩\u{200d}💻";
-    // An environment variable, the replies and keys, the text, the method native draws with, the text's cells under it,
-    // the link snapshot, and the screen rows to check. Native draws NoZwj as Unicode but the emulator splits the emoji,
-    // so only the method's row and the cursor show the app's measurement.
+    // An environment variable, the replies and keys, the text, the method native draws with and whether the reply
+    // changed it, the text's cells under it, the link snapshot, and the screen rows to check. Native draws NoZwj as
+    // Unicode but the emulator splits the emoji, so only the method's row and the cursor show the app's measurement.
     // Only Ghostty's reply turns hyperlinks on; "l" updates the link before anything else reads the terminal state.
     let ghostty = &b"\x1b[?2027;2$y\x1bP>|ghostty 1.3.0\x1b\\lw"[..];
     let cases = [
-        (("TERM", "xterm-256color"), &b"\x1b[?2027;0$yw"[..], zwj, "Wcwidth", 4, "go (https://a.b)", 0..5),
-        (("TERM_PROGRAM", "vscode"), b"\x1b[?2027;2$yw", zwj, "Unicode", 2, "go", 0..5),
-        (("TERM", "xterm-256color"), ghostty, "বাংলা", "UnicodeWide", 4, "go!", 0..5),
-        (("OPENTUI_FORCE_NOZWJ", "1"), b"w", zwj, "Unicode", 2, "go (https://a.b)", 2..3),
+        (("TERM", "xterm-256color"), &b"\x1b[?2027;0$yw"[..], zwj, "Wcwidth", true, 4, "go (https://a.b)", 0..5),
+        (("TERM_PROGRAM", "vscode"), b"\x1b[?2027;2$yw", zwj, "Unicode", true, 2, "go", 0..5),
+        (("TERM", "xterm-256color"), ghostty, "বাংলা", "UnicodeWide", true, 4, "go!", 0..5),
+        (("OPENTUI_FORCE_NOZWJ", "1"), b"w", zwj, "Unicode", false, 2, "go (https://a.b)", 2..3),
     ];
-    for (variable, input, text, method, cells, link, checked) in cases {
+    for (index, (variable, input, text, method, changed, cells, link, checked)) in cases.into_iter().enumerate() {
         let environment = vec![("TERM".into(), "xterm-256color".into()), (variable.0.into(), variable.1.into())];
-        let options = RemoteOptions { width: 48, height: 5, environment };
+        let options = RemoteOptions { width: 48, height: 6, environment };
         let mut client = Client::start(options, quiet(), move |app| {
             let editor = Textarea::new(app);
             editor.set_text("x");
+            // Its cursor, after the text, must move with the reply's method.
+            let early = Textarea::new(app);
+            early.set_text(text);
+            early.set_cursor_offset(u32::MAX);
             let gutter = LineNumbers::new(app, &editor).height(1).line_sign(0, LineSign::before(text, None));
             let table = Table::new(app)
                 .set_columns([Column::new("").width(ColumnWidth::Cells(6)).align(Alignment::Right)])
@@ -409,10 +429,21 @@ fn widgets_measure_text_with_the_width_method_a_reply_switches_to() {
                 .set_rows([[text]])
                 .size(6, 1);
             let row = View::new(app).row().height(1).child(&table).child(&Text::new(app, "|"));
-            app.root().add(&row).add(&gutter);
+            // Dragged over "AB" after the text in the first case; the reply must not move the selection.
+            let dragged = TextTable::new(app).grid_lines(false).set_content([[format!("{text}AB")]]);
+            app.root().add(&row).add(&gutter).add(&dragged);
             // Made before the reply, as apps make their scrollback writer.
             let scrollback = Scrollback::new(app).unwrap();
             let link = Markdown::new(scrollback.app()).set_markdown("[go](https://a.b)");
+            let surface = scrollback.surface(true).unwrap();
+            surface.root().add(&Text::new(scrollback.app(), text));
+            surface.render().unwrap();
+            // A Code and a TextTable made before the reply must snapshot like ones made after it, colours included.
+            let early_code = Code::new(scrollback.app()).wrap(WrapMode::Char).set_code(format!("{text}abcd"));
+            let styled =
+                move || [[["q".fg(Color::RED), text.fg(Color::RED), "AB".fg(Color::GREEN), "CD".fg(Color::BLUE)]]];
+            let table = move |app: &App| TextTable::new(app).set_content(styled());
+            let early_table = table(scrollback.app());
             app.on_key(move |cx, key| {
                 if key.matches("l") {
                     // Updates a paragraph without making a node, so only `hyperlinks` reads the terminal state.
@@ -425,40 +456,147 @@ fn widgets_measure_text_with_the_width_method_a_reply_switches_to() {
                         Text::new(scrollback.app(), &line).wrap(WrapMode::Char).as_any(),
                         Markdown::new(scrollback.app()).set_markdown(&line).as_any(),
                         Code::new(scrollback.app()).wrap(WrapMode::Char).set_code(&line).as_any(),
+                        early_code.clone().as_any(),
                     ]
                     .map(|widget| {
                         let options = SnapshotOptions { width: Some(6), ..SnapshotOptions::default() };
                         let shot = scrollback.snapshot(&widget, options).unwrap().buffer.capture().unwrap().text();
                         shot.replace('\n', "/")
                     });
+                    // Content set again after the reply, before anything else lays the table out.
+                    early_table.set_content(styled());
+                    let tables = [early_table.clone(), table(scrollback.app())].map(|widget| {
+                        let options = SnapshotOptions { width: Some(6), ..SnapshotOptions::default() };
+                        scrollback.snapshot(&widget, options).unwrap().buffer.capture().unwrap()
+                    });
                     let link =
                         scrollback.snapshot(&link, SnapshotOptions::default()).unwrap().buffer.capture().unwrap();
                     let error = scrollback.app().session().context().last_error().unwrap();
-                    let label = format!("m={:?} {} {error:?}", cx.app().width_method(), link.text().trim_end());
+                    let stale = surface.commit_rows(0, 1, None, true).is_err();
+                    surface.render().unwrap();
+                    surface.commit_rows(0, 1, None, true).unwrap();
+                    let (method, link, cursor) = (cx.app().width_method(), link.text(), early.cursor_offset());
+                    let same = tables[0] == tables[1];
+                    let label = format!("m={method:?} {stale} {} {error:?} c={cursor} t={same}", link.trim_end());
                     let label = Text::new(cx.app(), label);
                     cx.app().root().add(&label).add(&Text::new(cx.app(), shots.join(" ")));
                 } else if key.matches("i") {
-                    let input = Input::new(cx.app()).set_value(format!("{text}yz"));
+                    // After frames laid the table out again: the drag still selects "AB".
+                    let input = Input::new(cx.app()).set_value(format!("{text}yz{}", dragged.selected_text()));
                     cx.app().root().add(&input);
                     input.focus();
                 }
             });
         });
         client.wait_for("|");
+        // The first case starts with Unicode, so "A" is in column 3 and "B" in 4 (one-based) of row 3.
+        if index == 0 {
+            client.send(b"\x1b[<0;3;3M\x1b[<32;4;3M\x1b[<0;4;3m");
+        }
         client.send(input);
         client.wait_for("m=");
         client.send(b"i");
         client.wait_for("yz");
-        let host = opentui::testing::TestApp::new(48, 5);
-        let screen = TerminalView::new(&host).size(48, 5).write(client.text()).screen();
+        let host = opentui::testing::TestApp::new(48, 6);
+        let screen = TerminalView::new(&host).size(48, 6).write(client.text()).screen();
         // A 6-cell snapshot wraps "cd" after a 4-cell text.
         let (pad, shot) = (" ".repeat(6 - cells as usize), if cells == 4 { "ab/cd" } else { "abcd" });
-        let shots = vec![format!("{text}{shot}"); 3].join(" ");
-        // The label ends with the Context's last error: the snapshots leave none.
-        let rows = [format!("{pad}{text}|"), format!("{text} 1 x"), format!("m={method} {link} None"), shots];
-        let rows = [&rows[..], &[format!("{text}yz")]].concat();
-        let expected = (&rows[checked.clone()], Some((cells + 2, 4)));
+        let shots = vec![format!("{text}{shot}"); 4].join(" ");
+        // The label ends with the Context's last error, which the snapshots leave none of, the early cursor, and
+        // whether the early table snapshots like the late one.
+        let label = format!("m={method} {changed} {link} None c={cells} t=true");
+        let selected = if index == 0 { "AB" } else { "" };
+        let rows = [format!("{pad}{text}|"), format!("{text} 1 x"), format!("{text}AB"), label, shots];
+        let rows = [&rows[..], &[format!("{text}yz{selected}")]].concat();
+        // Rows from the dragged table on are one lower than the cases name.
+        let checked = checked.start + usize::from(checked.start >= 2)..checked.end + 1;
+        let expected = (&rows[checked.clone()], Some((cells + 2 + if index == 0 { 2 } else { 0 }, 5)));
         assert_eq!((&screen.lines[checked], screen.cursor.position), expected, "{variable:?}");
+        client.link.terminate();
+        client.finish().expect("the app thread").expect("the app");
+    }
+}
+
+// Expected: a table press held while a reply changes the width method keeps the text it was made on: dragged back to
+// the start, it selects up to and including that character, as a press made after the reply would.
+// Actual: the first drag after the reply anchored at the press's old screen column, which then lay elsewhere.
+#[test]
+fn a_table_press_held_across_a_width_reply_keeps_its_text() {
+    let zwj = "👩\u{200d}💻";
+    // A press on "A" (one-based column) is held while the reply arrives; then the pointer goes to "q", back over the
+    // press's old column, to "q", into the second cell and to "q" again. A table made after the reply, pressed on its
+    // "A", takes the same path. VS Code starts with wcwidth and its reply narrows the emoji, so the old column lies in
+    // "BC"; a plain xterm starts with Unicode and its reply widens it, so the old column lies inside the emoji.
+    let cases = [
+        (("TERM_PROGRAM", "vscode"), "m=Unicode", 6, 4, [1, 6, 1, 5, 1]),
+        (("TERM", "xterm-256color"), "m=Wcwidth", 4, 6, [1, 4, 1, 7, 1]),
+    ];
+    // With `leave`, each press goes into its second cell first: the early one before the reply. With `tall`, "A" is
+    // on the second line of its cell.
+    let variants = [(false, false), (true, false), (false, true)];
+    for ((variable, method, early_press, late_press, path), (leave, tall)) in
+        cases.into_iter().flat_map(|case| variants.map(|variant| (case, variant)))
+    {
+        let environment = vec![("TERM".into(), "xterm-256color".into()), (variable.0.into(), variable.1.into())];
+        let options = RemoteOptions { width: 24, height: 8, environment };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let mut client = Client::start(options, quiet(), move |app| {
+            let first = if tall { format!("x\nq{zwj}A") } else { format!("q{zwj}A") };
+            let table = move |app: &App| {
+                TextTable::new(app)
+                    .grid_lines(false)
+                    .column_width_mode(opentui::widget::ColumnWidthMode::Content)
+                    .set_content([[first.clone(), "BC".to_owned()]])
+            };
+            let held = table(app);
+            app.root().add(&held);
+            let late = std::cell::RefCell::new(None::<TextTable>);
+            app.on_key(move |cx, key| {
+                if key.matches("w") {
+                    cx.app().root().add(&Text::new(cx.app(), format!("m={:?}", cx.app().width_method())));
+                    let made = table(cx.app());
+                    cx.app().root().add(&made);
+                    late.replace(Some(made));
+                } else if key.matches("i") {
+                    record.lock().unwrap().push(held.selected_text());
+                } else if key.matches("l") {
+                    let text = late.borrow().as_ref().map(TextTable::selected_text).unwrap_or_default();
+                    record.lock().unwrap().push(text);
+                } else if key.matches("d") {
+                    cx.app().root().add(&Text::new(cx.app(), "done"));
+                }
+            });
+        });
+        // The rows of "A": the held table first, then the "m=" line and the late table.
+        let (early_row, late_row) = if tall { (2, 5) } else { (1, 3) };
+        let excursion =
+            |press: i32, row: i32| if leave { format!("\x1b[<32;{};{row}M", press + 1) } else { String::new() };
+        client.wait_for("BC");
+        let reply = if method == "m=Unicode" { 2 } else { 0 };
+        let press = format!("\x1b[<0;{early_press};{early_row}M{}", excursion(early_press, early_row));
+        client.send(format!("{press}\x1b[?2027;{reply}$yw").as_bytes());
+        client.wait_for(method);
+        let mut input = String::new();
+        for x in path {
+            input.push_str(&format!("\x1b[<32;{x};{early_row}Mi"));
+        }
+        // A new press after the gesture starts from its own cell: from the emoji to "A".
+        input.push_str(&format!("\x1b[<0;1;{early_row}m\x1b[<0;2;{early_row}M\x1b[<32;{late_press};{early_row}Mi"));
+        input.push_str(&format!("\x1b[<0;{late_press};{early_row}m"));
+        input.push_str(&format!("\x1b[<0;{late_press};{late_row}M{}", excursion(late_press, late_row)));
+        for x in path {
+            input.push_str(&format!("\x1b[<32;{x};{late_row}Ml"));
+        }
+        input.push_str(&format!("\x1b[<0;1;{late_row}md"));
+        client.send(input.as_bytes());
+        client.wait_for("done");
+        let seen = seen.lock().unwrap().clone();
+        let label = format!("{variable:?} leave={leave} tall={tall}");
+        let (early, rest) = seen.split_at(path.len());
+        assert_eq!(early, &rest[1..], "{label}");
+        assert_eq!(early[0], format!("q{zwj}A"), "{label}");
+        assert_eq!(rest[0], format!("{zwj}A"), "{label}");
         client.link.terminate();
         client.finish().expect("the app thread").expect("the app");
     }
@@ -523,10 +661,57 @@ fn images_switch_to_kitty_graphics_when_the_terminal_reports_support_after_the_f
     client.wait_for("\x1b[14t");
     // A reply cut in two still answers it, not typed as keys.
     client.send(b"\x1b[4;900;14");
+    // The remote app runs the real loop, so the escape timeout has to pass on the wall clock.
     std::thread::sleep(opentui::input::ESCAPE_TIMEOUT * 3);
     client.send(b"00t");
     client.wait_for("s=160,v=240,");
     assert!(!client.text().contains("s=137,v=240,"), "{:?}", client.text());
+    client.send(b"q");
+    client.finish().expect("the app thread").expect("the app");
+}
+
+// Expected: an image whose upload is larger than a frame, in a Contain view at HiDPI cells as in an image preview
+// dialog, goes out in its first frame as one Kitty copy that fits the frame, placed over the view's cells.
+// Actual: the full upload, then a copy at the view's pixel size, were each too large: two blank frames, then half blocks.
+#[test]
+fn an_image_larger_than_a_frame_shows_a_kitty_copy_that_fits_one() {
+    use opentui::native::{Image, ImageFit, ImageProtocol, SessionOptions};
+    use opentui::widget::ImageView;
+    let mut app_options = quiet();
+    app_options.host.session =
+        SessionOptions { chunk_size: 16 * 1024, span_capacity: 16, max_bytes: 256 * 1024, control_capacity: 4096 };
+    let mut client = Client::start(RemoteOptions::default(), app_options, |app| {
+        let mut seed = 1u32;
+        let noise: Vec<u8> = (0..600 * 480 * 4)
+            .map(|index| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                if index % 4 == 3 { 255 } else { (seed >> 16) as u8 }
+            })
+            .collect();
+        let image = Image::from_rgba(app.session().context(), 600, 480, &noise).unwrap();
+        let view = ImageView::new(app).protocol(ImageProtocol::Kitty).fit(ImageFit::Contain).size(30, 10);
+        let view = view.image(Some(image));
+        app.on_key(move |cx, key| {
+            if key.matches("o") {
+                cx.app().root().add(&view);
+            } else if key.matches("q") {
+                cx.quit();
+            }
+        });
+    });
+    client.wait_for("\x1b[14t");
+    // Cells of 20x42 pixels: the view is 600x420, and the image fits it at 525x420, 882 KB as raw RGB in base64.
+    client.send(b"\x1b[4;1008;1600to");
+    client.take_until("the image", |client| client.text().contains("a=p,") || client.text().contains('\u{2580}'));
+    let text = client.text();
+    assert!(!text.contains('\u{2580}') && !text.contains('\u{2584}'), "half blocks");
+    assert_eq!(text.matches("\x1b_Ga=t,").count(), 1);
+    // The copy is placed whole over the view's cells.
+    let (_, upload) = text.split_once("\x1b_Ga=t,").unwrap();
+    let (upload, place) = upload.split_once("a=p,").unwrap();
+    let keys: Vec<&str> = upload.split([',', ';']).take(3).collect();
+    let whole = format!("c=26,r=10,x=0,y=0,w={},h={},", &keys[1][2..], &keys[2][2..]);
+    assert!(upload.len() < 256 * 1024 && place.contains(&whole), "{keys:?} {place:?}");
     client.send(b"q");
     client.finish().expect("the app thread").expect("the app");
 }

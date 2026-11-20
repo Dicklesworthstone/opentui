@@ -148,7 +148,7 @@ fn newlines(metrics: *const UnifiedRope.Metrics) u32 {
     return metrics.custom.newline_count;
 }
 
-fn weight(metrics: *const UnifiedRope.Metrics) u32 {
+pub fn weight(metrics: *const UnifiedRope.Metrics) u32 {
     return metrics.weight();
 }
 
@@ -159,6 +159,20 @@ fn cells(metrics: *const UnifiedRope.Metrics) u32 {
 /// The linestart leaf of `row` and the rope weight before it, by one descent.
 pub fn lineStart(rope: *const UnifiedRope, row: u32) ?UnifiedRope.Position {
     return rope.seekCount(linestarts, row);
+}
+
+/// Bytes of the text as `ot_text_buffer_get_text` returns it: one byte per line break.
+pub fn textBytes(metrics: *const UnifiedRope.Metrics) u32 {
+    return metrics.custom.total_bytes + metrics.custom.newline_count;
+}
+
+pub fn leafCount(metrics: *const UnifiedRope.Metrics) u32 {
+    return metrics.count;
+}
+
+/// The text byte where `row` starts, by one descent over the line metrics.
+pub fn lineStartByte(rope: *const UnifiedRope, row: u32) ?u32 {
+    return (rope.seekCountSum(linestarts, textBytes, row) orelse return null).sum;
 }
 
 /// Display width of `row`, whose line starts at weight `start`; a break weighs one.

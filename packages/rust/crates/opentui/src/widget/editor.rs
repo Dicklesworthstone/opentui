@@ -7,19 +7,23 @@ use crate::app::{App, Cx};
 use crate::error::Result;
 use crate::input::{KeyEvent, Keymap, MouseEvent, MouseEventKind};
 use crate::native::{
-    EditBuffer, EditCommand, EditQuery, EditorOptions, EditorQuery, EditorView, Highlight, Hooks, NodeKind,
-    SelectionColors, SyntaxStyle, Viewport, WrapMode,
+    EditBuffer, EditCommand, EditQuery, EditorOptions, EditorQuery, EditorView, Hooks, NodeKind, SelectionColors,
+    SelectionUnit, SyntaxStyle, Viewport, WrapMode,
 };
 use crate::style::{Color, Span, Style};
-use crate::syntax::{self, SyntaxTheme};
+use crate::syntax::{Incremental, SyntaxTheme};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// What a key does in an [`Input`](super::Input) or [`Textarea`](super::Textarea). Bind keys to actions with
 /// `bind`, or run one directly with `perform`.
 ///
 /// Movement collapses a selection; the `Select` variants extend it from where it started. Lines are logical lines
-/// (between line breaks); visual lines are the rows wrapping produces.
+/// (between line breaks); visual lines are the rows wrapping produces. Left/right step by cursor stops, not bytes;
+/// up/down step by wrapped rows. Selection offsets count display cells, one per newline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EditorAction {
     MoveLeft,
@@ -67,79 +71,13 @@ pub enum EditorAction {
     Paste,
 }
 
-/// Core's default Textarea bindings. Core's "meta" is the Alt key here.
-const BINDINGS: &[(&str, EditorAction)] = &[
-    ("left", EditorAction::MoveLeft),
-    ("right", EditorAction::MoveRight),
-    ("up", EditorAction::MoveUp),
-    ("down", EditorAction::MoveDown),
-    ("shift+left", EditorAction::SelectLeft),
-    ("shift+right", EditorAction::SelectRight),
-    ("shift+up", EditorAction::SelectUp),
-    ("shift+down", EditorAction::SelectDown),
-    ("home", EditorAction::BufferHome),
-    ("end", EditorAction::BufferEnd),
-    ("shift+home", EditorAction::SelectBufferHome),
-    ("shift+end", EditorAction::SelectBufferEnd),
-    ("ctrl+a", EditorAction::LineHome),
-    ("ctrl+e", EditorAction::LineEnd),
-    ("ctrl+shift+a", EditorAction::SelectLineHome),
-    ("ctrl+shift+e", EditorAction::SelectLineEnd),
-    ("alt+a", EditorAction::VisualLineHome),
-    ("alt+e", EditorAction::VisualLineEnd),
-    ("alt+shift+a", EditorAction::SelectVisualLineHome),
-    ("alt+shift+e", EditorAction::SelectVisualLineEnd),
-    ("ctrl+f", EditorAction::MoveRight),
-    ("ctrl+b", EditorAction::MoveLeft),
-    ("ctrl+w", EditorAction::DeleteWordBackward),
-    ("ctrl+backspace", EditorAction::DeleteWordBackward),
-    ("alt+d", EditorAction::DeleteWordForward),
-    ("alt+delete", EditorAction::DeleteWordForward),
-    ("ctrl+delete", EditorAction::DeleteWordForward),
-    ("ctrl+shift+d", EditorAction::DeleteLine),
-    ("ctrl+k", EditorAction::DeleteToLineEnd),
-    ("ctrl+u", EditorAction::DeleteToLineStart),
-    ("backspace", EditorAction::Backspace),
-    ("shift+backspace", EditorAction::Backspace),
-    ("ctrl+d", EditorAction::Delete),
-    ("delete", EditorAction::Delete),
-    ("shift+delete", EditorAction::Delete),
-    ("enter", EditorAction::Newline),
-    ("linefeed", EditorAction::Newline),
-    ("alt+enter", EditorAction::Submit),
-    ("ctrl+-", EditorAction::Undo),
-    ("ctrl+.", EditorAction::Redo),
-    ("super+z", EditorAction::Undo),
-    ("super+shift+z", EditorAction::Redo),
-    ("alt+f", EditorAction::WordForward),
-    ("alt+b", EditorAction::WordBackward),
-    ("alt+right", EditorAction::WordForward),
-    ("alt+left", EditorAction::WordBackward),
-    ("ctrl+right", EditorAction::WordForward),
-    ("ctrl+left", EditorAction::WordBackward),
-    ("alt+shift+f", EditorAction::SelectWordForward),
-    ("alt+shift+b", EditorAction::SelectWordBackward),
-    ("alt+shift+right", EditorAction::SelectWordForward),
-    ("alt+shift+left", EditorAction::SelectWordBackward),
-    ("alt+backspace", EditorAction::DeleteWordBackward),
-    ("super+left", EditorAction::VisualLineHome),
-    ("super+right", EditorAction::VisualLineEnd),
-    ("super+up", EditorAction::BufferHome),
-    ("super+down", EditorAction::BufferEnd),
-    ("super+shift+left", EditorAction::SelectVisualLineHome),
-    ("super+shift+right", EditorAction::SelectVisualLineEnd),
-    ("super+shift+up", EditorAction::SelectBufferHome),
-    ("super+shift+down", EditorAction::SelectBufferEnd),
-    ("super+a", EditorAction::SelectAll),
-];
-
 /// Adds the extmark methods to an editing widget whose only field is an `Rc<EditorCore>`.
 macro_rules! extmark_methods {
     () => {
         /// Marks a range of the text so it moves with edits: a styled decoration, or with
         /// [`ExtmarkOptions::atomic`], a token the cursor and deletions treat as one unit, such as a mention. Offsets
-        /// count as the cursor's do; see [`Extmark`]. Replacing the text with `set_text` or `set_value` removes all
-        /// marks, and undoing an edit does not bring back marks it removed.
+        /// count display cells (one per newline) and past the text mean its end; see [`Extmark`]. Replacing the text
+        /// with `set_text` or `set_value` removes all marks; undoing an edit brings back the marks it removed.
         pub fn add_extmark(&self, range: std::ops::Range<u32>, options: ExtmarkOptions) -> ExtmarkId {
             self.0.add_extmark(range, options)
         }
@@ -164,13 +102,13 @@ macro_rules! extmark_methods {
             self.0.extmarks().into_iter().find(|mark| mark.id == id)
         }
 
-        /// The marks that cover `offset`: they start at or before it and end after it.
+        /// The marks that cover a document cell offset (one cell per newline): `start <= offset < end`.
         pub fn extmarks_at(&self, offset: u32) -> Vec<Extmark> {
             self.0.extmarks().into_iter().filter(|mark| mark.start <= offset && offset < mark.end).collect()
         }
 
-        /// Moves the cursor to a document offset, clearing the selection. An offset inside an atomic mark moves to
-        /// its nearer edge.
+        /// Moves the cursor in document display cells (one per newline), clearing the selection. An offset inside
+        /// an atomic mark moves to its nearer edge.
         pub fn set_cursor_offset(&self, offset: u32) -> Self {
             self.0.set_cursor_offset(offset);
             self.clone()
@@ -238,13 +176,14 @@ macro_rules! editor_methods {
             self.clone()
         }
 
-        /// The most characters the text may hold, counted as Unicode scalar values: 1000 by default for an `Input`,
-        /// unlimited for a `Textarea`. Longer text is cut to fit.
+        /// The longest text it may hold: in UTF-16 code units for an `Input`, as Core counts `maxLength`, 1000 by
+        /// default; in characters (Unicode scalar values) for a `Textarea`, unlimited by default. Longer text is cut
+        /// to fit, leaving out a character that does not fit whole.
         pub fn max_length(&self, max: usize) -> Self {
             self.0.max_length.set(max);
             let text = self.0.text();
-            if text.chars().count() > max {
-                self.0.set_text(&text.chars().take(max).collect::<String>());
+            if self.0.length(&text) > max {
+                self.0.set_text(&text);
             }
             self.clone()
         }
@@ -280,13 +219,13 @@ macro_rules! editor_methods {
             self.clone()
         }
 
-        /// The cursor as a document offset: display columns, with one position per line break. For plain ASCII on
-        /// one line, this is the character index.
+        /// Display cells from the document start, one per newline. Convert with
+        /// [`EditBuffer::cell_offset_to_byte_index`](crate::native::EditBuffer::cell_offset_to_byte_index) before slicing the text.
         pub fn cursor_offset(&self) -> u32 {
             self.0.report(self.0.buffer.info()).map_or(0, |info| info.cursor_offset)
         }
 
-        /// The selected text, or an empty string.
+        /// The selected UTF-8 text, or an empty string. String slice bounds are bytes, not selection cells.
         pub fn selected_text(&self) -> String {
             use super::Behavior;
             self.0.selected_text().unwrap_or_default()
@@ -297,39 +236,12 @@ pub(crate) use editor_methods;
 
 /// Core's Textarea bindings.
 pub(crate) fn textarea_keymap() -> Keymap<EditorAction> {
-    BINDINGS.iter().copied().collect()
+    crate::tables::TEXTAREA_SHORTCUTS.iter().copied().collect()
 }
 
 /// Core's Input bindings: the Textarea's, with Enter and line feed submitting.
 pub(crate) fn input_keymap() -> Keymap<EditorAction> {
     textarea_keymap().bind("enter", EditorAction::Submit).bind("linefeed", EditorAction::Submit)
-}
-
-/// Removes escape sequences and control characters, which the buffer would show as notation two or four cells wide.
-/// `keep_newlines` keeps tab, CR, and LF; otherwise line breaks become nothing and tabs stay.
-pub(crate) fn sanitize(text: &str, keep_newlines: bool) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '\x1b' => match chars.next() {
-                Some('[') => while chars.next().is_some_and(|next| !('\x40'..='\x7e').contains(&next)) {},
-                Some(']' | 'P' | '_' | '^' | 'X') => {
-                    while let Some(next) = chars.next() {
-                        if next == '\x07' || (next == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\t' => output.push('\t'),
-            '\n' | '\r' if keep_newlines => output.push(character),
-            _ if character.is_control() => {}
-            _ => output.push(character),
-        }
-    }
-    output
 }
 
 pub(crate) struct Colors {
@@ -350,6 +262,10 @@ pub(crate) struct EditorCore {
     pub max_length: Cell<usize>,
     /// The document offset a keyboard selection started from.
     anchor: Cell<Option<u32>>,
+    /// The side a mouse drag came from, which a cursor it left in an atomic mark leaves by once the selection goes.
+    pointer_side: Cell<Ordering>,
+    /// The unit a mouse selection grows by, until a keyboard selection extends it by cells.
+    pointer_unit: Cell<SelectionUnit>,
     pub colors: RefCell<Colors>,
     placeholder: RefCell<String>,
     pub on_change: Callbacks<str>,
@@ -358,25 +274,34 @@ pub(crate) struct EditorCore {
     extmarks: RefCell<Extmarks>,
     /// Set while an edit is tracked for extmarks, so nested edits are counted once.
     tracking: Cell<bool>,
+    /// A press left the cursor on its cell, maybe inside an atomic mark, until a rule moves it out.
+    held: Cell<bool>,
+    /// A rule command left the cursor outside the atomic marks since the step or edit began, so it needs no check.
+    settled: Cell<bool>,
     cursor_options: Cell<EditorOptions>,
     pub on_cursor: Callbacks<(u32, u32)>,
     filetype: RefCell<Option<String>>,
-    syntax_theme: RefCell<SyntaxTheme>,
+    syntax_theme: RefCell<Arc<SyntaxTheme>>,
     /// The content epoch highlighted last, or `None` when the next frame highlights the text.
     highlighted: Cell<Option<u64>>,
+    /// The highlighter of the filetype, with the tree of the text it highlighted last.
+    incremental: RefCell<Option<Incremental>>,
+    /// Layers written, for tests.
+    #[cfg(test)]
+    layers: Cell<usize>,
 }
 
 impl EditorCore {
     pub fn build(app: &App, single_line: bool) -> Rc<Self> {
         let theme = app.theme();
         let session = app.session();
-        let buffer = app.report(EditBuffer::new(session.context(), app.width_method()));
+        let buffer = app.report(EditBuffer::following(session.context(), app.width_method()));
         let buffer = match buffer {
             Some(buffer) => buffer,
             // A Context too full for a buffer has failed already; the report ends the app this turn.
             None => panic!("opentui: failed to create an edit buffer: {:?}", app.check()),
         };
-        let view = match app.report(EditorView::new(&buffer, 1, 1)) {
+        let view = match app.report(EditorView::new(&buffer, 0, 0)) {
             Some(view) => view,
             None => panic!("opentui: failed to create an editor view: {:?}", app.check()),
         };
@@ -387,6 +312,8 @@ impl EditorCore {
             single_line,
             max_length: Cell::new(if single_line { 1000 } else { usize::MAX }),
             anchor: Cell::new(None),
+            pointer_side: Cell::new(Ordering::Equal),
+            pointer_unit: Cell::new(SelectionUnit::Cell),
             colors: RefCell::new(Colors {
                 fg: theme.foreground,
                 bg: theme.input_bg,
@@ -401,11 +328,16 @@ impl EditorCore {
             keymap: RefCell::new(if single_line { input_keymap() } else { textarea_keymap() }),
             extmarks: RefCell::new(Extmarks::default()),
             tracking: Cell::new(false),
+            held: Cell::new(false),
+            settled: Cell::new(false),
             cursor_options: Cell::new(EditorOptions { color: theme.cursor, ..Default::default() }),
             on_cursor: Callbacks::default(),
             filetype: RefCell::new(None),
-            syntax_theme: RefCell::new(SyntaxTheme::from_theme(&theme)),
+            syntax_theme: RefCell::new(Arc::new(SyntaxTheme::from_theme(&theme))),
             highlighted: Cell::new(None),
+            incremental: RefCell::new(None),
+            #[cfg(test)]
+            layers: Cell::new(0),
         });
         core.element.set_focusable(true);
         core.element.pointer.set(Some(crate::native::MousePointer::TEXT));
@@ -476,25 +408,40 @@ impl EditorCore {
     /// Replaces the text without undo history, then moves the cursor to the end.
     pub fn set_text(&self, text: &str) {
         // The replacement removes all current text.
-        let text = self.limit(&sanitize(text, !self.single_line), usize::MAX);
+        let text = self.limit(&self.accepted(text), usize::MAX);
         self.clear_selection_state();
         self.report(self.buffer.set_text(&text, false));
         self.goto_buffer_end();
-        if !self.extmarks.borrow().marks.is_empty() {
-            self.extmarks.borrow_mut().marks.clear();
-            self.refresh_extmarks();
+    }
+
+    /// The text as the editor takes it: an `Input` drops line breaks, as Core's does. Control characters stay, and
+    /// the buffer shows them as notation.
+    fn accepted<'t>(&self, text: &'t str) -> Cow<'t, str> {
+        if self.single_line && text.contains(['\n', '\r']) {
+            text.replace(['\n', '\r'], "").into()
+        } else {
+            text.into()
         }
     }
 
-    /// Cuts `text` so the document stays within the maximum length, given `removed` characters being replaced.
+    /// The units `max_length` counts a character in: UTF-16 code units in an `Input`, one per character in a `Textarea`.
+    fn units(&self, character: char) -> usize {
+        if self.single_line { character.len_utf16() } else { 1 }
+    }
+
+    pub(crate) fn length(&self, text: &str) -> usize {
+        text.chars().map(|character| self.units(character)).sum()
+    }
+
+    /// Cuts `text` so the document stays within the maximum length, given `removed` units being replaced.
     fn limit(&self, text: &str, removed: usize) -> String {
         let max = self.max_length.get();
         if max == usize::MAX {
             return text.to_owned();
         }
-        let current = if text.is_empty() { 0 } else { self.text().chars().count() };
-        let room = max.saturating_sub(current.saturating_sub(removed));
-        text.chars().take(room).collect()
+        let current = if text.is_empty() { 0 } else { self.length(&self.text()) };
+        let mut room = max.saturating_sub(current.saturating_sub(removed));
+        text.chars().take_while(|c| room.checked_sub(self.units(*c)).map(|left| room = left).is_some()).collect()
     }
 
     fn clear_selection_state(&self) {
@@ -508,9 +455,9 @@ impl EditorCore {
 
     /// Inserts text at the cursor, replacing any selection.
     pub fn insert(&self, text: &str) {
-        let text = sanitize(text, !self.single_line);
+        let text = self.accepted(text);
         let removed =
-            self.selection().map_or(0, |_| self.report(self.view.selected_text()).unwrap_or_default().chars().count());
+            self.selection().map_or(0, |_| self.length(&self.report(self.view.selected_text()).unwrap_or_default()));
         let text = self.limit(&text, removed);
         if text.is_empty() {
             return;
@@ -521,12 +468,12 @@ impl EditorCore {
     }
 
     fn delete_selection(&self) -> bool {
-        if self.selection().is_none() {
-            return false;
+        let selected = self.selection().is_some();
+        if selected {
+            self.report(self.view.delete_selection());
         }
-        self.report(self.view.delete_selection());
         self.clear_selection_state();
-        true
+        selected
     }
 
     /// Moves the cursor. With `select`, extends the selection from where it started; otherwise clears it.
@@ -536,32 +483,31 @@ impl EditorCore {
             if let Some(app) = self.element.app() {
                 app.keep_selection_only(&self.element);
             }
-            // Extend a live selection, keyboard or mouse, from its far end; with none, start at the cursor.
+            // Extend a keyboard selection from its anchor offset; with none, start at the cursor's cell. A mouse
+            // selection keeps the anchor cell native pinned; as Core's, a word or line one becomes a cell one first.
             let cursor = self.cursor().2;
-            let start = match self.selection() {
-                Some((start, end)) => match self.anchor.get() {
-                    Some(anchor) if anchor == start || anchor == end => anchor,
-                    _ => {
-                        // A mouse selection leaves the cursor on its focus cell, inside the selection: keep the end
-                        // away from the cursor and move from the other end.
-                        let (anchor, moving) = if cursor == start { (end, start) } else { (start, end) };
-                        self.report(self.buffer.command(EditCommand::CursorOffset(moving)));
-                        anchor
-                    }
-                },
-                None => cursor,
+            let start = match (self.selection(), self.anchor.get()) {
+                (Some((start, end)), Some(anchor)) if (start..=end).contains(&anchor) => Some(anchor),
+                (Some(_), _) => None,
+                (None, _) => Some(cursor),
             };
-            let before = self.cursor().2;
-            step(self);
-            self.keep_cursor_outside(before);
-            let cursor = self.cursor().2;
-            self.anchor.set(Some(start));
-            let colors = self.colors.borrow().selection;
-            if start == cursor {
-                self.report(self.view.clear_selection());
-            } else {
-                self.report(self.view.select_range(start.min(cursor), start.max(cursor), colors));
+            if start.is_none() && self.pointer_unit.replace(SelectionUnit::Cell) != SelectionUnit::Cell {
+                self.report(self.view.convert_selection_to_cell());
             }
+            self.settled_step(step);
+            let cursor = self.cursor().2;
+            self.anchor.set(start);
+            let colors = self.colors.borrow().selection;
+            match start {
+                Some(start) if start == cursor => self.report(self.view.clear_selection()),
+                Some(start) => self.report(self.view.select_inclusive(start, cursor, colors)),
+                // A mouse selection's focus moves to the cursor's cell, in viewport-local cells.
+                None => self.report(self.view.position(EditorQuery::Cursor)).and_then(|at| {
+                    let focus = (at.visual_col as i32, at.visual_row as i32);
+                    self.report(self.view.select_local((0, 0), focus, true, SelectionUnit::Cell, false, colors))
+                        .map(drop)
+                }),
+            };
             return;
         }
         // Horizontal movement collapses a selection to its edge without taking another step.
@@ -571,44 +517,35 @@ impl EditorCore {
             return;
         }
         self.clear_selection_state();
+        self.settled_step(step);
+    }
+
+    /// Runs a step, then keeps the cursor out of atomic marks unless a rule command already did.
+    fn settled_step(&self, step: impl FnOnce(&Self)) {
         let before = self.cursor().2;
+        self.settled.set(false);
         step(self);
-        self.keep_cursor_outside(before);
+        if !self.settled.get() {
+            self.keep_cursor_outside(self.cursor().2.cmp(&before));
+        }
     }
 
-    /// Moves the cursor one column, past atomic marks as Core moves past virtual ones (`extmarks.ts`): left from a
-    /// mark's end goes to one before its start, and right from at most its start goes to its end.
+    /// Sends an edit command with the cursor rules around atomic marks, which settle the cursor.
+    fn command_atomic(&self, command: EditCommand) {
+        self.report(self.buffer.command_atomic(command));
+        self.settled.set(true);
+    }
+
+    /// Moves the cursor one column, past atomic marks as Core moves past virtual ones (native rules, `OT_EDIT_ATOMIC`):
+    /// left from a mark's end goes to the start of the unit before it, and right from its start or one cell before it
+    /// goes to its end. A live selection moves one character, as Core's does.
     fn step_horizontal(&self, forward: bool) {
-        let before = self.cursor().2;
-        let marks = self.extmarks.borrow();
-        let edge = if forward {
-            marks.atomic_containing(before + 1).filter(|mark| before <= mark.start).map(|mark| mark.end)
+        let command = if forward { EditCommand::MoveRight } else { EditCommand::MoveLeft };
+        if self.selection().is_some() {
+            self.report(self.buffer.command(command));
         } else {
-            before
-                .checked_sub(1)
-                .and_then(|target| marks.atomic_containing(target))
-                .filter(|mark| before >= mark.end)
-                .map(|mark| mark.start.saturating_sub(1))
-        };
-        drop(marks);
-        let command = match edge {
-            Some(offset) => EditCommand::CursorOffset(offset),
-            None if forward => EditCommand::MoveRight,
-            None => EditCommand::MoveLeft,
-        };
-        self.report(self.buffer.command(command));
-    }
-
-    /// Moves the cursor one visual row. Landing in an atomic mark sends it to the nearer edge, as Core's: one before
-    /// the start, or the end. Moving down never goes back to or before where it started.
-    fn step_vertical(&self, down: bool) {
-        let before = self.cursor().2;
-        self.report(if down { self.view.move_down() } else { self.view.move_up() });
-        let after = self.cursor().2;
-        let Some(mark) = self.extmarks.borrow().atomic_containing(after) else { return };
-        let start = mark.start.saturating_sub(1);
-        let to_start = after - mark.start < mark.end - after && !(down && start <= before);
-        self.report(self.buffer.command(EditCommand::CursorOffset(if to_start { start } else { mark.end })));
+            self.command_atomic(command);
+        }
     }
 
     fn goto_buffer_end(&self) {
@@ -671,14 +608,13 @@ impl EditorCore {
         match action {
             A::MoveLeft => self.movement(false, Some(false), |s| s.step_horizontal(false)),
             A::MoveRight => self.movement(false, Some(true), |s| s.step_horizontal(true)),
-            A::MoveUp => self.movement(false, None, |s| s.step_vertical(false)),
-            A::MoveDown => self.movement(false, None, |s| s.step_vertical(true)),
-            A::SelectLeft => self.movement(true, None, |s| {
-                s.report(s.buffer.command(EditCommand::MoveLeft));
+            // Landing in an atomic mark leaves it by the nearer edge, as Core's; Down never goes back.
+            A::MoveUp | A::MoveDown => self.movement(false, None, |s| {
+                s.report(s.view.move_atomic(action == A::MoveDown));
+                s.settled.set(true);
             }),
-            A::SelectRight => self.movement(true, None, |s| {
-                s.report(s.buffer.command(EditCommand::MoveRight));
-            }),
+            A::SelectLeft => self.movement(true, None, |s| s.step_horizontal(false)),
+            A::SelectRight => self.movement(true, None, |s| s.step_horizontal(true)),
             A::SelectUp => self.movement(true, None, |s| {
                 s.report(s.view.move_up());
             }),
@@ -714,14 +650,15 @@ impl EditorCore {
             A::WordBackward => self.movement(false, Some(false), |s| s.goto_word(false)),
             A::SelectWordForward => self.movement(true, None, |s| s.goto_word(true)),
             A::SelectWordBackward => self.movement(true, None, |s| s.goto_word(false)),
+            // At an atomic mark's end (Backspace) or start (Delete) the whole mark goes, as one edit.
             A::Backspace => {
-                if !self.delete_selection() && !self.delete_atomic(false) {
-                    self.report(self.buffer.command(EditCommand::Backspace));
+                if !self.delete_selection() {
+                    self.command_atomic(EditCommand::Backspace);
                 }
             }
             A::Delete => {
-                if !self.delete_selection() && !self.delete_atomic(true) {
-                    self.report(self.buffer.command(EditCommand::DeleteForward));
+                if !self.delete_selection() {
+                    self.command_atomic(EditCommand::DeleteForward);
                 }
             }
             A::DeleteWordForward | A::DeleteWordBackward => {
@@ -791,7 +728,7 @@ impl EditorCore {
         self.notifying(|cx| self.run(cx, action));
     }
 
-    /// Inserts text as a paste does, then tells change handlers about it.
+    /// Inserts text at the cursor, then tells change handlers about it.
     pub fn insert_notifying(&self, text: &str) {
         self.notifying(|_| self.insert(text));
     }
@@ -826,153 +763,79 @@ impl EditorCore {
 
     // Extmarks.
 
-    /// The cursor offset at the end of `text`: display columns as the buffer counts them, plus one per line break.
-    fn measure(&self, text: &str) -> u32 {
-        self.report(self.buffer.measure(text)).unwrap_or(0)
-    }
-
-    /// Runs an edit, then moves extmarks for whatever it changed and keeps the cursor out of atomic marks.
+    /// Runs an edit and keeps the cursor out of atomic marks, once for nested edits.
     pub fn tracked<R>(&self, edit: impl FnOnce() -> R) -> R {
-        if self.tracking.get() || self.extmarks.borrow().marks.is_empty() {
+        if self.tracking.get() {
             return edit();
         }
+        // A press leaves the cursor on its cell for the handlers until the release; an edit before then starts at the
+        // nearer edge.
+        if self.held.get() && self.selection().is_none() {
+            self.keep_cursor_outside(Ordering::Equal);
+        }
         self.tracking.set(true);
-        let before = self.text();
+        self.settled.set(false);
         let cursor_before = self.cursor().2;
-        let selection_before = self.selection().map_or(u32::MAX, |(start, _)| start);
         let result = edit();
         self.tracking.set(false);
-        // A handler may have replaced the text and cleared the marks.
-        if self.extmarks.borrow().marks.is_empty() {
-            return result;
+        // Undo can bring back a mark around the cursor, so this runs even when no mark was there before, unless a rule
+        // command settled the cursor during the edit.
+        if !self.settled.get() {
+            self.keep_cursor_outside(self.cursor().2.cmp(&cursor_before));
         }
-        let after = self.text();
-        if before != after {
-            let limit = cursor_before.min(self.cursor().2).min(selection_before);
-            let change = extmarks::change(&before, &after, limit, &mut |text| self.measure(text));
-            extmarks::apply(&mut self.extmarks.borrow_mut().marks, change);
-            self.refresh_extmarks();
-        }
-        self.keep_cursor_outside(cursor_before);
         result
     }
 
-    /// Moves a cursor inside an atomic mark to its edge: the one it moved toward from `before`, or the nearer one.
-    fn keep_cursor_outside(&self, before: u32) {
-        let cursor = self.cursor().2;
-        let Some(mark) = self.extmarks.borrow().atomic_around(cursor) else { return };
-        let to_end = match cursor.cmp(&before) {
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Equal => mark.end - cursor <= cursor - mark.start,
-        };
-        self.report(self.buffer.command(EditCommand::CursorOffset(if to_end { mark.end } else { mark.start })));
+    /// Moves a cursor inside atomic marks to the outer edge of the marks around it: toward the end for `Greater`, the
+    /// start for `Less`, or the nearer one.
+    fn keep_cursor_outside(&self, toward: Ordering) {
+        self.held.set(false);
+        self.report(self.buffer.keep_outside(toward));
+        self.settled.set(true);
     }
 
-    /// Deletes a whole atomic mark that starts at the cursor (`forward`) or ends at it. Returns whether it did.
-    fn delete_atomic(&self, forward: bool) -> bool {
-        let cursor = self.cursor().2;
-        let mark = self.extmarks.borrow().marks.iter().copied().find(|mark| {
-            mark.options.atomic
-                && mark.start < mark.end
-                && if forward { mark.start == cursor } else { mark.end == cursor }
-        });
-        let Some(mark) = mark else { return false };
-        let colors = self.colors.borrow().selection;
-        self.report(self.view.select_range(mark.start, mark.end, colors));
-        self.report(self.view.delete_selection());
-        self.clear_selection_state();
-        true
+    /// The buffer's style table. Until `syntax_style` sets one, the editor makes its own, with its syntax theme.
+    fn table(&self) -> Option<SyntaxStyle> {
+        if let Some(table) = &self.extmarks.borrow().syntax {
+            return Some(table.clone());
+        }
+        let app = self.element.app()?;
+        let table = app.report(SyntaxStyle::new(app.session().context()))?;
+        self.report(table.set_capture_theme(&self.syntax_theme.borrow()));
+        self.report(self.buffer.set_syntax_style(Some(&table)));
+        self.extmarks.borrow_mut().syntax = Some(table.clone());
+        Some(table)
     }
 
-    /// Redraws styled marks as highlights. Highlight offsets skip line breaks, unlike the cursor's.
-    fn refresh_extmarks(&self) {
-        let Some(app) = self.element.app() else { return };
-        self.report(self.buffer.remove_highlights(extmarks::HIGHLIGHT_TAG));
-        let styled: Vec<Extmark> =
-            self.extmarks.borrow().marks.iter().filter(|mark| mark.options.style.is_some()).copied().collect();
-        if styled.is_empty() {
-            app.request_redraw();
-            return;
-        }
-        // Each line break before an offset is one position the highlight's offset leaves out.
-        let skip_breaks = |offset: u32| {
-            let row = app.report(self.buffer.position(EditQuery::Offset(offset))).flatten().map_or(0, |at| at.row);
-            offset.saturating_sub(row)
-        };
-        for mark in styled {
-            let style = mark.options.style.expect("filtered to styled marks");
-            let Some(style_id) = self.style_id(style) else { continue };
-            let highlight = Highlight {
-                start: skip_breaks(mark.start),
-                end: skip_breaks(mark.end),
-                style_id,
-                // Above syntax highlights, at 0.
-                priority: mark.options.priority.saturating_add(1),
-                tag: extmarks::HIGHLIGHT_TAG,
-            };
-            self.report(self.buffer.highlight(highlight));
-        }
-        app.request_redraw();
-    }
-
-    /// The id of `style` in the buffer's style table, registering it on first use. Until `syntax_style` sets a table,
-    /// the editor makes its own.
-    fn style_id(&self, style: Style) -> Option<u32> {
-        if let Some(&id) = self.extmarks.borrow().styles.get(&style) {
-            return Some(id);
-        }
-        if self.extmarks.borrow().syntax.is_none() {
-            let app = self.element.app()?;
-            let table = app.report(SyntaxStyle::new(app.session().context()))?;
-            self.report(self.buffer.set_syntax_style(Some(&table)));
-            self.extmarks.borrow_mut().syntax = Some(table);
-        }
-        let mut extmarks = self.extmarks.borrow_mut();
-        // Named for the style itself, so editors that share a table never redefine each other's names.
-        let id = self.report(extmarks.syntax.as_ref()?.register(&format!("opentui.{style:?}"), style))?;
-        extmarks.styles.insert(style, id);
-        Some(id)
-    }
-
-    /// Uses `style` as the buffer's style table, registering extmark and syntax styles in it as needed.
+    /// Uses `style` as the buffer's style table, registering syntax styles in it as needed. Marks keep their styles.
     pub fn set_syntax_style(&self, style: &SyntaxStyle) {
         self.report(self.buffer.set_syntax_style(Some(style)));
-        {
-            let mut extmarks = self.extmarks.borrow_mut();
-            extmarks.syntax = Some(style.clone());
-            extmarks.styles.clear();
-        }
-        self.refresh_extmarks();
-        self.highlighted.set(None);
+        self.extmarks.borrow_mut().syntax = Some(style.clone());
+        // The table takes this editor's theme and names; editors sharing it paint the theme set last.
+        let lists = self.extmarks.borrow().group_sets.lists();
+        self.report(style.set_capture_theme(&self.syntax_theme.borrow()));
+        lists.iter().for_each(|names| drop(self.report(style.capture_group(names))));
     }
 
     pub fn add_extmark(&self, range: std::ops::Range<u32>, options: ExtmarkOptions) -> ExtmarkId {
-        let id = self.extmarks.borrow_mut().add(range, options);
-        self.refresh_extmarks();
-        id
+        let range = range.start.min(range.end)..range.start.max(range.end);
+        // Above syntax layers, which paint at 0.
+        let priority = options.priority.saturating_add(1);
+        ExtmarkId(self.report(self.buffer.add_mark(range, options.atomic, options.style, priority)).unwrap_or(0))
     }
 
     pub fn remove_extmark(&self, id: ExtmarkId) -> bool {
-        let removed = {
-            let mut extmarks = self.extmarks.borrow_mut();
-            let before = extmarks.marks.len();
-            extmarks.marks.retain(|mark| mark.id != id);
-            extmarks.marks.len() != before
-        };
-        if removed {
-            self.refresh_extmarks();
-        }
-        removed
+        self.report(self.buffer.remove_mark(id.0)).unwrap_or(false)
     }
 
     pub fn clear_extmarks(&self) {
-        self.extmarks.borrow_mut().marks.clear();
-        self.refresh_extmarks();
+        self.report(self.buffer.clear_marks());
     }
 
+    /// The marks in (start, id) order. Native code moves them with each edit.
     pub fn extmarks(&self) -> Vec<Extmark> {
-        let mut marks = self.extmarks.borrow().marks.clone();
+        let marks = self.report(self.buffer.marks()).unwrap_or_default();
+        let mut marks: Vec<Extmark> = marks.iter().map(|(raw, style)| Extmark::from_native(raw, *style)).collect();
         marks.sort_by_key(|mark| (mark.start, mark.id));
         marks
     }
@@ -982,7 +845,7 @@ impl EditorCore {
         let before = self.cursor().2;
         self.clear_selection_state();
         self.report(self.buffer.command(EditCommand::CursorOffset(offset)));
-        self.keep_cursor_outside(before);
+        self.keep_cursor_outside(offset.cmp(&before));
     }
 
     /// Tells change handlers about the text if it changed since `before`, a content epoch.
@@ -1001,24 +864,29 @@ impl EditorCore {
         }
         *self.filetype.borrow_mut() = filetype.map(str::to_owned);
         self.highlighted.set(None);
+        self.incremental.take();
         if filetype.is_some() {
             self.element.add_hooks(Hooks::UPDATE);
             self.element.app().inspect(App::request_redraw);
         } else {
-            self.report(self.buffer.remove_highlights(extmarks::SYNTAX_TAG));
+            self.report(self.buffer.set_layer(extmarks::SYNTAX_LAYER, 0..u32::MAX, &[]));
         }
     }
 
     pub fn set_syntax_theme(&self, theme: SyntaxTheme) {
-        if *self.syntax_theme.borrow() != theme {
+        // Without a table yet there is nothing to restyle, and no table to make: one the app bound stays.
+        let table = self.extmarks.borrow().syntax.clone();
+        let theme = Arc::new(theme);
+        let restyled = table.is_some_and(|table| self.report(table.set_capture_theme(&theme)) == Some(true));
+        if restyled || *self.syntax_theme.borrow() != theme {
             *self.syntax_theme.borrow_mut() = theme;
-            self.highlighted.set(None);
             self.element.app().inspect(App::request_redraw);
         }
     }
 
-    /// Highlights the text as its filetype when it changed since the last highlight, or the filetype or styles did.
-    /// Captures become one highlight per styled piece, their styles merged as `Code` merges them, below extmarks.
+    /// Highlights the text as its filetype when it changed since the last highlight, or the filetype did, reusing the
+    /// tree of the last highlight. Each piece becomes a layer run of its capture names, which paint merges as `Code`
+    /// merges their styles, below extmarks. The whole layer is written; native changes only the runs that differ.
     fn highlight(&self) {
         let filetype = self.filetype.borrow();
         let Some(filetype) = filetype.as_deref() else { return };
@@ -1027,22 +895,18 @@ impl EditorCore {
             return;
         }
         let text = self.text();
-        let ranges = syntax::highlight_ranges(&text, filetype, &self.syntax_theme.borrow());
-        self.report(self.buffer.remove_highlights(extmarks::SYNTAX_TAG));
-        let Some(ranges) = ranges else { return };
-        // Highlight offsets are display columns that leave out line breaks.
-        let mut start = 0;
-        for (range, style) in ranges {
-            let piece = &text[range];
-            let end = start + self.measure(piece).saturating_sub(piece.matches('\n').count() as u32);
-            if style != Style::new()
-                && let Some(style_id) = self.style_id(style)
-            {
-                let highlight = Highlight { start, end, style_id, priority: 0, tag: extmarks::SYNTAX_TAG };
-                self.report(self.buffer.highlight(highlight));
-            }
-            start = end;
-        }
+        let mut incremental = self.incremental.borrow_mut();
+        let named = incremental.get_or_insert_with(|| Incremental::new(filetype)).update(text).unwrap_or_default();
+        // Without pieces the editor makes no table, so one the app bound on the buffer stays.
+        let table = if named.0.is_empty() { None } else { self.table() };
+        let runs = match table {
+            Some(table) => self.extmarks.borrow_mut().group_sets.runs(&table, self.buffer.context(), named, |at| at),
+            None => Ok(Vec::new()),
+        };
+        let Some(runs) = self.report(runs) else { return };
+        self.report(self.buffer.set_layer(extmarks::SYNTAX_LAYER, 0..u32::MAX, &runs));
+        #[cfg(test)]
+        self.layers.set(self.layers.get() + 1);
     }
 
     fn scroll(&self, rows: i64) {
@@ -1052,6 +916,10 @@ impl EditorCore {
         let y = (i64::from(viewport.y) + rows).clamp(0, i64::from(max)) as u32;
         if y != viewport.y {
             self.report(self.view.set_viewport(Viewport { y, ..viewport }, true));
+            // A selection holds the cursor where the wheel left it.
+            if self.selection().is_none() {
+                self.keep_cursor_outside(rows.cmp(&0));
+            }
         }
     }
 }
@@ -1085,7 +953,13 @@ impl Behavior for EditorCore {
     fn paste(&self, cx: &mut Cx<'_>, text: &str) -> bool {
         let before = self.epoch();
         let (row, col, _) = self.cursor();
-        self.tracked(|| self.insert(text));
+        // As Core's handlePaste: whole escape sequences go, C1 forms included, then control characters but tab, LF
+        // and CR.
+        let text: String = crate::input::strip_ansi_sequences(text)
+            .chars()
+            .filter(|character| !character.is_control() || matches!(character, '\t' | '\n' | '\r'))
+            .collect();
+        self.tracked(|| self.insert(&text));
         self.changed_since(cx, before);
         self.cursor_moved_since(cx, (row, col));
         true
@@ -1106,18 +980,25 @@ impl Behavior for EditorCore {
 
     /// Mouse selections move the cursor to their focus, as Core's do.
     fn select(&self, selection: Option<&SelectionUpdate>) -> bool {
-        let Some(selection) = selection else {
-            self.clear_selection_state();
-            return false;
-        };
-        let (anchor, focus) = selection.local(&self.element);
-        let colors = self.colors.borrow().selection;
         self.anchor.set(None);
-        let (row, col, before) = self.cursor();
-        self.report(self.view.select_local(anchor, focus, !selection.start, selection.unit, true, colors));
+        let (row, col, _) = self.cursor();
+        // A cursor the pointer left inside a mark stays until the press's handlers have seen it, then goes to the
+        // nearer edge; once a drag's selection is gone, to the side the drag came from.
+        let toward = if let Some(selection) = selection {
+            let (anchor, focus) = selection.local(&self.element);
+            let colors = self.colors.borrow().selection;
+            self.report(self.view.select_local(anchor, focus, !selection.start, selection.unit, true, colors));
+            self.pointer_side.set((anchor.1, anchor.0).cmp(&(focus.1, focus.0)));
+            self.pointer_unit.set(selection.unit);
+            self.held.set(selection.start);
+            (!selection.start).then_some(Ordering::Equal)
+        } else {
+            self.report(self.view.clear_selection());
+            Some(self.pointer_side.get())
+        };
         let selected = self.selection().is_some();
-        if !selected {
-            self.keep_cursor_outside(before);
+        if let (false, Some(toward)) = (selected, toward) {
+            self.keep_cursor_outside(toward);
         }
         if let Some(app) = self.element.app() {
             self.cursor_moved_since(&mut Cx::new(&app), (row, col));
@@ -1144,5 +1025,541 @@ impl Behavior for EditorCore {
         self.on_change.clear();
         self.on_submit.clear();
         self.on_cursor.clear();
+    }
+}
+
+#[cfg(all(test, feature = "tree-sitter"))]
+mod tests {
+    use super::*;
+    use crate::native::{Highlight, LayerRun};
+    use crate::testing::TestApp;
+    use crate::widget::{Container, Textarea, Widget};
+    use crate::{syntax, sys};
+    use std::collections::HashMap;
+
+    /// Syntax highlighting as the editor did it with value-named styles: each piece's merged style registered under a
+    /// name of its own and interned as a one-name group set, so a new theme or table highlights again, unless
+    /// `clear_highlights` emptied the layer since the last highlight (capture names keep it empty until an edit).
+    struct Valued {
+        table: SyntaxStyle,
+        sets: HashMap<Style, u32>,
+        filetype: Option<&'static str>,
+        theme: SyntaxTheme,
+        highlighted: Option<u64>,
+        cleared: bool,
+    }
+
+    impl Valued {
+        /// Highlights as C4's oracle expects, with `own` the editor's highlighter where a fresh parse has an error;
+        /// returns whether it had one.
+        fn refresh(&mut self, buffer: &EditBuffer, own: Option<&Incremental>) -> bool {
+            let Some(filetype) = self.filetype else { return false };
+            let epoch = buffer.info().unwrap().content_epoch;
+            if self.highlighted.replace(epoch) == Some(epoch) {
+                return false;
+            }
+            self.cleared = false;
+            let text = buffer.text().unwrap();
+            let (ranges, error) = syntax::expected_ranges(&text, filetype, own, &self.theme).unwrap_or_default();
+            let mut runs = Vec::new();
+            for (range, style) in ranges {
+                if style == Style::new() {
+                    continue;
+                }
+                let name = format!("valued.{}", self.sets.len());
+                let group_set = *self.sets.entry(style).or_insert_with(|| {
+                    self.table.register(&name, style).unwrap();
+                    buffer.context().group_set(&[&name]).unwrap()
+                });
+                runs.push(LayerRun { start_byte: range.start as u32, end_byte: range.end as u32, group_set });
+            }
+            buffer.set_layer(extmarks::SYNTAX_LAYER, 0..u32::MAX, &runs).unwrap();
+            error
+        }
+
+        fn restyle(&mut self) {
+            if !self.cleared {
+                self.highlighted = None;
+            }
+        }
+    }
+
+    // Rust, JavaScript and Markdown fragments, split at `|`: balanced ones, and openers and closers alone.
+    const PIECES: &str = "let |fn f() {|}|x| = |1|\"s\\n\"|// c|/* b */|'a'|\t|\n|\u{65e5}\u{672c}|\u{e9}|# h|*e*|`c`|\
+                          ```rust\n|r#\"r\"#|;|\r\n|\"a\\n\u{fe0f}\"|\u{301}|/*|*/|r#\"|{|*|`|```python\n| => x|\"";
+    const KEYS: &[&str] = &["backspace", "delete", "left", "right", "up", "down", "home", "end", "ctrl+-", "ctrl+."];
+    const FILETYPES: &[Option<&str>] = &[Some("rust"), Some("markdown"), Some("javascript"), Some("cobol"), None];
+
+    // A group set composes its names as `Style::patch` does: fg and bg from the last name with one, attributes added.
+    // Each run of random names paints as a run of its merged style under one name of its own.
+    #[test]
+    fn group_sets_compose_their_names_as_style_patch() {
+        let app = TestApp::new(64, 1);
+        let area = Textarea::new(&app).grow(1.0);
+        area.set_text("x".repeat(64));
+        app.root().add(&area);
+        let context = app.session().context();
+        let table = SyntaxStyle::new(context).unwrap();
+        area.syntax_style(&table);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for _ in 0..16 {
+            let mut runs = Vec::new();
+            let mut theme = SyntaxTheme::new();
+            for name in ["n0", "n1", "n2", "n3", "n4", "n5"] {
+                let mut color = || (next(2) == 1).then(|| Color::rgb(next(256) as u8, next(256) as u8, 0));
+                let (fg, bg) = (color(), color());
+                theme.set(name, Style { fg, bg, attributes: crate::style::Attributes::from_bits(next(256) as u8) });
+                table.register(name, theme.get(name).unwrap()).unwrap();
+            }
+            for at in 0..32u32 {
+                let names: Vec<String> = (0..=next(8)).map(|_| format!("n{}", next(6))).collect();
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                let merged = format!("merged.{at}");
+                table.register(&merged, theme.merge(names.iter().copied())).unwrap();
+                for (start_byte, names) in [(2 * at, &names[..]), (2 * at + 1, &[merged.as_str()][..])] {
+                    let group_set = context.group_set(names).unwrap();
+                    runs.push(LayerRun { start_byte, end_byte: start_byte + 1, group_set });
+                }
+            }
+            area.buffer().set_layer(extmarks::SYNTAX_LAYER, 0..u32::MAX, &runs).unwrap();
+            let capture = app.render();
+            for at in 0..32 {
+                assert_eq!(capture.cell(2 * at, 0), capture.cell(2 * at + 1, 0), "run {at}");
+            }
+        }
+    }
+
+    // A theme or table switch redefines capture names: it interns no group set and parses nothing (the grammar,
+    // swapped for a counting lazy one after the first frame, loads at the next edit only; after
+    // `clear_highlights` the text stays plain), so every new theme paints, also with the Context's name pool full.
+    // Past the bound only a piece that needs a new set paints plain, and the app keeps running.
+    #[test]
+    fn theme_switches_intern_no_group_sets_and_highlight_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LOADS: AtomicUsize = AtomicUsize::new(0);
+        let grammar = || syntax::Grammar::new(tree_sitter_rust::LANGUAGE, "\"let\" @keyword (string_literal) @string");
+        syntax::register("g7-churn", grammar()).unwrap();
+        let app = TestApp::new(20, 2);
+        let area = Textarea::new(&app).filetype("g7-churn").grow(1.0);
+        area.set_text("let a = 1;");
+        app.root().add(&area);
+        let keyword = |r: u8| {
+            let theme = SyntaxTheme::new().style("string", Style::new().fg(Color::GREEN));
+            theme.style("keyword", Style::new().fg(Color::rgb(r, 0, 0)))
+        };
+        let fg = |app: &TestApp| app.try_render().expect("a frame past the bound").cell(0, 0).unwrap().fg;
+        area.syntax_theme(keyword(1));
+        assert_eq!(fg(&app), Color::rgb(1, 0, 0));
+        syntax::register_lazy("g7-churn", move || {
+            LOADS.fetch_add(1, Ordering::SeqCst);
+            grammar().compile().ok()
+        });
+        let context = app.session().context();
+        let first = context.group_set(&["probe.0"]).unwrap();
+        for r in 2..40 {
+            area.syntax_theme(keyword(r));
+            assert_eq!(fg(&app), Color::rgb(r, 0, 0));
+        }
+        assert_eq!(context.group_set(&["probe.1"]).unwrap(), first + 1, "theme switches interned group sets");
+        // Fill the 64 KiB name pool, down to fewer bytes than any list of names has.
+        let mut index = 0;
+        for width in [64, 16, 4] {
+            while context.group_set(&[&format!("{index:0width$}")]).is_ok() {
+                index += 1;
+            }
+        }
+        for r in 40..80 {
+            area.syntax_theme(keyword(r));
+            assert_eq!(fg(&app), Color::rgb(r, 0, 0));
+        }
+        area.syntax_style(&SyntaxStyle::new(context).unwrap());
+        assert_eq!(fg(&app), Color::rgb(79, 0, 0));
+        assert_eq!(LOADS.load(Ordering::SeqCst), 0, "a theme or table switch parsed");
+        area.focus();
+        // The first string needs a new set, which the full pool refuses: it paints plain.
+        app.type_text(" \"s\"");
+        assert_eq!(fg(&app), Color::rgb(79, 0, 0));
+        assert_eq!(app.render().cell(12, 0).unwrap().fg, app.theme().foreground);
+        assert_eq!(LOADS.load(Ordering::SeqCst), 1);
+        area.buffer().clear_highlights().unwrap();
+        area.syntax_theme(keyword(1));
+        assert_eq!(fg(&app), app.theme().foreground);
+    }
+
+    // Against hand-written colors, not the widget's own capture lists: a repeated name keeps its last place, the
+    // last `none` clears what lies under it, and a three-part name takes its longest styled prefix, or its first
+    // part with `first_part_fallback`.
+    #[test]
+    fn capture_lists_follow_the_stack_rule_and_the_theme_fallback() {
+        let member = syntax::Grammar::new(tree_sitter_rust::LANGUAGE, "(identifier) @variable.other.member");
+        syntax::register("g7-member", member).unwrap();
+        let (red, blue) = (Style::new().fg(Color::RED), Style::new().fg(Color::BLUE));
+        let marks = SyntaxTheme::new().style("text.emphasis", red).style("text.strong", blue);
+        let members = SyntaxTheme::new().style("variable.other", red).style("variable", blue);
+        let fence = "````markdown\n```rust\nlet x = y;\n```\n````\n";
+        for (filetype, text, theme, symbol, want) in [
+            ("markdown", "*a **b *c* d** e*", marks, "c", Some(Color::RED)),
+            ("markdown", fence, SyntaxTheme::from_theme(&crate::theme::Theme::dark()), "y", None),
+            ("g7-member", "x", members.clone(), "x", Some(Color::RED)),
+            ("g7-member", "x", members.first_part_fallback(), "x", Some(Color::BLUE)),
+        ] {
+            let app = TestApp::new(20, 6);
+            let area = Textarea::new(&app).filetype(filetype).syntax_theme(theme).grow(1.0);
+            area.set_text(text);
+            app.root().add(&area);
+            let capture = app.render();
+            let cell = capture.cells.iter().find(|cell| cell.symbol == symbol).unwrap();
+            assert_eq!(cell.fg, want.unwrap_or(app.theme().foreground), "{text:?}");
+        }
+    }
+
+    // A theme set on a shared table restyles every editor on it, and an edit registers only names the table has
+    // not seen, with its palette: typing in one editor leaves the other's colors alone, even a name the app
+    // redefined in the table.
+    #[test]
+    fn editors_sharing_a_table_paint_the_theme_set_last() {
+        let app = TestApp::new(24, 2);
+        let theme = |color: Color| -> SyntaxTheme {
+            ["keyword", "string", "escape", "comment"].into_iter().map(|name| (name, Style::new().fg(color))).collect()
+        };
+        let table = SyntaxStyle::new(app.session().context()).unwrap();
+        let areas = [("let x = \"a\";", Color::RED), ("let s = \"b\"; // c", Color::RED)].map(|(text, color)| {
+            let area = Textarea::new(&app).filetype("rust").syntax_theme(theme(color)).syntax_style(&table).height(1);
+            area.set_text(text);
+            app.root().add(&area);
+            area
+        });
+        let colors = |app: &TestApp| {
+            let capture = app.render();
+            [(8, 0), (8, 1), (13, 1)].map(|(x, y)| capture.cell(x, y).unwrap().fg)
+        };
+        assert_eq!(colors(&app), [Color::RED; 3]);
+        areas[0].syntax_theme(theme(Color::BLUE));
+        assert_eq!(colors(&app), [Color::BLUE; 3]);
+        table.register("opentui.string", Style::new().fg(Color::GREEN)).unwrap();
+        areas[1].set_text("let s = \"b\\n\"; // c");
+        assert_eq!(colors(&app)[0], Color::GREEN);
+    }
+
+    // Without a filetype, a theme change neither makes nor binds a table: one the app bound on the buffer stays.
+    #[test]
+    fn a_theme_change_without_a_filetype_keeps_the_apps_table() {
+        let app = TestApp::new(20, 1);
+        let area = Textarea::new(&app).grow(1.0);
+        area.set_text("let a = 1;");
+        app.root().add(&area);
+        let table = SyntaxStyle::new(app.session().context()).unwrap();
+        let style_id = table.register("app", Style::new().fg(Color::GREEN)).unwrap();
+        area.buffer().set_syntax_style(Some(&table)).unwrap();
+        area.buffer().highlight(Highlight { start: 0, end: 3, style_id, priority: 1, tag: 1 }).unwrap();
+        area.syntax_theme(SyntaxTheme::new().style("keyword", Style::new().fg(Color::RED)));
+        assert_eq!(app.render().cell(0, 0).unwrap().fg, Color::GREEN);
+    }
+
+    // A list of capture names past the group-set bounds keeps every style, in the editor and in `Code`: a name over
+    // the byte bound, or more names than a group set holds, paint as one name for the whole list (bigboi-4).
+    #[test]
+    fn capture_lists_past_the_group_set_bounds_keep_their_styles() {
+        let bytes = sys::OT_GROUP_SET_NAME_BYTE_COUNT_MAX as usize - "opentui.".len();
+        let count = sys::OT_GROUP_SET_NAME_COUNT_MAX as usize - 1;
+        let default = Style::new().fg(Color::BLUE);
+        for (captures, want) in [
+            (vec!["n".repeat(bytes)], Style::new().fg(Color::RED)),
+            (vec!["n".repeat(bytes + 1)], Style::new().fg(Color::RED)),
+            ((1..=count).map(|index| format!("c{index}")).collect(), default.bold()),
+            ((1..=count + 1).map(|index| format!("c{index}")).collect(), default.bold()),
+        ] {
+            let query: String = captures.iter().map(|name| format!("(\"let\" @{name})")).collect();
+            let filetype = format!("g7-bounds-{}-{}", captures.len(), captures[0].len());
+            let grammar = syntax::Grammar::new(tree_sitter_rust::LANGUAGE, query).core_captures();
+            syntax::register(&filetype, grammar).unwrap();
+            let last = captures.last().unwrap();
+            let style = if captures.len() == 1 { Style::new().fg(Color::RED) } else { Style::new().bold() };
+            let theme = SyntaxTheme::new().style("default", default).style(last.as_str(), style);
+            let app = TestApp::new(20, 2);
+            // Highlighted first under a theme without these styles, then switched to it.
+            let area = Textarea::new(&app).filetype(filetype.as_str()).syntax_theme(SyntaxTheme::new()).height(1);
+            area.set_text("let a = 1;");
+            let code = crate::widget::Code::new(&app).filetype(filetype.as_str()).syntax_theme(SyntaxTheme::new());
+            app.root().add(&area).add(&code.set_code("let a = 1;").height(1));
+            app.render();
+            area.syntax_theme(theme.clone());
+            code.syntax_theme(theme);
+            let capture = app.render();
+            let fg = want.fg.unwrap_or(app.theme().foreground);
+            for row in 0..2 {
+                let cell = capture.cell(0, row).unwrap();
+                let (count, bytes) = (captures.len(), last.len());
+                assert_eq!(
+                    (cell.fg, cell.attributes),
+                    (fg, want.attributes),
+                    "row {row}: {count} names of {bytes} bytes"
+                );
+            }
+        }
+    }
+
+    // A grapheme cluster across a capture boundary: VS16 joins the `n` of the escape `\n` but starts the string's
+    // next piece. Measuring pieces apart put the old highlights one column early from there on; byte runs keep the
+    // closing quote a string and the second `let` a keyword, with the space before it plain.
+    #[test]
+    fn a_cluster_across_a_capture_boundary_keeps_later_captures_in_place() {
+        let app = TestApp::new(30, 2);
+        let area = Textarea::new(&app).filetype("rust").grow(1.0);
+        area.set_text("let x=\"a\\n\u{fe0f}\"; let y=3;");
+        app.root().add(&area);
+        let theme = SyntaxTheme::from_theme(&app.theme());
+        let color = |name| theme.get(name).and_then(|style| style.fg).unwrap();
+        let capture = app.render();
+        let cells = &capture.cells[..capture.width as usize];
+        let quote = cells.iter().rposition(|cell| cell.symbol == "\"").unwrap();
+        let second_let = cells.iter().rposition(|cell| cell.symbol == "l").unwrap();
+        assert_eq!(cells[quote].fg, color("string"));
+        assert_eq!(cells[second_let - 1].fg, app.theme().foreground);
+        assert!(cells[second_let..second_let + 3].iter().all(|cell| cell.fg == color("keyword")));
+    }
+
+    // P12: capture-name group sets paint byte-identical frames to value-named ones, over random edits, filetype
+    // changes (with and without a grammar), clear_highlights, theme switches (longest-prefix and first-part themes,
+    // `default` styles, attributes over attributes, a color per capture name) and table swaps, and styled extmarks
+    // above both. C4 invariants 1, 5 and 9: the value-named twin highlights a fresh parse (an error-free text must
+    // highlight so) or the editor's own tree; edits at any place, through the view and through `buffer()`, undo and
+    // redo, and `set_text` reuse the tree; each highlight writes one layer.
+    #[test]
+    fn capture_name_sets_paint_as_value_named_styles_did() {
+        let pieces: Vec<&str> = PIECES.split('|').collect();
+        // Review-bigboi-r2's JavaScript append (`f` becomes a function), review-bigboi's repeated line, and
+        // review-opus's two Markdown edits: the first `*` deleted, and a fence's info string changed.
+        let rows = [
+            ("javascript", "const f =\n  (x)", 15, 0, " => x"),
+            ("rust", "// x\n// x\n// x\n// x\n", 0, 0, "// x\n"),
+            ("markdown", "a *b\nc d* e", 2, 1, ""),
+            ("markdown", "```rust\nlet x = 1;\n```\n", 3, 4, "python"),
+        ];
+        let injective = syntax::injective_theme();
+        let (mut compared, mut erroneous, mut own_differs) = (0, 0, 0);
+        for seed in 1..=200u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut next = |bound: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % bound as u64) as usize
+            };
+            let (named, valued) = (TestApp::new(24, 6), TestApp::new(24, 6));
+            let red = Style::new().fg(Color::RED);
+            let other = SyntaxTheme::new().style("keyword", Style::new().bold()).style("comment", red);
+            let nested = SyntaxTheme::new()
+                .style("default", Style::new().fg(Color::GREEN).italic())
+                .style("punctuation", Style::new().bg(Color::BLUE))
+                .style("punctuation.bracket", Style::new().underline())
+                .style("string", red.bold())
+                .style("markup", Style::new().fg(Color::YELLOW).dim())
+                .style("markup.heading", Style::new().strikethrough());
+            let themes = [
+                injective.clone(),
+                SyntaxTheme::from_theme(&named.theme()),
+                other.style("string", red.bg(Color::BLUE)),
+                nested.clone(),
+                nested.first_part_fallback(),
+            ];
+            let row = rows.get(seed as usize - 1);
+            let filetype = row.map_or("rust", |row| row.0);
+            let mut twin = Valued {
+                table: SyntaxStyle::new(valued.session().context()).unwrap(),
+                sets: HashMap::new(),
+                filetype: Some(filetype),
+                theme: themes[0].clone(),
+                highlighted: None,
+                cleared: false,
+            };
+            let areas = [Textarea::new(&named).filetype(filetype).grow(1.0), Textarea::new(&valued).grow(1.0)];
+            areas[1].syntax_style(&twin.table);
+            areas[0].syntax_theme(themes[0].clone());
+            for (app, area) in [&named, &valued].into_iter().zip(&areas) {
+                app.root().add(area);
+                area.focus();
+            }
+            // An edit through the view: `deleted` characters at a cursor offset, then a piece typed there.
+            let edit = |at: u32, deleted: usize, piece: &str| {
+                for (app, area) in [&named, &valued].into_iter().zip(&areas) {
+                    area.set_cursor_offset(at);
+                    (0..deleted).for_each(|_| app.press("delete"));
+                    area.insert(piece);
+                }
+            };
+            // Whether the next highlight is the filetype's first, the one parse without a tree.
+            let (mut layers, mut first) = (0, true);
+            for step in 0..24 {
+                let command = match (row, step) {
+                    (Some(row), 0) => {
+                        areas.iter().for_each(|area| drop(area.set_text(row.1)));
+                        17
+                    }
+                    (Some(row), 1) => {
+                        edit(row.2, row.3, row.4);
+                        17
+                    }
+                    (_, 0) => 8,
+                    _ => next(20),
+                };
+                match command {
+                    0..=4 => {
+                        let text = pieces[next(pieces.len())];
+                        named.type_text(text);
+                        valued.type_text(text);
+                    }
+                    5..=7 => {
+                        let key = KEYS[next(KEYS.len())];
+                        named.press(key);
+                        valued.press(key);
+                    }
+                    8 => {
+                        let text: String = (0..next(12)).map(|_| pieces[next(pieces.len())]).collect();
+                        areas.iter().for_each(|area| drop(area.set_text(&text)));
+                    }
+                    9 => {
+                        let filetype = FILETYPES[next(FILETYPES.len())];
+                        areas[0].filetype(filetype);
+                        if twin.filetype != filetype {
+                            (twin.filetype, twin.highlighted, first) = (filetype, None, true);
+                            if filetype.is_none() {
+                                areas[1].buffer().set_layer(extmarks::SYNTAX_LAYER, 0..u32::MAX, &[]).unwrap();
+                            }
+                        }
+                    }
+                    10 => {
+                        areas.iter().for_each(|area| area.buffer().clear_highlights().unwrap());
+                        // Plain until the editor highlights again, also after a restyle the twin had due.
+                        if areas[0].0.highlighted.get() == Some(areas[0].0.epoch()) {
+                            twin.highlighted = Some(areas[1].buffer().info().unwrap().content_epoch);
+                        }
+                        twin.cleared = true;
+                    }
+                    11 => {
+                        let theme = themes[next(themes.len())].clone();
+                        areas[0].syntax_theme(theme.clone());
+                        if twin.theme != theme {
+                            twin.theme = theme;
+                            twin.restyle();
+                        }
+                    }
+                    12 => {
+                        areas[0].syntax_style(&SyntaxStyle::new(named.session().context()).unwrap());
+                        twin.table = SyntaxStyle::new(valued.session().context()).unwrap();
+                        areas[1].syntax_style(&twin.table);
+                        twin.sets = HashMap::new();
+                        twin.restyle();
+                    }
+                    13 => {
+                        let (start, length) = (next(40) as u32, next(6) as u32);
+                        let options = ExtmarkOptions::default().style(Style::new().fg(Color::CYAN));
+                        for area in &areas {
+                            area.add_extmark(start..start + length, options);
+                        }
+                    }
+                    14 => edit(next(areas[0].text().chars().count() + 1) as u32, next(4), pieces[next(pieces.len())]),
+                    15 => {
+                        let how = next(4);
+                        for area in &areas {
+                            match how {
+                                0 => drop(area.perform(EditorAction::Undo)),
+                                1 => drop(area.perform(EditorAction::Redo)),
+                                2 => drop(area.buffer().undo().unwrap()),
+                                _ => drop(area.buffer().redo().unwrap()),
+                            }
+                        }
+                    }
+                    16 => {
+                        let (column, deleted, piece) = (next(12) as u32, next(3) as u32, pieces[next(pieces.len())]);
+                        let undoable = next(2) == 0;
+                        #[expect(clippy::let_underscore_must_use, reason = "both buffers fail alike out of range")]
+                        for area in &areas {
+                            if undoable {
+                                area.buffer().set_text(piece, true).unwrap();
+                            } else {
+                                let _ = area.buffer().delete_range((0, column), (0, column + deleted));
+                                let _ = area.buffer().insert(piece);
+                            }
+                        }
+                    }
+                    _ => {
+                        let core = &areas[0].0;
+                        let epoch = core.epoch();
+                        let due = core.filetype.borrow().is_some() && core.highlighted.get() != Some(epoch);
+                        let parses = syntax::FRESH_PARSES.get();
+                        let got = named.render();
+                        let parses = syntax::FRESH_PARSES.get() - parses;
+                        let error = twin.refresh(areas[1].buffer(), None);
+                        let mut want = valued.render();
+                        let own = core.incremental.borrow();
+                        if error && want.cells != got.cells {
+                            // Where a fresh parse has an error, a whole query of the editor's own tree.
+                            twin.highlighted = None;
+                            twin.refresh(areas[1].buffer(), own.as_ref());
+                            want = valued.render();
+                            own_differs += 1;
+                        }
+                        erroneous += usize::from(error);
+                        let differ = want.cells.iter().zip(&got.cells).position(|(want, got)| want != got);
+                        assert!(differ.is_none(), "seed {seed} step {step} cell {differ:?}: {:?}", areas[0].text());
+                        // C4 invariant 5: a highlight per epoch change writes one layer, and parses without a tree only
+                        // the first text of its filetype.
+                        assert_eq!(core.layers.get() - layers, usize::from(due), "seed {seed} step {step}");
+                        layers = core.layers.get();
+                        let parsed = due && core.filetype.borrow().as_deref().is_some_and(syntax::has_grammar);
+                        assert_eq!(
+                            parses,
+                            usize::from(parsed && first),
+                            "seed {seed} step {step}: parses without a tree"
+                        );
+                        first &= !parsed;
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        // How many highlights had text with a parse error, where the twin is a fresh highlight only if the editor's
+        // own tree agrees (1b), against 1a's error-free rest.
+        println!("C4 1b on {erroneous} of {compared} frames; the editor's own tree painted otherwise on {own_differs}");
+        assert!(compared > 500 && erroneous * 4 < compared * 3, "{compared} compared, {erroneous} with errors");
+    }
+
+    // 474: with marks, a key read the whole text twice to find the edit; native code moves marks now. The cursor rules
+    // around atomic marks run natively too (C5.3), so no key reads the marks, however many there are, and each key
+    // sends one rule command.
+    #[test]
+    fn keys_with_marks_read_no_text() {
+        for count in [1, 40] {
+            let app = TestApp::new(20, 2);
+            let area = Textarea::new(&app).grow(1.0);
+            area.set_text(format!("ab @file cd{}", " ".repeat(count)));
+            app.root().add(&area);
+            area.focus();
+            area.add_extmark(3..8, ExtmarkOptions::default().atomic().style(Style::new().fg(Color::CYAN)));
+            for at in 1..count as u32 {
+                area.add_extmark(10 + at..11 + at, ExtmarkOptions::default().atomic());
+            }
+            area.set_cursor_offset(0);
+            app.render();
+            let keys = ["x", "left", "right", "backspace", "delete", "up", "down", "home"];
+            let counters = [&crate::native::TEXT_READS, &crate::native::MARK_READS, &crate::native::RULE_CALLS];
+            let reads: Vec<_> = keys
+                .iter()
+                .map(|key| {
+                    counters.iter().for_each(|counter| counter.with(|calls| calls.set(0)));
+                    app.press(key);
+                    counters.map(|counter| counter.with(Cell::get))
+                })
+                .collect();
+            assert_eq!(reads, [[0, 0, 1]; 8], "{keys:?} with {count} marks");
+            assert_eq!(area.extmarks()[0].range(), 2..7);
+        }
     }
 }

@@ -486,20 +486,18 @@ test "notifications - iTerm2 feature reporting without No leaves disabled" {
 }
 
 test "notifications - xtversion heuristics prefer documented protocols" {
-    var kitty = Terminal.init(.{});
-    kitty.processCapabilityResponse("\x1bP>|kitty(0.46.2)\x1b\\");
-    try testing.expect(kitty.caps.notifications);
-    try testing.expectEqual(Terminal.NotificationProtocol.osc99, kitty.notification_protocol);
-
-    var ghostty = Terminal.init(.{});
-    ghostty.processCapabilityResponse("\x1bP>|ghostty 1.3.1\x1b\\");
-    try testing.expect(ghostty.caps.notifications);
-    try testing.expectEqual(Terminal.NotificationProtocol.osc777, ghostty.notification_protocol);
-
-    var iterm = Terminal.init(.{});
-    iterm.processCapabilityResponse("\x1bP>|iTerm2 3.6.9\x1b\\");
-    try testing.expect(iterm.caps.notifications);
-    try testing.expectEqual(Terminal.NotificationProtocol.osc9, iterm.notification_protocol);
+    // ConEmu reads every OSC 9 as a subcommand (sleep, message box, macro, process) and shows no notification.
+    for ([_]struct { []const u8, Terminal.NotificationProtocol }{
+        .{ "\x1bP>|kitty(0.46.2)\x1b\\", .osc99 },
+        .{ "\x1bP>|ghostty 1.3.1\x1b\\", .osc777 },
+        .{ "\x1bP>|iTerm2 3.6.9\x1b\\", .osc9 },
+        .{ "\x1bP>|ConEmu 230724\x1b\\", .none },
+    }) |case| {
+        var term = Terminal.init(.{ .remote_mode = .remote });
+        term.processCapabilityResponse(case[0]);
+        try testing.expectEqual(case[1] != .none, term.caps.notifications);
+        try testing.expectEqual(case[1], term.notification_protocol);
+    }
 }
 
 test "notifications - TERM_FEATURES enables OSC9 protocol" {
@@ -679,13 +677,14 @@ test "remote detection - explicit local mode ignores SSH environment" {
     try testing.expect(!term.caps.remote);
 }
 
-test "processCapabilityResponse captures startup cursor report before home probes" {
+test "processCapabilityResponse captures startup cursor report before the width probes" {
     var term = Terminal.init(.{});
     var writer = TestWriter.init(testing.allocator);
     defer writer.deinit();
     try term.queryTerminalSend(&writer);
+    try term.queryExplicitWidth(&writer);
 
-    term.processCapabilityResponse("\x1b[7;11R\x1b[1;2R\x1b[1;3R");
+    term.processCapabilityResponse("\x1b[7;11R\x1b[2;2R\x1b[2;3R");
 
     const cursor = term.getCursorPosition();
     try testing.expectEqual(@as(u32, 11), cursor.x);
@@ -699,12 +698,12 @@ test "processCapabilityResponse captures startup cursor report before home probe
 test "a DA1 reply ends startup cursor reports in sentinel mode and reports Sixel only for a graphics query" {
     // Rows: sentinel, multiplexer variable, replies (one capability response each), explicit width, Sixel.
     const rows = .{
-        .{ false, "", .{ "\x1b[?62;4c", "\x1b[7;11R", "\x1b[1;2R", "\x1b[1;3R" }, true, true },
-        .{ true, "", .{ "\x1b[7;11R", "\x1b[1;2R", "\x1b[1;3R", "\x1b[?62;4c" }, true, true },
-        .{ true, "", .{ "\x1b[7;11R\x1b[1;2R\x1b[1;3R\x1b[?62;4c", "", "", "" }, true, true },
-        .{ true, "", .{ "\x1b[7;11R", "\x1b[?62;4c", "\x1b[1;2R", "\x1b[1;3R" }, false, true },
-        .{ true, "TMUX", .{ "\x1b[7;11R", "\x1b[1;2R", "\x1b[1;3R", "\x1b[?62;4c" }, true, false },
-        .{ true, "STY", .{ "\x1b[7;11R", "\x1b[1;2R", "\x1b[1;3R", "\x1b[?62;4c" }, true, false },
+        .{ false, "", .{ "\x1b[?62;4c", "\x1b[7;11R", "\x1b[2;2R", "\x1b[2;3R" }, true, true },
+        .{ true, "", .{ "\x1b[7;11R", "\x1b[2;2R", "\x1b[2;3R", "\x1b[?62;4c" }, true, true },
+        .{ true, "", .{ "\x1b[7;11R\x1b[2;2R\x1b[2;3R\x1b[?62;4c", "", "", "" }, true, true },
+        .{ true, "", .{ "\x1b[7;11R", "\x1b[?62;4c", "\x1b[2;2R", "\x1b[2;3R" }, false, true },
+        .{ true, "TMUX", .{ "\x1b[7;11R", "\x1b[2;2R", "\x1b[2;3R", "\x1b[?62;4c" }, true, false },
+        .{ true, "STY", .{ "\x1b[7;11R", "\x1b[2;2R", "\x1b[2;3R", "\x1b[?62;4c" }, true, false },
     };
     inline for (rows) |row| {
         var env = std.process.Environ.Map.init(testing.allocator);
@@ -715,6 +714,7 @@ test "a DA1 reply ends startup cursor reports in sentinel mode and reports Sixel
         var writer = TestWriter.init(testing.allocator);
         defer writer.deinit();
         try term.queryTerminalSend(&writer);
+        try term.queryExplicitWidth(&writer);
         inline for (row[2]) |reply| term.processCapabilityResponse(reply);
         try testing.expectEqual(row[3], term.caps.explicit_width);
         try testing.expectEqual(row[4], term.caps.sixel);
@@ -731,22 +731,29 @@ test "processCapabilityResponse only accepts exact ordered explicit width probe 
     var startup_writer = TestWriter.init(testing.allocator);
     defer startup_writer.deinit();
     try startup_on_row_one.queryTerminalSend(&startup_writer);
+    try startup_on_row_one.queryExplicitWidth(&startup_writer);
     startup_on_row_one.processCapabilityResponse("\x1b[1;5R");
-    startup_on_row_one.processCapabilityResponse("\x1b[1;2R");
-    startup_on_row_one.processCapabilityResponse("\x1b[1;3R");
+    startup_on_row_one.processCapabilityResponse("\x1b[2;2R");
+    startup_on_row_one.processCapabilityResponse("\x1b[2;3R");
     const cursor = startup_on_row_one.getCursorPosition();
     try testing.expectEqual(@as(u32, 5), cursor.x);
     try testing.expectEqual(@as(u32, 1), cursor.y);
     try testing.expect(startup_on_row_one.caps.explicit_width);
     try testing.expect(startup_on_row_one.caps.scaled_text);
 
-    var echoed = Terminal.init(.{});
-    var echoed_writer = TestWriter.init(testing.allocator);
-    defer echoed_writer.deinit();
-    try echoed.queryTerminalSend(&echoed_writer);
-    echoed.processCapabilityResponse("\x1b[7;11R\x1b[1;12R\x1b[1;8R");
-    try testing.expect(!echoed.caps.explicit_width);
-    try testing.expect(!echoed.caps.scaled_text);
+    // The probes run on row 2: the wrong columns there (#1383), or the right ones on row 1, where Shift+F3 and
+    // Alt+F3 send the same bytes, are no answer. Nor is a repeated startup report at (2,2) before a terminal that
+    // ignores OSC 66 answers column 1 twice: only a pair of replies that both moved counts.
+    for ([_][]const u8{ "\x1b[7;11R\x1b[2;12R\x1b[2;8R", "\x1b[7;11R\x1b[1;2R\x1b[1;3R", "\x1b[2;2R\x1b[2;2R\x1b[2;1R\x1b[2;1R" }) |replies| {
+        var echoed = Terminal.init(.{});
+        var echoed_writer = TestWriter.init(testing.allocator);
+        defer echoed_writer.deinit();
+        try echoed.queryTerminalSend(&echoed_writer);
+        try echoed.queryExplicitWidth(&echoed_writer);
+        echoed.processCapabilityResponse(replies);
+        try testing.expect(!echoed.caps.explicit_width);
+        try testing.expect(!echoed.caps.scaled_text);
+    }
 }
 
 test "environment variables - should be overridden by xtversion" {
@@ -1150,14 +1157,14 @@ test "queryTerminalSend - keeps response-generating queries inside tmux" {
 
     // tmux's graphics replies describe tmux, not the passthrough endpoint.
     try testing.expect(std.mem.find(u8, output, ansi.ANSI.kittyGraphicsQuery) == null);
-    try testing.expect(std.mem.find(u8, output, ansi.ANSI.primaryDeviceAttrs) == null);
 }
 
-test "queryTerminalSend - sentinel mode moves its one DA1 to the end of the packet" {
-    for ([_]bool{ false, true }) |tmux| {
+test "queryTerminalSend - one DA1 follows DECRQM 2026, and sentinel mode leaves it to the end of the setup" {
+    // Without a graphics query too: the DA1 reply settles the 2026 decision when no width probe runs.
+    for ([_][]const u8{ "", "TMUX=/tmp/tmux-1000/default,12345,0", "STY=1234.session", "OPENTUI_GRAPHICS=0" }) |vars| {
         var env = std.process.Environ.Map.init(testing.allocator);
         defer env.deinit();
-        if (tmux) try env.put("TMUX", "/tmp/tmux-1000/default,12345,0");
+        try putEnv(&env, vars);
         var clock = TestWriter.init(testing.allocator);
         defer clock.deinit();
         var sentinel = TestWriter.init(testing.allocator);
@@ -1169,13 +1176,11 @@ test "queryTerminalSend - sentinel mode moves its one DA1 to the end of the pack
         try sentinel_term.queryTerminalSend(&sentinel);
 
         const da1 = ansi.ANSI.primaryDeviceAttrs;
-        try testing.expectEqual(@as(usize, @intFromBool(!tmux)), std.mem.count(u8, clock.getWritten(), da1));
-        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sentinel.getWritten(), da1));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, clock.getWritten(), da1));
+        try testing.expect(std.mem.find(u8, clock.getWritten(), da1).? > std.mem.find(u8, clock.getWritten(), ansi.ANSI.decrqmSync).?);
         const moved = try std.mem.replaceOwned(u8, testing.allocator, clock.getWritten(), da1, "");
         defer testing.allocator.free(moved);
-        const expected = try std.mem.concat(testing.allocator, u8, &.{ moved, da1 });
-        defer testing.allocator.free(expected);
-        try testing.expectEqualStrings(expected, sentinel.getWritten());
+        try testing.expectEqualStrings(moved, sentinel.getWritten());
     }
 }
 
@@ -1453,7 +1458,6 @@ test "queryTerminalSend - asks for 24-bit color only when the environment does n
         try testing.expect(std.mem.find(u8, output, ansi.ANSI.xtversion) != null and std.mem.find(u8, output, ansi.ANSI.capabilityQueriesBase) != null);
         try testing.expectEqual(row.asks, std.mem.find(u8, output, "\x1bP+q524742\x1b\\") != null);
         try testing.expectEqual(row.asks, std.mem.find(u8, output, "\x1bP+q5463\x1b\\") != null);
-        if (sentinel) try testing.expect(std.mem.endsWith(u8, output, ansi.ANSI.primaryDeviceAttrs));
         try term.enableDetectedFeatures(&writer, false);
         try testing.expectEqual(row.rgb, term.caps.rgb);
         try testing.expectEqual(row.rgb or !row.ms or std.mem.find(u8, row.env, "256color") != null, term.caps.ansi256);
@@ -1515,92 +1519,41 @@ test "writeNotification - returns false when unsupported" {
     try testing.expectEqual(@as(usize, 0), writer.getWritten().len);
 }
 
-test "writeNotification - writes OSC99 title and body with base64 payloads" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    var term = Terminal.init(.{ .env_map = &env });
-    term.caps.notifications = true;
-    term.notification_protocol = .osc99;
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    const ok = try term.writeNotification(testing.allocator, &writer, "Body", "Title");
-
-    try testing.expect(ok);
-    try testing.expectEqualStrings("\x1b]99;i=opentui-1:p=title:e=1:d=0;VGl0bGU=\x1b\\\x1b]99;i=opentui-1:p=body:e=1:d=1;Qm9keQ==\x1b\\", writer.getWritten());
-}
-
-test "writeNotification - writes OSC777 and sanitizes semicolons and controls" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    var term = Terminal.init(.{ .env_map = &env });
-    term.caps.notifications = true;
-    term.notification_protocol = .osc777;
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    const ok = try term.writeNotification(testing.allocator, &writer, "Bo;dy\n", "Ti;tle");
-
-    try testing.expect(ok);
-    try testing.expectEqualStrings("\x1b]777;notify;Ti tle;Bo dy \x1b\\", writer.getWritten());
-}
-
-test "writeNotification - writes OSC9 combined title and message" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    var term = Terminal.init(.{ .env_map = &env });
-    term.caps.notifications = true;
-    term.notification_protocol = .osc9;
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    const ok = try term.writeNotification(testing.allocator, &writer, "Body\n", "Title");
-
-    try testing.expect(ok);
-    try testing.expectEqualStrings("\x1b]9;Title: Body \x1b\\", writer.getWritten());
-}
-
-test "writeNotification - wraps OSC777 in tmux passthrough" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("TMUX", "/tmp/tmux-1000/default,12345,0");
-
-    var term = Terminal.init(.{ .env_map = &env });
-    term.caps.notifications = true;
-    term.notification_protocol = .osc777;
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    const ok = try term.writeNotification(testing.allocator, &writer, "Body", "Title");
-
-    try testing.expect(ok);
-    try testing.expect(std.mem.startsWith(u8, writer.getWritten(), "\x1bPtmux;"));
-    try testing.expect(std.mem.find(u8, writer.getWritten(), "\x1b\x1b]777;notify;Title;Body") != null);
-    try testing.expect(std.mem.endsWith(u8, writer.getWritten(), "\x1b\\"));
-}
-
-test "writeNotification - wraps OSC99 in tmux passthrough" {
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("TMUX", "/tmp/tmux-1000/default,12345,0");
-
-    var term = Terminal.init(.{ .env_map = &env });
-    term.caps.notifications = true;
-    term.notification_protocol = .osc99;
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    const ok = try term.writeNotification(testing.allocator, &writer, "Body", null);
-
-    try testing.expect(ok);
-    try testing.expect(std.mem.startsWith(u8, writer.getWritten(), "\x1bPtmux;"));
-    try testing.expect(std.mem.find(u8, writer.getWritten(), "\x1b\x1b]99;i=opentui-1:p=body:e=1:d=1;Qm9keQ==") != null);
-    try testing.expect(std.mem.endsWith(u8, writer.getWritten(), "\x1b\\"));
+test "writeNotification - text cannot end or redirect its OSC" {
+    // C0, DEL and C1 controls become spaces, OSC 777 fields lose their semicolons, and OSC 9 text that starts
+    // with a digit gets a space first, so no OSC 9 parser reads it as a ConEmu subcommand. Invalid UTF-8 writes
+    // nothing and consumes no ID. Null expects a rejection.
+    for ([_]struct { Terminal.NotificationProtocol, []const u8, ?[]const u8, ?[]const u8 }{
+        .{ .osc99, "Body", "Title", "\x1b]99;i=opentui-1:p=title:e=1:d=0;VGl0bGU=\x1b\\\x1b]99;i=opentui-1:p=body:e=1:d=1;Qm9keQ==\x1b\\" },
+        .{ .osc99, "Body", "", "\x1b]99;i=opentui-1:p=body:e=1:d=1;Qm9keQ==\x1b\\" },
+        .{ .osc777, "Bo;dy\n", "Ti;tle", "\x1b]777;notify;Ti tle;Bo dy \x1b\\" },
+        .{ .osc777, "a\x00b\x1bc\x1fd\x7fe", null, "\x1b]777;notify;a b c d e;\x1b\\" },
+        .{ .osc777, "Body", "", "\x1b]777;notify;;Body\x1b\\" },
+        .{ .osc777, "done\u{9c}\u{9b}21t", "ci\u{9c}", "\x1b]777;notify;ci ;done  21t\x1b\\" },
+        .{ .osc777, "€ Łódź\u{a0}", "\u{80}\u{9f}", "\x1b]777;notify;  ;€ Łódź\u{a0}\x1b\\" },
+        .{ .osc9, "Body\n", "Title", "\x1b]9;Title: Body \x1b\\" },
+        .{ .osc9, "x\u{9d}9;/tmp\u{9c}", null, "\x1b]9;x 9;/tmp \x1b\\" },
+        .{ .osc9, "4;1;50", null, "\x1b]9; 4;1;50\x1b\\" },
+        .{ .osc9, "9;/tmp/demo", null, "\x1b]9; 9;/tmp/demo\x1b\\" },
+        .{ .osc9, "5 tests passed", null, "\x1b]9; 5 tests passed\x1b\\" },
+        .{ .osc9, "12 files", "", "\x1b]9; 12 files\x1b\\" },
+        .{ .osc9, "0", null, "\x1b]9; 0\x1b\\" },
+        .{ .osc9, "done", "3;tab", "\x1b]9; 3;tab: done\x1b\\" },
+        .{ .osc9, "4;1;50", "CI", "\x1b]9;CI: 4;1;50\x1b\\" },
+        .{ .osc99, "\x9c", null, null },
+        .{ .osc777, "ok", "\xc2", null },
+        .{ .osc9, "\xff", "ok", null },
+        .{ .osc9, "ok", "\xed\xa0\x80", null },
+    }) |case| {
+        var term = Terminal.init(.{ .remote_mode = .remote });
+        term.caps.notifications = true;
+        term.notification_protocol = case[0];
+        var writer = TestWriter.init(testing.allocator);
+        defer writer.deinit();
+        try testing.expectEqual(case[3] != null, try term.writeNotification(testing.allocator, &writer, case[1], case[2]));
+        try testing.expectEqualStrings(case[3] orelse "", writer.getWritten());
+        try testing.expectEqual(@intFromBool(case[3] != null), term.notification_id_counter);
+    }
 }
 
 test "writeNotification - writes raw OSC99 in Zellij" {
@@ -1854,12 +1807,14 @@ test "writeClipboard - Screen framing crosses the 252-byte boundary" {
 
 // The environment is adopted as an app forwards it, so SSH_CONNECTION makes it a remote client's. GNU screen
 // answers no query, so its TERM (forwarded by ssh) or STY names it there too; a tmux XTVERSION reply wins.
+// A nonempty TMUX or a tmux TERM there only holds back the graphics query, which tmux would show as the pane
+// title before its XTVERSION reply: a stale TMUX in front of another terminal keeps its framing and Sixel.
 // With STY and TMUX both set, a local session checks TMUX first; a remote one counts it as screen (D71a).
 test "multiplexer sets clipboard framing, OSC 52, widths and the graphics query, also behind ssh" {
     const screen = "\x1bP\x1b]52;c;dGVzdA==\x07\x1b\\";
     const tmux = "\x1bPtmux;\x1b\x1b]52;c;dGVzdA==\x1b\x1b\\\x1b\\";
     const plain = "\x1b]52;c;dGVzdA==\x1b\\";
-    const Row = struct { env: []const u8, reply: []const u8 = "", mux: Terminal.Multiplexer, osc52: bool, width: utf8.WidthMethod, graphics: bool, clipboard: []const u8 };
+    const Row = struct { env: []const u8, reply: []const u8 = "", mux: Terminal.Multiplexer, osc52: bool, width: utf8.WidthMethod, graphics: bool, sixel: bool = false, clipboard: []const u8 };
     const rows = [_]Row{
         .{ .env = "STY=1.pts-0.box", .mux = .screen, .osc52 = true, .width = .wcwidth, .graphics = false, .clipboard = screen },
         .{ .env = "TERM=screen", .mux = .screen, .osc52 = true, .width = .wcwidth, .graphics = false, .clipboard = screen },
@@ -1867,10 +1822,15 @@ test "multiplexer sets clipboard framing, OSC 52, widths and the graphics query,
         .{ .env = "TERM=screen.xterm-256color SSH_CONNECTION=1", .mux = .screen, .osc52 = true, .width = .wcwidth, .graphics = false, .clipboard = screen },
         .{ .env = "STY=1.pts-0.box TMUX=/tmp/tmux-1000/default,1,0", .mux = .tmux, .osc52 = true, .width = .wcwidth, .graphics = false, .clipboard = tmux },
         .{ .env = "STY=1.pts-0.box TMUX=/tmp/tmux-1000/default,1,0 SSH_CONNECTION=1", .mux = .screen, .osc52 = true, .width = .wcwidth, .graphics = false, .clipboard = screen },
-        .{ .env = "TERM=screen-256color TMUX=/tmp/tmux-1000/default,1,0 SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = true, .clipboard = plain },
+        .{ .env = "TERM=screen-256color TMUX=/tmp/tmux-1000/default,1,0 SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = false, .clipboard = plain },
         .{ .env = "TERM=screen-256color SSH_CONNECTION=1", .reply = "\x1bP>|tmux 3.8\x1b\\", .mux = .tmux, .osc52 = true, .width = .unicode, .graphics = false, .clipboard = tmux },
+        .{ .env = "ZELLIJ=0 TERM=tmux-256color", .mux = .zellij, .osc52 = true, .width = .wcwidth, .graphics = true, .clipboard = plain },
         .{ .env = "ZELLIJ=0 SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = true, .clipboard = plain },
-        .{ .env = "TERM=tmux-256color SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = true, .clipboard = plain },
+        .{ .env = "TMUX=/tmp/tmux-1000/default,1,0 SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = false, .clipboard = plain },
+        .{ .env = "TERM=tmux-256color SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = false, .clipboard = plain },
+        .{ .env = "TMUX=/tmp/tmux-1000/default,1,0 SSH_CONNECTION=1", .reply = "\x1bP>|tmux 3.8\x1b\\", .mux = .tmux, .osc52 = true, .width = .unicode, .graphics = false, .clipboard = tmux },
+        .{ .env = "TMUX= SSH_CONNECTION=1", .mux = .none, .osc52 = false, .width = .unicode, .graphics = true, .clipboard = plain },
+        .{ .env = "TERM=xterm-256color TMUX=/gone SSH_CONNECTION=1", .reply = "\x1b[?62;4c", .mux = .none, .osc52 = false, .width = .unicode, .graphics = false, .sixel = true, .clipboard = plain },
     };
     for (rows, 0..) |row, index| {
         errdefer std.debug.print("multiplexer row {d}\n", .{index});
@@ -1886,11 +1846,46 @@ test "multiplexer sets clipboard framing, OSC 52, widths and the graphics query,
         if (row.reply.len > 0) term.processCapabilityResponse(row.reply);
         try testing.expectEqual(row.mux, term.multiplexer);
         try testing.expectEqual(row.osc52, term.caps.osc52);
-        try testing.expectEqual(row.mux != .none, term.caps.explicit_cursor_positioning);
+        try testing.expectEqual(row.mux == .tmux or row.mux == .screen, term.caps.explicit_cursor_positioning);
         try testing.expectEqual(row.width, term.caps.unicode);
+        try testing.expectEqual(row.sixel, term.caps.sixel);
         writer.reset();
         try term.writeClipboard(&writer, .clipboard, "test");
         try testing.expectEqualStrings(row.clipboard, writer.getWritten());
+        // A notification takes the clipboard's framing and terminator, also past one screen chunk. Screen
+        // forwards only the low byte of a code point (U+4E07 as BEL, U+4E1B as ESC, U+039C as ST, U+0134
+        // as '4'; a C locale ends its DCS at the 9C in U+00DC), so there non-ASCII text becomes spaces.
+        term.caps.notifications = true;
+        for ([_]struct { Terminal.NotificationProtocol, []const u8, []const u8, ?[]const u8 }{
+            .{ .osc99, "test", "99;i=opentui-1:p=body:e=1:d=1;dGVzdA==", null },
+            .{ .osc777, "dGVzdA==", "777;notify;dGVzdA==;", null },
+            .{ .osc9, "42 tests", "9; 42 tests", null },
+            .{ .osc9, "万丛]52;c;UFdORUQ=万", "9;万丛]52;c;UFdORUQ=万", "9;  ]52;c;UFdORUQ= " },
+            .{ .osc9, "Ĵ;1;50", "9;Ĵ;1;50", "9; ;1;50" },
+            .{ .osc777, "ΜΛ21tćě€Ü“", "777;notify;ΜΛ21tćě€Ü“;", "777;notify;  21t     ;" },
+        }) |case| {
+            term.notification_protocol = case[0];
+            writer.reset();
+            try testing.expect(try term.writeNotification(testing.allocator, &writer, case[1], null));
+            const sent = if (row.mux == .screen) case[3] orelse case[2] else case[2];
+            const notification = try std.mem.replaceOwned(u8, testing.allocator, row.clipboard, "52;c;dGVzdA==", sent);
+            defer testing.allocator.free(notification);
+            try testing.expectEqualStrings(notification, writer.getWritten());
+        }
+        if (row.mux != .screen) continue;
+        writer.reset();
+        const long: [1000]u8 = @splat('x');
+        try testing.expect(try term.writeNotification(testing.allocator, &writer, &long, null));
+        var forwarded: [1100]u8 = undefined;
+        try testing.expectEqualStrings("\x1b]777;notify;" ++ long ++ ";\x07", try forwardScreenDcs(writer.getWritten(), &forwarded));
+        // The body's ESC falls on the first chunk's last byte, so it starts the next chunk instead.
+        writer.reset();
+        term.notification_protocol = .osc99;
+        term.notification_id_counter = 9;
+        const title: [162]u8 = @splat('x');
+        try testing.expect(try term.writeNotification(testing.allocator, &writer, "test", &title));
+        try testing.expect(std.mem.find(u8, writer.getWritten(), "\x1b\x1b\\") == null);
+        try testing.expect(std.mem.endsWith(u8, try forwardScreenDcs(writer.getWritten(), &forwarded), "\x07\x1b]99;i=opentui-10:p=body:e=1:d=1;dGVzdA==\x07"));
     }
 }
 
@@ -1929,85 +1924,53 @@ fn forwardScreenDcs(input: []const u8, output: []u8) ![]const u8 {
     return output[0..output_offset];
 }
 
-test "queryTerminalSend - force-off rejects unrelated row-1 cursor reports" {
+test "queryExplicitWidth - OPENTUI_FORCE_EXPLICIT_WIDTH skips the probes or sets the capability" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("OPENTUI_FORCE_EXPLICIT_WIDTH", "0");
-
-    var term = Terminal.init(.{ .env_map = &env });
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    try term.queryTerminalSend(&writer);
-
-    const output = writer.getWritten();
-
-    // Should not contain OSC 66 queries
-    try testing.expect(std.mem.find(u8, output, "\x1b]66;") == null);
-
-    // Should still contain other queries
-    try testing.expect(std.mem.find(u8, output, "\x1b[>0q") != null); // xtversion
-
-    // Verify the flag was set correctly
-    try testing.expect(term.skip_explicit_width_query);
-    try testing.expect(!term.caps.explicit_width);
-
-    term.processCapabilityResponse("\x1b[1;2R");
-    try testing.expect(!term.caps.explicit_width);
-    try testing.expect(!term.caps.scaled_text);
+    // Rows: environment value ("" unset), probes sent, explicit width before any reply.
+    const rows = .{ .{ "", true, false }, .{ "true", true, true }, .{ "0", false, false } };
+    inline for (rows) |row| {
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        if (row[0].len != 0) try env.put("OPENTUI_FORCE_EXPLICIT_WIDTH", row[0]);
+        var term = Terminal.init(.{ .env_map = &env });
+        var writer = TestWriter.init(testing.allocator);
+        defer writer.deinit();
+        try term.queryTerminalSend(&writer);
+        try term.queryExplicitWidth(&writer);
+        const output = writer.getWritten();
+        try testing.expectEqual(row[1], std.mem.find(u8, output, ansi.ANSI.explicitWidthQuery) != null);
+        try testing.expectEqual(row[1], std.mem.find(u8, output, ansi.ANSI.scaledTextQuery) != null);
+        try testing.expect(std.mem.find(u8, output, ansi.ANSI.xtversion) != null);
+        try testing.expectEqual(row[2], term.caps.explicit_width);
+        // foot's replies (it draws `w` only); without probes they are not evidence.
+        term.processCapabilityResponse("\x1b[7;11R\x1b[2;2R\x1b[2;2R");
+        try testing.expectEqual(row[1] or row[2], term.caps.explicit_width);
+        try testing.expect(!term.caps.scaled_text);
+    }
 }
 
-test "queryTerminalSend - sends OSC 66 queries by default" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-
-    var term = Terminal.init(.{ .env_map = &env });
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    try term.queryTerminalSend(&writer);
-
-    const output = writer.getWritten();
-
-    // Should contain OSC 66 explicit width query
-    try testing.expect(std.mem.find(u8, output, "\x1b]66;w=1; \x1b\\") != null);
-
-    // Should contain OSC 66 scaled text query
-    try testing.expect(std.mem.find(u8, output, "\x1b]66;s=2; \x1b\\") != null);
-
-    // Verify the flag was not set
-    try testing.expect(!term.skip_explicit_width_query);
-}
-
-test "queryTerminalSend - sends OSC 66 queries when OPENTUI_FORCE_EXPLICIT_WIDTH=true" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    var env = std.process.Environ.Map.init(testing.allocator);
-    defer env.deinit();
-    try env.put("OPENTUI_FORCE_EXPLICIT_WIDTH", "true");
-
-    var term = Terminal.init(.{ .env_map = &env });
-
-    var writer = TestWriter.init(testing.allocator);
-    defer writer.deinit();
-
-    try term.queryTerminalSend(&writer);
-
-    const output = writer.getWritten();
-
-    // Should contain OSC 66 queries
-    try testing.expect(std.mem.find(u8, output, "\x1b]66;w=1; \x1b\\") != null);
-    try testing.expect(std.mem.find(u8, output, "\x1b]66;s=2; \x1b\\") != null);
-
-    // Verify the capability was forced on
-    try testing.expect(term.caps.explicit_width);
-    try testing.expect(!term.skip_explicit_width_query);
+test "XTVERSION kitty 0.40 and foot 1.21 or later report text sizing without a probe" {
+    // Rows: XTVERSION reply, OPENTUI_FORCE_EXPLICIT_WIDTH ("" unset), explicit width, scaled text (foot: width only).
+    const rows = .{
+        .{ "kitty(0.49.2)", "", true, true },   .{ "kitty(0.40.0)", "", true, true },  .{ "kitty(0.39.1)", "", false, false },
+        .{ "kitty(1.0.0)", "", true, true },    .{ "kitty(0.9.0)", "", false, false }, .{ "kitty(0.49.2)", "0", false, false },
+        .{ "foot(1.28.0)", "", true, false },   .{ "foot(1.21.0)", "", true, false },  .{ "foot(1.20.2)", "", false, false },
+        .{ "foot(1.28.0)", "0", false, false }, .{ "tmux 3.5a", "", false, false },
+    };
+    inline for (rows) |row| {
+        var env = std.process.Environ.Map.init(testing.allocator);
+        defer env.deinit();
+        if (row[1].len != 0) try env.put("OPENTUI_FORCE_EXPLICIT_WIDTH", row[1]);
+        var term = Terminal.init(.{ .env_map = &env });
+        var writer = TestWriter.init(testing.allocator);
+        defer writer.deinit();
+        try term.queryTerminalSend(&writer);
+        term.processCapabilityResponse("\x1bP>|" ++ row[0] ++ "\x1b\\");
+        errdefer std.debug.print("XTVERSION {s}\n", .{row[0]});
+        try testing.expectEqual(row[2], term.caps.explicit_width);
+        try testing.expectEqual(row[3], term.caps.scaled_text);
+    }
 }
 
 test "enableDetectedFeatures - sends initial theme queries" {
@@ -2113,8 +2076,8 @@ test "width method follows the environment, then the DECRPM 2027 reply and XTVER
         .{ tmux38 ++ .{.{ "ZELLIJ", "0" }}, .{"\x1bP>|tmux 3.8\x1b\\"}, .unicode },
         .{ .{ .{ "TERM", "xterm-256color" }, .{ "XTERM_VERSION", "XTerm(411)" }, .{ "KONSOLE_VERSION", "250400" } }, .{}, .unicode },
         // Explicit widths (the probe moved the cursor to column 2) need no mode 2027.
-        .{ .{}, .{ "\x1b[?2027;2$y", "\x1b[1;1R\x1b[1;2R\x1b[1;3R" }, .unicode },
-        .{ .{}, .{ "\x1b[?2027;1$y", "\x1b[1;1R\x1b[1;2R\x1b[1;3R" }, .unicode },
+        .{ .{}, .{ "\x1b[?2027;2$y", "\x1b[1;1R\x1b[2;2R\x1b[2;3R" }, .unicode },
+        .{ .{}, .{ "\x1b[?2027;1$y", "\x1b[1;1R\x1b[2;2R\x1b[2;3R" }, .unicode },
     };
     inline for (rows, 0..) |row, index| {
         var env = std.process.Environ.Map.init(testing.allocator);
@@ -2126,6 +2089,7 @@ test "width method follows the environment, then the DECRPM 2027 reply and XTVER
         defer writer.deinit();
         // Session enables features before the replies arrive, and again after each reply.
         try term.queryTerminalSend(&writer);
+        try term.queryExplicitWidth(&writer);
         try term.enableDetectedFeatures(&writer, false);
         inline for (row[1]) |reply| {
             term.processCapabilityResponse(reply);

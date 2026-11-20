@@ -119,11 +119,10 @@ impl Terminal {
         check(unsafe { SetConsoleMode(std_handle(STD_OUTPUT_HANDLE), output) })
     }
 
-    /// Restores the saved console modes.
+    /// Restores the saved console modes, even out of raw mode: a program the console was handed to may have changed
+    /// them.
     pub fn leave_raw(&mut self) -> io::Result<()> {
-        if !std::mem::replace(&mut self.raw, false) {
-            return Ok(());
-        }
+        self.raw = false;
         let input = check(unsafe { SetConsoleMode(std_handle(STD_INPUT_HANDLE), self.input_mode) });
         let output = check(unsafe { SetConsoleMode(std_handle(STD_OUTPUT_HANDLE), self.output_mode) });
         input.and(output)
@@ -136,6 +135,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        #[expect(clippy::let_underscore_must_use, reason = "a drop has no caller to report to")]
         let _ = self.leave_raw();
     }
 }

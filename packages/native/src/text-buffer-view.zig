@@ -13,6 +13,7 @@ const TextSelection = tb.TextSelection;
 pub const WrapMode = tb.WrapMode;
 const TextChunk = seg_mod.TextChunk;
 const StyleSpan = tb.StyleSpan;
+const TextBufferError = tb.TextBufferError;
 
 pub const TextBufferViewError = error{
     OutOfMemory,
@@ -506,13 +507,9 @@ pub const UnifiedTextBufferView = struct {
     pub fn setViewport(self: *Self, vp: ?Viewport) void {
         self.viewport = vp;
 
-        // If viewport has width, set wrap width (wrapping behavior depends on wrap_mode)
+        // A width of zero is a view not laid out yet: wrapping at it gives every character its own row.
         if (vp) |viewport| {
-            if (self.wrap_width != viewport.width) {
-                self.wrap_width = viewport.width;
-                self.virtual_lines_dirty = true;
-                self.truncation_applied = false;
-            }
+            self.setWrapWidth(if (viewport.width > 0) viewport.width else null);
         } else {
             self.truncation_applied = false;
         }
@@ -547,6 +544,11 @@ pub const UnifiedTextBufferView = struct {
             self.virtual_lines_dirty = true;
             self.truncation_applied = false;
         }
+    }
+
+    /// The width the layout wraps lines at, or null when it does not wrap them.
+    pub fn layoutWrapWidth(self: *const Self) ?u32 {
+        return if (self.wrap_mode == .none) null else self.wrap_width;
     }
 
     pub fn setWrapMode(self: *Self, mode: WrapMode) void {
@@ -649,7 +651,7 @@ pub const UnifiedTextBufferView = struct {
         return .{
             .root = self.text_buffer.rope().root,
             .clears = self.text_buffer.layout_cache.clears,
-            .tab_generation = self.text_buffer.tab_metrics_generation,
+            .tab_generation = self.text_buffer.metrics_generation,
         };
     }
 
@@ -679,7 +681,7 @@ pub const UnifiedTextBufferView = struct {
         const rope = self.text_buffer.rope();
         // A buffer switch drops the baseline, so it is always this buffer's.
         if (baseline.clears != self.text_buffer.layout_cache.clears or
-            baseline.tab_generation != self.text_buffer.tab_metrics_generation) return null;
+            baseline.tab_generation != self.text_buffer.metrics_generation) return null;
         if (baseline.root == rope.root) return .{ .first = 0, .old_count = 0, .new_count = 0, .weight_delta = 0 };
 
         var old = rope.*;
@@ -744,12 +746,11 @@ pub const UnifiedTextBufferView = struct {
         const allocator = self.virtual_lines_arena.allocator();
         const word_layout: ?*WordLayoutStorage = if (self.word_layout.lines.items.len == self.text_buffer.getLineCount()) &self.word_layout else null;
         text_work.add(.layouts, 1);
-        return if (self.wrap_mode == .none or self.wrap_width == null)
-            calculateUnwrappedVirtualLines(allocator, self.text_buffer, range, output)
-        else switch (self.wrap_mode) {
+        const width = self.layoutWrapWidth() orelse return calculateUnwrappedVirtualLines(allocator, self.text_buffer, range, output);
+        return switch (self.wrap_mode) {
             .none => unreachable,
-            .char => calculateVirtualLinesGeneric(.render, .char, allocator, self.text_buffer, range, self.wrap_width.?, self.first_line_offset, output, null),
-            .word => calculateVirtualLinesGeneric(.render, .word, allocator, self.text_buffer, range, self.wrap_width.?, self.first_line_offset, output, word_layout),
+            .char => calculateVirtualLinesGeneric(.render, .char, allocator, self.text_buffer, range, width, self.first_line_offset, output, null),
+            .word => calculateVirtualLinesGeneric(.render, .word, allocator, self.text_buffer, range, width, self.first_line_offset, output, word_layout),
         };
     }
 
@@ -1037,6 +1038,23 @@ pub const UnifiedTextBufferView = struct {
         self.selection = null;
         self.clearSelectionEndpoints();
         self.selection_behavior = .cell;
+    }
+
+    /// Keeps the selection on its text after `buffer`'s widths changed from `method`, its direction too.
+    pub fn followWidthMethod(self: *Self, buffer: *const UnifiedTextBuffer, method: utf8.WidthMethod) void {
+        if (self.text_buffer != buffer) return;
+        if (self.selection) |*selection| mapPair(buffer, method, &selection.start, &selection.end);
+        if (self.selection_endpoints) |*endpoints| {
+            if (endpoints.anchor <= endpoints.focus) mapPair(buffer, method, &endpoints.anchor, &endpoints.focus) else mapPair(buffer, method, &endpoints.focus, &endpoints.anchor);
+        }
+    }
+
+    /// Maps `low <= high` onto the new widths: low rounds down, high up. An empty pair, such as a press
+    /// without a drag, is mapped once and stays empty even inside a cluster that now joins.
+    fn mapPair(buffer: *const UnifiedTextBuffer, method: utf8.WidthMethod, low: *u32, high: *u32) void {
+        const empty = low.* == high.*;
+        low.* = buffer.weightAtByte(buffer.byteAtOffsetUnder(low.*, method), true);
+        high.* = if (empty) low.* else buffer.weightAtByte(buffer.byteAtOffsetUnder(high.*, method), false);
     }
 
     pub fn setSelectionOccupancy(self: *Self, occupancy: SelectionOccupancy) void {
@@ -1551,6 +1569,58 @@ pub const UnifiedTextBufferView = struct {
         return result;
     }
 
+    /// A grapheme the view draws: the byte where it starts in the UTF-8 the text was set with, and the local columns
+    /// it spans.
+    pub const CellGrapheme = struct { byte: u32, x: i64, width: u32 };
+
+    /// The grapheme the view draws at local cell `(x, y)`, from the lines it was last prepared with. Null for a cell
+    /// that shows none: outside the viewport, alignment or wrap padding, past the last line, or a truncation
+    /// ellipsis, and while the lines need preparing again, which a read never does.
+    pub fn graphemeAtCell(self: *const Self, x: i32, y: i32) ?CellGrapheme {
+        if (self.needsPrepare()) return null;
+        var vp_x: i64 = 0;
+        var vp_y: i64 = 0;
+        if (self.viewport) |vp| {
+            if (x < 0 or y < 0 or x >= vp.width or y >= vp.height) return null;
+            vp_y = vp.y;
+            if (self.wrap_mode == .none) vp_x = vp.x;
+        }
+        const row = @as(i64, y) + vp_y;
+        if (row < 0 or row >= self.virtual_lines.items.len) return null;
+        const vline_idx: usize = @intCast(row);
+        const vline = &self.virtual_lines.items[vline_idx];
+        const pad = self.getLineAlignmentPad(vline_idx, vline.width_cols);
+        const col = @as(i64, x) + vp_x - pad;
+        if (col < 0) return null;
+        // Past the line's chunks lies wrap padding.
+        var start: u32 = 0;
+        for (vline.chunks.items) |vchunk| {
+            const local: u32 = @intCast(col - start);
+            defer start += vchunk.width_cols;
+            if (local >= vchunk.width_cols) continue;
+            const chunk = vchunk.chunk;
+            if ((chunk.flags & TextChunk.Flags.STATIC_ELLIPSIS) != 0) return null;
+            const bytes = chunk.getBytes(self.text_buffer.memRegistry());
+            const pos = utf8.findGraphemePosByWidth(
+                bytes,
+                vchunk.col_start_in_chunk + local,
+                self.text_buffer.tabWidth(),
+                self.text_buffer.controlDisplay(),
+                chunk.isAsciiOnly(),
+                false,
+                self.text_buffer.widthMethod(),
+            );
+            if (pos.byte_offset >= bytes.len) return null;
+            const width = utf8.getGraphemeWidthAt(bytes, pos.byte_offset, self.text_buffer.tabWidth(), self.text_buffer.controlDisplay(), self.text_buffer.widthMethod());
+            return .{
+                .byte = chunk.byte_start + pos.byte_offset,
+                .x = @as(i64, start) + pos.columns_used - vchunk.col_start_in_chunk + pad - vp_x,
+                .width = width,
+            };
+        }
+        return null;
+    }
+
     /// Pack selection info into u64 for efficient passing
     /// Returns 0xFFFF_FFFF_FFFF_FFFF for no selection or zero-width selection
     pub fn packSelectionInfo(self: *const Self) u64 {
@@ -1576,13 +1646,14 @@ pub const UnifiedTextBufferView = struct {
         return self.text_buffer.copyTextRange(selection.start, selection.end, out);
     }
 
-    pub fn getVirtualLineSpans(self: *const Self, vline_idx: usize) VirtualLineSpanInfo {
+    /// Rebuilding a stale line's spans can need memory, so this can fail.
+    pub fn getVirtualLineSpans(self: *const Self, vline_idx: usize) TextBufferError!VirtualLineSpanInfo {
         if (vline_idx >= self.virtual_lines.items.len) {
             return .{ .spans = &[_]StyleSpan{}, .source_line = 0, .source_col_start = 0 };
         }
 
         const vline = &self.virtual_lines.items[vline_idx];
-        const spans = self.text_buffer.getLineSpans(vline.source_line);
+        const spans = try self.text_buffer.getLineSpans(vline.source_line);
 
         return .{
             .spans = spans,

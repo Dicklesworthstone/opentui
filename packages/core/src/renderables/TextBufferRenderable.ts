@@ -94,7 +94,7 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
         return
       }
 
-      textBuffer = TextBuffer.create(this._ctx.widthMethod, ctx.nativeScene)
+      textBuffer = TextBuffer.create(this._ctx.widthMethod, ctx.nativeScene, true)
       this.textBuffer = textBuffer
       textBufferView = TextBufferView.create(textBuffer)
       this.textBufferView = textBufferView
@@ -202,8 +202,7 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
   }
 
   public set scrollY(value: number) {
-    const maxScrollY = Math.max(0, this.scrollHeight - this.height)
-    const clamped = Math.max(0, Math.min(value ?? 0, maxScrollY))
+    const clamped = Math.max(0, Math.min(value ?? 0, this.maxScrollY))
     if (this._scrollY !== clamped) {
       this.runMutation(() => {
         this.setNativeSceneTextOptions({ scrollY: clamped })
@@ -219,8 +218,7 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
   }
 
   public set scrollX(value: number) {
-    const maxScrollX = Math.max(0, this.scrollWidth - this.width)
-    const clamped = Math.max(0, Math.min(value ?? 0, maxScrollX))
+    const clamped = Math.max(0, Math.min(value ?? 0, this.maxScrollX))
     if (this._scrollX !== clamped) {
       this.runMutation(() => {
         this.setNativeSceneTextOptions({ scrollX: clamped })
@@ -242,11 +240,17 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
   }
 
   public get maxScrollY(): number {
-    return Math.max(0, this.scrollHeight - this.height)
+    return Math.max(0, this.scrollHeight - this.textViewport.height)
   }
 
   public get maxScrollX(): number {
-    return Math.max(0, this.scrollWidth - this.width)
+    return Math.max(0, this.scrollWidth - this.textViewport.width)
+  }
+
+  /** The cells the text fills: native text leaves its padding out once it has a layout; until then, its box. */
+  private get textViewport(): { width: number; height: number } {
+    const scene = this.nativeTextScene
+    return scene && scene.getLayout(this, "paint").width > 0 ? scene.getLayout(this, "content") : this
   }
 
   protected updateViewportOffset(scrollX = this._scrollX, scrollY = this._scrollY): void {
@@ -290,9 +294,7 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
     const newColor = value ? RGBA.clone(parseColor(value)) : undefined
     if (this._selectionBg !== newColor) {
       this.runMutation(() => {
-        if (this.nativeTextScene || this.lastLocalSelection) {
-          this.updateLocalSelection(this.lastLocalSelection, true, { bg: newColor, fg: this._selectionFg })
-        }
+        this.setSelectionColors(newColor, this._selectionFg)
         this._selectionBg = newColor
         this.requestRender()
       })
@@ -307,9 +309,7 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
     const newColor = value ? RGBA.clone(parseColor(value)) : undefined
     if (this._selectionFg !== newColor) {
       this.runMutation(() => {
-        if (this.nativeTextScene || this.lastLocalSelection) {
-          this.updateLocalSelection(this.lastLocalSelection, true, { bg: this._selectionBg, fg: newColor })
-        }
+        this.setSelectionColors(this._selectionBg, newColor)
         this._selectionFg = newColor
         this.requestRender()
       })
@@ -446,6 +446,12 @@ export abstract class TextBufferRenderable extends Renderable implements LineInf
       return this.updateLocalSelection(this.lastLocalSelection)
     }
     return false
+  }
+
+  /** Restyles the accepted selection; replaying its cells would select other text after a width change. */
+  private setSelectionColors(bg?: RGBA, fg?: RGBA): void {
+    if (this.nativeTextScene) this.nativeTextScene.setTextSelection(this, "colors", null, bg, fg)
+    else this.textBufferView.setSelectionColors(bg, fg)
   }
 
   private updateLocalSelection(

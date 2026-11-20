@@ -1,14 +1,15 @@
 #!/bin/sh
 # Compile-checks the workspace for every target build.rs maps except the x86_64 Linux and Windows ones, which test.sh
 # checks on their own runners: clippy with the feature sets test.sh uses, against stub artifacts. Nothing is linked or
-# run. test.sh runs on macOS too; nothing tests arm64 Linux, Linux with musl, or Windows on Arm beyond this check.
+# run. test.sh runs on macOS too; nothing tests arm64 Linux, Linux with musl, or Windows on Arm beyond this check,
+# except that CI links an arm64 MSVC executable statically.
 #
 # Needs Zig, whose C compiler builds tree-sitter's and ring's C code for each target against its bundled headers, and
 # each target's standard library, which the script adds with rustup. Without rustup, build them from rust-src:
 # RUSTC_BOOTSTRAP=1 CARGO_UNSTABLE_BUILD_STD=std sh scripts/check-targets.sh
 #
 # Usage: sh scripts/check-targets.sh
-# Set ZIG to the Zig command if `zig` is not the version packages/native/build.zig.zon names, such as ZIG='zig 0.17.0'
+# Set ZIG to the Zig command if `zig` is not the version packages/native/build.zig.zon names, such as ZIG='zig 0.17.1'
 # with anyzig.
 set -eu
 
@@ -20,14 +21,15 @@ zig=${ZIG:-zig}
 header=${OPENTUI_LIB_DIR:-$here/../native/include}/opentui.h
 
 # Each Rust target, the Zig target its C code compiles for, and its row in build.rs: artifact directory and shared
-# library. Zig has no MSVC headers, so both Windows targets use MinGW's; the objects are never linked.
-targets='aarch64-apple-darwin aarch64-macos.13.0 aarch64-macos libopentui.dylib
-x86_64-apple-darwin x86_64-macos.13.0 x86_64-macos libopentui.dylib
-aarch64-unknown-linux-gnu aarch64-linux-gnu.2.17 aarch64-linux libopentui.so
-x86_64-unknown-linux-musl x86_64-linux-musl x86_64-linux-musl libopentui.so
-aarch64-unknown-linux-musl aarch64-linux-musl aarch64-linux-musl libopentui.so
-aarch64-pc-windows-msvc aarch64-windows-gnu aarch64-windows opentui.dll
-aarch64-pc-windows-gnullvm aarch64-windows-gnu aarch64-windows opentui.dll'
+# library, and release archive platform. Zig has no MSVC headers, so both Windows targets use MinGW's; the objects are
+# never linked.
+targets='aarch64-apple-darwin aarch64-macos.13.0 aarch64-macos libopentui.dylib darwin-arm64
+x86_64-apple-darwin x86_64-macos.13.0 x86_64-macos libopentui.dylib darwin-x64
+aarch64-unknown-linux-gnu aarch64-linux-gnu.2.17 aarch64-linux libopentui.so linux-arm64
+x86_64-unknown-linux-musl x86_64-linux-musl x86_64-linux-musl libopentui.so linux-x64-musl
+aarch64-unknown-linux-musl aarch64-linux-musl aarch64-linux-musl libopentui.so linux-arm64-musl
+aarch64-pc-windows-msvc aarch64-windows-gnu aarch64-windows opentui.dll windows-arm64
+aarch64-pc-windows-gnullvm aarch64-windows-gnu aarch64-windows opentui.dll windows-arm64'
 if [ -z "${CARGO_UNSTABLE_BUILD_STD:-}" ] && command -v rustup > /dev/null; then
     rustup target add $(printf '%s\n' "$targets" | cut -d' ' -f1)
 fi
@@ -37,12 +39,12 @@ tools=$CARGO_TARGET_DIR/tools
 # build.rs only checks that the artifacts exist and that the header matches the bindings.
 mkdir -p "$tools/lib"
 cp "$header" "$tools/lib/opentui.h"
-for stub in libopentui.dylib libopentui.so libopentui.a opentui.dll opentui.lib; do
+for stub in libopentui.dylib libopentui.so libopentui.a opentui.dll opentui.lib opentui-static.lib; do
     rm -f "$tools/lib/$stub"
     : > "$tools/lib/$stub"
 done
 # Read-only, as in a release or a Nix store: the static build below runs build.rs twice over its own copy.
-chmod a-w "$tools/lib/libopentui.a"
+chmod a-w "$tools/lib/libopentui.a" "$tools/lib/opentui-static.lib"
 # cc-rs gives MSVC targets lib.exe's options.
 for archiver in ar lib; do
     printf '#!/bin/sh\nexec %s %s "$@"\n' "$zig" "$archiver" > "$tools/zig-$archiver"
@@ -51,10 +53,10 @@ done
 
 export OPENTUI_LIB_DIR="$tools/lib"
 cargo=${CARGO:-cargo}
-while read -r target zig_target platform library; do
+while read -r target zig_target platform library release; do
     # The stubs share one OPENTUI_LIB_DIR, so check build.rs's row and the native build's directory by name.
-    grep -Fq "(\"$target\", \"$platform\", \"$library\")," crates/opentui-sys/build.rs ||
-        { echo "FAIL: build.rs does not map $target to $platform and $library" >&2; exit 1; }
+    grep -Fq "(\"$target\", \"$platform\", \"$library\", \"$release\")," crates/opentui-sys/build.rs ||
+        { echo "FAIL: build.rs does not map $target to $platform, $library and $release" >&2; exit 1; }
     grep -Fq ".output_name = \"$platform\"" ../native/build.zig ||
         { echo "FAIL: packages/native/build.zig builds no $platform" >&2; exit 1; }
     cat > "$tools/cc-$target" <<EOF
@@ -84,14 +86,14 @@ EOF
         *-musl) rustflags='-C target-feature=-crt-static' ;;
     esac
     case $target in
-        # Windows links opentui.dll with or without the static feature.
-        *-windows-*) feature_sets="--no-default-features '$shared' '$static'" ;;
+        # The Windows GNU targets link opentui.dll with or without the static feature.
+        *-windows-gnullvm) feature_sets="--no-default-features '$shared' '$static'" ;;
         *) feature_sets="--no-default-features '$shared' '$static' '$static'" ;;
     esac
     eval "set -- $feature_sets"
     for features do
         # A newer archive reruns build.rs, so the second static pass replaces the first one's copy.
-        touch "$tools/lib/libopentui.a"
+        touch "$tools/lib/libopentui.a" "$tools/lib/opentui-static.lib"
         env "CC_$(printf %s "$target" | tr - _)=$tools/cc-$target" "AR_$(printf %s "$target" | tr - _)=$tools/zig-$archiver" \
             ${rustflags:+"RUSTFLAGS=$rustflags"} "$cargo" clippy --locked --target "$target" --manifest-path "$here/Cargo.toml" --workspace \
             --all-targets $features -- -D warnings < /dev/null
@@ -126,11 +128,21 @@ while IFS= read -r output; do
 done < "$tools/static-outputs"
 echo 'PASS: static macOS builds search libopentui.a and no libopentui.dylib'
 
-# Windows links opentui.dll with the static feature too, though the stubs include a libopentui.a.
-find "$CARGO_TARGET_DIR" -path '*-windows-*/debug/build/opentui-sys-*/output' -newer "$tools/lib/opentui.h" \
-    -print > "$tools/windows-outputs"
-[ -s "$tools/windows-outputs" ] || { echo 'FAIL: no Windows build' >&2; exit 1; }
+# The Windows GNU targets link opentui.dll with the static feature too, though the stubs include the archives. MSVC
+# links opentui-static.lib with it.
+find "$CARGO_TARGET_DIR" -path "$CARGO_TARGET_DIR/*-pc-windows-*/debug/build/opentui-sys-*/output" \
+    -newer "$tools/lib/opentui.h" -print > "$tools/windows-outputs"
+msvc_static=0
 while IFS= read -r output; do
-    grep -qx 'cargo:static=0' "$output" || { echo "FAIL: a Windows build links libopentui.a: $output" >&2; exit 1; }
+    case $output in
+        *-windows-gnullvm/*)
+            grep -qx 'cargo:static=0' "$output" || { echo "FAIL: a Windows GNU build links an archive: $output" >&2; exit 1; } ;;
+        *)
+            grep -qx 'cargo:static=0' "$output" && continue
+            grep -qx 'cargo:rustc-link-lib=static=opentui-static' "$output" ||
+                { echo "FAIL: a static MSVC build links no opentui-static.lib: $output" >&2; exit 1; }
+            msvc_static=$((msvc_static + 1)) ;;
+    esac
 done < "$tools/windows-outputs"
-echo 'PASS: Windows builds link opentui.dll with and without the static feature'
+[ "$msvc_static" -eq 1 ] || { echo "FAIL: $msvc_static static MSVC builds, not 1" >&2; exit 1; }
+echo 'PASS: Windows GNU builds link opentui.dll, and static MSVC builds opentui-static.lib'

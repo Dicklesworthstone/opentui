@@ -2,6 +2,7 @@
 #include "yoga-vocabulary.h"
 
 #include <yoga/OTAllocator.h>
+#include <yoga/algorithm/PixelGrid.h>
 #include <yoga/node/Node.h>
 
 #include <algorithm>
@@ -14,7 +15,6 @@
 #ifdef OT_YOGA_TEST_ALLOCATOR
 #include <yoga/algorithm/Cache.h>
 #include <yoga/algorithm/CalculateLayout.h>
-#include <yoga/algorithm/PixelGrid.h>
 #include <yoga/debug/Log.h>
 #include <yoga/numeric/Comparison.h>
 #include <utility>
@@ -148,12 +148,6 @@ uint32_t otYogaNodeMoveChild(YGNodeRef parent_ref, YGNodeRef child_ref,
     child->setOwner(parent);
     static_assert(std::is_nothrow_copy_assignable_v<LayoutResults>);
     if (previous) child->setLayout({});
-    // Absolute-edge rounding visits only flagged paths, and the child may get no layout pass: under
-    // display: none, descendants stay dirty below the zeroed root, so the dirty walk below stops
-    // there. Flag the child's new path, so the next pass rounds its subtree as a full pass would.
-    for (Node* node = child; node && node->getConfig()->roundsPositionsFromAbsoluteEdges();
-         node = node->getOwner())
-      node->setHasNewLayout(true);
 
     // Both ancestor paths are bounded by managed placement validation. Mark
     // their complete accepted state before any managed callback can inspect it.
@@ -240,11 +234,45 @@ void otYogaNodeForgetMeasurements(YGNodeRef node) noexcept {
   }
 }
 
-uint32_t otYogaNodeGetComputedLayout(YGNodeConstRef node, OTYogaLayout* out) noexcept {
+uint32_t otYogaNodeGetComputedLayout(YGNodeConstRef node, OTYogaLayout* out,
+                                     float* content) noexcept {
   if (!node || !out) return OT_YOGA_INVALID_ARGUMENT;
   return checked([&] {
     *out = {YGNodeLayoutGetLeft(node),   YGNodeLayoutGetTop(node),   YGNodeLayoutGetRight(node),
             YGNodeLayoutGetBottom(node), YGNodeLayoutGetWidth(node), YGNodeLayoutGetHeight(node)};
+    if (!content) return;
+    using namespace facebook::yoga;
+    const auto* target = resolveRef(node);
+    const auto& layout = target->getLayout();
+    const float pad[4] = {layout.padding(PhysicalEdge::Left), layout.padding(PhysicalEdge::Top),
+                          layout.padding(PhysicalEdge::Right), layout.padding(PhysicalEdge::Bottom)};
+    if (pad[0] == 0 && pad[1] == 0 && pad[2] == 0 && pad[3] == 0) {
+      // Without padding the view is the box itself.
+      content[0] = content[1] = 0;
+      content[2] = out->width;
+      content[3] = out->height;
+      return;
+    }
+    // The unrounded absolute origin that rounding starts from.
+    double left = 0, top = 0;
+    for (auto* cursor = target; cursor; cursor = cursor->getOwner()) {
+      left += cursor->getLayout().rawPosition(PhysicalEdge::Left);
+      top += cursor->getLayout().rawPosition(PhysicalEdge::Top);
+    }
+    const double scale = target->getConfig()->getPointScaleFactor();
+    // Scene configs round at scale 1, which sees only the fraction: whole cells off the origin keep
+    // the edges small, exact floats.
+    left -= std::floor(left);
+    top -= std::floor(top);
+    // Rounded as Yoga rounds the node's own edges (PixelGrid.cpp), so no padding gives the box.
+    // Natively measured nodes keep the default node type (yoga.zig), whose edges round to nearest.
+    auto edge = [&](double value) { return roundValueToPixelGrid(value, scale, false, false); };
+    const double right = left + layout.rawDimension(Dimension::Width);
+    const double bottom = top + layout.rawDimension(Dimension::Height);
+    content[0] = edge(left + pad[0]) - edge(left);
+    content[1] = edge(top + pad[1]) - edge(top);
+    content[2] = edge(right - pad[2]) - edge(left + pad[0]);
+    content[3] = edge(bottom - pad[3]) - edge(top + pad[1]);
   });
 }
 

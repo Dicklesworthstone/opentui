@@ -2,7 +2,7 @@ use super::{ClipboardSelection, Context, ImageProtocol};
 use crate::error::{Error, Result, Status, check, cleanup, count};
 use crate::style::Color;
 use crate::sys;
-use std::{any::Any, ffi::c_void, io, panic, rc::Rc};
+use std::{any::Any, cell::Cell, ffi::c_void, io, panic, rc::Rc};
 
 /// Output queue limits for a [`Session`].
 ///
@@ -36,9 +36,12 @@ impl Default for SessionOptions {
 /// Whether the renderer may trust the local terminal environment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Remote {
-    /// Detect remote sessions, such as SSH, and take only the color depth from forwarded hints for them: a `TERM`
-    /// containing `256color`, a `COLORTERM` of `truecolor` or `24bit` (ignored inside GNU screen, which gets 256
-    /// colors), and `OPENTUI_FORCE_TRUECOLOR` of `1` or `true`, which forces 24-bit color.
+    /// Detect remote sessions, such as SSH, and take only these forwarded hints for them: a `TERM` containing
+    /// `256color`, a `COLORTERM` of `truecolor` or `24bit` (ignored inside GNU screen, which gets 256 colors),
+    /// `OPENTUI_FORCE_TRUECOLOR` of `1` or `true`, which forces 24-bit color, and the `OPENTUI_FORCE_WCWIDTH`,
+    /// `OPENTUI_FORCE_UNICODE` and `OPENTUI_FORCE_NOZWJ` width overrides. GNU screen, which answers no query, is
+    /// detected from `STY` or a `TERM` starting with `screen` without `TMUX`. A nonempty `TMUX` or a `TERM` starting
+    /// with `tmux` only leaves out the startup graphics query; tmux itself is detected from its XTVERSION reply.
     #[default]
     Auto,
     Local,
@@ -72,18 +75,18 @@ pub struct KittyKeyboard(u32);
 
 impl KittyKeyboard {
     pub const OFF: Self = Self(0);
-    pub const DISAMBIGUATE: Self = Self(1);
-    pub const EVENT_TYPES: Self = Self(2);
-    pub const ALTERNATE_KEYS: Self = Self(4);
-    pub const ALL_KEYS_AS_ESCAPES: Self = Self(8);
-    pub const ASSOCIATED_TEXT: Self = Self(16);
+    pub const DISAMBIGUATE: Self = Self(sys::OT_KITTY_KEYBOARD_DISAMBIGUATE);
+    pub const EVENT_TYPES: Self = Self(sys::OT_KITTY_KEYBOARD_EVENT_TYPES);
+    pub const ALTERNATE_KEYS: Self = Self(sys::OT_KITTY_KEYBOARD_ALTERNATE_KEYS);
+    pub const ALL_KEYS_AS_ESCAPES: Self = Self(sys::OT_KITTY_KEYBOARD_ALL_KEYS_AS_ESCAPES);
+    pub const ASSOCIATED_TEXT: Self = Self(sys::OT_KITTY_KEYBOARD_REPORT_TEXT);
 
     pub const fn bits(self) -> u32 {
         self.0
     }
 
     pub const fn from_bits(bits: u32) -> Self {
-        Self(bits & 31)
+        Self(bits & sys::OT_KITTY_KEYBOARD_ALL)
     }
 
     pub const fn union(self, other: Self) -> Self {
@@ -212,10 +215,10 @@ pub enum CursorStyle {
 impl CursorStyle {
     pub(crate) fn raw(self) -> u8 {
         match self {
-            Self::Block => 0,
-            Self::Line => 1,
-            Self::Underline => 2,
-            Self::Default => 3,
+            Self::Block => sys::OT_CURSOR_STYLE_BLOCK as u8,
+            Self::Line => sys::OT_CURSOR_STYLE_LINE as u8,
+            Self::Underline => sys::OT_CURSOR_STYLE_UNDERLINE as u8,
+            Self::Default => sys::OT_CURSOR_STYLE_DEFAULT as u8,
         }
     }
 }
@@ -559,6 +562,8 @@ pub struct Session(Rc<SessionInner>);
 struct SessionInner {
     context: Context,
     handle: sys::ot_handle,
+    /// The last [`Session::set_image_resolution`]: columns, rows, pixel width, pixel height.
+    resolution: Cell<[u32; 4]>,
 }
 
 impl Drop for SessionInner {
@@ -611,7 +616,7 @@ impl Session {
         };
         let mut handle = sys::ot_handle::default();
         check("ot_session_create", unsafe { sys::ot_session_create(context.as_raw(), &raw, &mut handle) })?;
-        Ok(Self(Rc::new(SessionInner { context: context.clone(), handle })))
+        Ok(Self(Rc::new(SessionInner { context: context.clone(), handle, resolution: Cell::default() })))
     }
 
     pub fn context(&self) -> &Context {
@@ -870,9 +875,12 @@ impl Session {
     /// Sends a desktop notification. Returns `false` when the terminal lacks support or output was rejected.
     pub fn notify(&self, message: &str, title: Option<&str>) -> Result<bool> {
         let mut written = 0;
-        let title = title.unwrap_or("");
-        let (message_length, title_length) =
-            (count("ot_session_notification", message.len())?, count("ot_session_notification", title.len())?);
+        // A null title means none; OSC 777 lays out an empty title differently.
+        let title_ptr = title.map_or(std::ptr::null(), str::as_ptr);
+        let (message_length, title_length) = (
+            count("ot_session_notification", message.len())?,
+            count("ot_session_notification", title.map_or(0, str::len))?,
+        );
         let (context, session) = self.raw();
         check("ot_session_notification", unsafe {
             sys::ot_session_notification(
@@ -880,7 +888,7 @@ impl Session {
                 session,
                 message.as_ptr(),
                 message_length,
-                title.as_ptr(),
+                title_ptr,
                 title_length,
                 &mut written,
             )
@@ -1019,7 +1027,16 @@ impl Session {
         let (context, session) = self.raw();
         check("ot_session_set_image_resolution", unsafe {
             sys::ot_session_set_image_resolution(context, session, columns, rows, pixel_width, pixel_height)
-        })
+        })?;
+        self.0.resolution.set([columns, rows, pixel_width, pixel_height]);
+        Ok(())
+    }
+
+    /// How many times taller than wide a cell is, from the size [`Self::set_image_resolution`] set, as native image
+    /// fitting and Core's `ImageRenderable.cellAspectRatio` compute it: 2 without a size.
+    pub fn cell_aspect(&self) -> f64 {
+        let [columns, rows, width, height] = self.0.resolution.get().map(f64::from);
+        if columns * rows * width * height == 0.0 { 2.0 } else { (height / rows) / (width / columns) }
     }
 
     pub fn renderer_state(&self) -> Result<RendererState> {
@@ -1092,7 +1109,8 @@ impl Session {
     }
 
     /// Tells native code the terminal's palette and default colors, so it can choose palette colors for RGB ones on
-    /// terminals without true color. `epoch` marks a new palette. Requires an active terminal.
+    /// terminals without true color. `epoch` marks a new palette. Requires an active terminal. A default color the
+    /// terminal did not report falls back to white on black, as in Core.
     pub fn set_palette_state(
         &self,
         palette: &[Color],
@@ -1102,7 +1120,8 @@ impl Session {
     ) -> Result<()> {
         let lanes = |color: Color| [u16::from(color.r), u16::from(color.g), u16::from(color.b), u16::from(color.a)];
         let palette: Vec<u16> = palette.iter().take(256).flat_map(|&color| lanes(color)).collect();
-        let (foreground, background) = (foreground.map(lanes), background.map(lanes));
+        let foreground = lanes(foreground.unwrap_or(Color::DEFAULT_FOREGROUND));
+        let background = lanes(background.unwrap_or(Color::DEFAULT_BACKGROUND));
         let (context, session) = self.raw();
         check("ot_session_set_palette_state", unsafe {
             sys::ot_session_set_palette_state(
@@ -1110,8 +1129,8 @@ impl Session {
                 session,
                 palette.as_ptr(),
                 (palette.len() / 4) as u32,
-                foreground.as_ref().map_or(std::ptr::null(), |lanes| lanes.as_ptr()),
-                background.as_ref().map_or(std::ptr::null(), |lanes| lanes.as_ptr()),
+                foreground.as_ptr(),
+                background.as_ptr(),
                 epoch,
             )
         })

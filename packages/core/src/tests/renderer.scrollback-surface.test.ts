@@ -13,6 +13,7 @@ import { SyntaxStyle } from "../syntax-style.js"
 import { createTestRenderer, MockTreeSitterClient, setRendererCapabilities, type TestRenderer } from "../testing.js"
 import type { RenderContext } from "../types.js"
 import { getLinkId } from "../utils.js"
+import blockRows from "./markdown-block-rows.conformance.json" with { type: "json" }
 
 type ClaimedCommit = {
   snapshot: Pick<OptimizedBuffer, "width" | "height" | "widthMethod" | "withBuffers" | "getRealCharBytes" | "destroy">
@@ -82,10 +83,6 @@ function destroyClaimedCommits(commits: ClaimedCommit[]): void {
   for (const commit of commits) {
     commit.snapshot.destroy()
   }
-}
-
-function numericMarginBottom(renderable: Renderable): number {
-  return typeof renderable.marginBottom === "number" ? renderable.marginBottom : 0
 }
 
 function createMockTreeSitterClient(
@@ -273,7 +270,6 @@ test("ScrollbackSurface works with MarkdownRenderable top-level blocks", async (
     content: "# Title\n\nPara 1\n\n",
     syntaxStyle,
     streaming: true,
-    internalBlockMode: "top-level",
     treeSitterClient: mockTreeSitterClient,
   })
 
@@ -283,15 +279,12 @@ test("ScrollbackSurface works with MarkdownRenderable top-level blocks", async (
   md.content = "# Title\n\nPara 1\n\nPara 2"
   await surface.settle()
 
-  expect(md._stableBlockCount).toBe(1)
+  // The heading and "Para 1" are final; the streamed "Para 2" is not.
+  expect(md.committedBlockCount).toBe(2)
 
-  const stableBlock = md._blockStates[0]!
-  const nextBlock = md._blockStates[1]
-  const stableEnd = nextBlock
-    ? nextBlock.renderable.y
-    : stableBlock.renderable.y + stableBlock.renderable.height + numericMarginBottom(stableBlock.renderable)
+  const [stableBlock, nextBlock] = md.getChildren()
 
-  surface.commitRows(stableBlock.renderable.y, stableEnd, { trailingNewline: false })
+  surface.commitRows(stableBlock!.y, nextBlock!.y, { trailingNewline: false })
 
   const commits = claimCommits(renderer)
 
@@ -305,6 +298,29 @@ test("ScrollbackSurface works with MarkdownRenderable top-level blocks", async (
     destroyClaimedCommits(commits)
   }
 })
+
+test.each(blockRows.rows as [string, string[], number, number, number[][]][])(
+  "Markdown blocks' rows in a ScrollbackSurface: %s",
+  async (_, chunks, width, committed, rows) => {
+    const { renderer } = await createSplitFooterRenderer({ width, height: 24, footerHeight: 3 })
+    const surface = renderer.createScrollbackSurface({ startOnNewLine: true })
+    const mockTreeSitterClient = createMockTreeSitterClient({ autoResolveTimeout: 0 })
+    mockTreeSitterClient.setMockResult({ highlights: [] })
+    const md = new MarkdownRenderable(surface.renderContext, {
+      content: "",
+      syntaxStyle,
+      width: "100%",
+      streaming: true,
+      treeSitterClient: mockTreeSitterClient,
+    })
+    surface.root.add(md)
+    for (const chunk of chunks) md.content += chunk
+    await surface.settle()
+
+    expect(md.committedBlockCount).toBe(committed)
+    expect(md.getChildren().map((block) => [block.y, block.y + block.height])).toEqual(rows)
+  },
+)
 
 test("ScrollbackSurface forwards hyperlink capability changes to existing Markdown tables", async () => {
   const { renderer } = await createSplitFooterRenderer()
@@ -324,7 +340,7 @@ test("ScrollbackSurface forwards hyperlink capability changes to existing Markdo
 
   surface.root.add(markdown)
   await surface.settle()
-  const table = markdown._blockStates[0]!.renderable
+  const table = markdown.getChildren()[0]
   surface.commitRows(0, surface.height)
 
   for (const hyperlinks of [true, false]) {
@@ -332,7 +348,7 @@ test("ScrollbackSurface forwards hyperlink capability changes to existing Markdo
     renderer.emit("capabilities", capabilities)
     expect(surface.renderContext.capabilities).toBe(capabilities)
     await surface.settle()
-    expect(markdown._blockStates[0]!.renderable).toBe(table)
+    expect(markdown.getChildren()[0]).toBe(table)
     surface.commitRows(0, surface.height)
   }
 
@@ -364,7 +380,7 @@ test("ScrollbackSurface forwards hyperlink capability changes to existing Markdo
   expect(renderer.listenerCount("capabilities")).toBe(capabilityListenerCount)
 })
 
-test("ScrollbackSurface commitRows respects top-level block margins from custom renderNode blocks", async () => {
+test("ScrollbackSurface commitRows respects top-level block spacing from custom renderBlock blocks", async () => {
   const { renderer } = await createSplitFooterRenderer()
   const surface = renderer.createScrollbackSurface({ startOnNewLine: true })
   const mockTreeSitterClient = createMockTreeSitterClient({ autoResolveTimeout: 0 })
@@ -375,10 +391,9 @@ test("ScrollbackSurface commitRows respects top-level block margins from custom 
     content: "# Title\n\nPara 1\n\n",
     syntaxStyle,
     streaming: true,
-    internalBlockMode: "top-level",
     treeSitterClient: mockTreeSitterClient,
-    renderNode: (node, ctx) => {
-      if (node.type === "heading") {
+    renderBlock: (block, ctx) => {
+      if (block.kind === "heading") {
         return new TextRenderable(surface.renderContext, {
           id: "surface-markdown-custom-heading",
           content: "CUSTOM",
@@ -396,17 +411,12 @@ test("ScrollbackSurface commitRows respects top-level block margins from custom 
   md.content = "# Title\n\nPara 1\n\nPara 2"
   await surface.settle()
 
-  expect(md._stableBlockCount).toBe(1)
+  // The heading and "Para 1" are final; the streamed "Para 2" is not.
+  expect(md.committedBlockCount).toBe(2)
 
-  const stableBlock = md._blockStates[0]!
-  const nextBlock = md._blockStates[1]
-  const stableEnd = nextBlock
-    ? nextBlock.renderable.y
-    : stableBlock.renderable.y + stableBlock.renderable.height + numericMarginBottom(stableBlock.renderable)
+  const [stableBlock, nextBlock] = md.getChildren()
 
-  expect(nextBlock!.renderable.y).toBe(stableEnd)
-
-  surface.commitRows(stableBlock.renderable.y, stableEnd, { trailingNewline: false })
+  surface.commitRows(stableBlock!.y, nextBlock!.y, { trailingNewline: false })
 
   const commits = claimCommits(renderer)
 
@@ -560,21 +570,21 @@ test("ScrollbackSurface preserves inline first-line offset when the first markdo
     content: "abcdef",
     syntaxStyle,
     streaming: true,
-    internalBlockMode: "top-level",
     treeSitterClient: mockTreeSitterClient,
   })
 
   surface.root.add(md)
   await surface.settle()
 
-  const initialRenderable = md._blockStates[0]!.renderable
+  const initialRenderable = md.getChildren()[0]!
   expect(initialRenderable.height).toBe(2)
 
   md.content = "# abcdef"
   await surface.settle()
 
-  const replacementRenderable = md._blockStates[0]!.renderable
-  expect(replacementRenderable).not.toBe(initialRenderable)
+  // The paragraph that becomes a heading keeps its text renderable, and the offset.
+  const replacementRenderable = md.getChildren()[0]!
+  expect(replacementRenderable).toBe(initialRenderable)
   expect(replacementRenderable.height).toBe(2)
 })
 

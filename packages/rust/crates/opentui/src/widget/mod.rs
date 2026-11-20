@@ -49,9 +49,15 @@ pub use frame_buffer::FrameBuffer;
 pub use image::ImageView;
 pub use input::Input;
 pub use line_numbers::{LineColor, LineNumbers, LineSign};
-pub use markdown::{CodeBlock, Markdown, MarkdownColors, MarkdownTableOptions, MarkdownTableStyle};
+pub use markdown::{
+    CodeBlock, InlineContext, InlineSpan, Markdown, MarkdownColors, MarkdownExtension, MarkdownTableOptions,
+    MarkdownTableStyle,
+};
 pub use painter::Painter;
-pub use scroll::{LinearScroll, MacOsScroll, ScrollAcceleration, ScrollAction, ScrollBox, ScrollEdge};
+pub(crate) use scroll::ScrollInner;
+pub use scroll::{
+    LinearScroll, MacOsScroll, ScrollAcceleration, ScrollAction, ScrollBox, ScrollCause, ScrollEdge, ScrollEvent,
+};
 pub use select::{Select, SelectAction, SelectOption};
 pub use slider::{Slider, SliderAction};
 pub use table::{Column, ColumnWidth, Table, TableAction};
@@ -69,12 +75,12 @@ pub use crate::native::{
     TerminalCursor, VideoInfo, VideoState, WrapMode,
 };
 
-use crate::app::{App, AppInner, Cx, HandlerId};
+use crate::app::{AnimationTick, App, AppInner, Cx, HandlerId, Tick};
 use crate::error::Result;
 use crate::input::{KeyEvent, MouseEvent};
 use crate::layout::{
-    Align, Display, Edge, FlexDirection, Gutter, Justify, LayoutMode, LayoutProperty, Length, Overflow, PositionType,
-    Rect, Wrap,
+    Align, BoxSizing, Display, Edge, FlexDirection, Gutter, Justify, LayoutMode, LayoutProperty, Length, Overflow,
+    PositionType, Rect, Wrap,
 };
 use crate::native::{BoxDetails, Hooks, Node, NodeKind, Observation, Paint, SelectionUnit, TextOptions};
 use crate::post::{Filter, FilterCell, FilterId};
@@ -131,8 +137,9 @@ impl<A: ?Sized> Callbacks<A> {
         }
     }
 
+    /// Drops every handler after the borrow, so what a handler owns may add or remove handlers as it drops.
     pub fn clear(&self) {
-        self.0.borrow_mut().clear();
+        self.0.take();
     }
 }
 
@@ -245,6 +252,20 @@ impl SelectionUpdate {
         let (x, y) = (rect.screen_x.trunc() as i32, rect.screen_y.trunc() as i32);
         ((self.anchor.0 - x, self.anchor.1 - y), (self.focus.0 - x, self.focus.1 - y))
     }
+
+    pub fn local_selection(&self, element: &Element) -> LocalSelection {
+        let (anchor, focus) = self.local(element);
+        LocalSelection { anchor, focus, unit: self.unit }
+    }
+}
+
+/// The app's selection relative to a widget's top-left cell. Text widgets keep the last one and apply it again when
+/// their content changes, as Core's do.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalSelection {
+    pub anchor: (i32, i32),
+    pub focus: (i32, i32),
+    pub unit: SelectionUnit,
 }
 
 /// Owned box titles, so the element can resend all box details after one changes.
@@ -290,6 +311,7 @@ impl Drop for Element {
     fn drop(&mut self) {
         if let Some(app) = self.app.upgrade() {
             app.unregister(self.num);
+            App::from_inner(app).end_widget_ticks(self.num);
         }
     }
 }
@@ -430,6 +452,12 @@ impl Element {
     pub(crate) fn add_hooks(&self, hooks: Hooks) {
         self.hooks.set(self.hooks.get().union(hooks));
         self.sync_hooks();
+    }
+
+    /// Registers the hook that tells which frames draw the widget: a paint slot, whose clip shows whether any of it is
+    /// in view. The root has no paint slot and nothing clips it; its update tells.
+    pub(crate) fn report_draws(&self) {
+        self.add_hooks(if self.root { Hooks::UPDATE } else { Hooks::RENDER_BEFORE });
     }
 
     /// The hooks the widget registers itself. Its own drawing records in the latest of their paint phases.
@@ -702,6 +730,24 @@ impl Widget for AnyWidget {
     }
 }
 
+/// A widget handle that does not keep the widget alive, from [`Widget::downgrade`]. State that a widget owns can hold
+/// one without a reference cycle.
+#[derive(Clone)]
+pub struct WeakWidget(Weak<dyn Behavior>);
+
+impl WeakWidget {
+    /// The widget, while another handle keeps it alive.
+    pub fn upgrade(&self) -> Option<AnyWidget> {
+        self.0.upgrade().map(AnyWidget)
+    }
+}
+
+impl std::fmt::Debug for WeakWidget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("WeakWidget").field(&self.upgrade().map(|widget| widget.id())).finish()
+    }
+}
+
 /// Layout, focus, and event methods shared by every widget.
 ///
 /// Methods that set a property take `&self` and return a clone of the handle, so they chain while building and work
@@ -731,6 +777,22 @@ pub trait Widget: Clone + 'static {
 
     fn as_any(&self) -> AnyWidget {
         AnyWidget(self.element().behavior().expect("a live widget has a behavior"))
+    }
+
+    /// A handle to this widget that does not keep it alive.
+    fn downgrade(&self) -> WeakWidget {
+        WeakWidget(self.element().this.clone())
+    }
+
+    /// [`App::on_animation_tick`] while this widget is drawn, as Core's `animationFps`: a hidden, detached, culled, or
+    /// fully clipped widget, such as a row scrolled out of view, wakes the app at most twice more, then not until a
+    /// frame draws it again, which resumes the ticks. The animation also ends when the widget drops.
+    /// [`AnimationTick::follow`] adds more widgets.
+    fn on_animation_tick(&self, fps: f64, callback: impl FnMut(&mut Cx<'_>, Tick) + 'static) -> AnimationTick {
+        let Some(app) = self.element().app() else { return AnimationTick::ended() };
+        let tick = app.on_animation_tick(fps, callback);
+        tick.follow(self);
+        tick
     }
 
     // Layout.
@@ -766,6 +828,19 @@ pub trait Widget: Clone + 'static {
 
     fn max_height(&self, height: impl Into<Length>) -> Self {
         self.element().set_layout(LayoutProperty::MaxHeight(height.into()));
+        self.clone()
+    }
+
+    /// Derives one dimension from the other: width in columns divided by height in rows. `f32::NAN` removes it.
+    fn aspect_ratio(&self, ratio: f32) -> Self {
+        self.element().set_layout(LayoutProperty::AspectRatio(ratio));
+        self.clone()
+    }
+
+    /// [`BoxSizing::ContentBox`] adds padding and border to the size and its limits; [`BoxSizing::BorderBox`], the
+    /// default, includes them.
+    fn box_sizing(&self, sizing: BoxSizing) -> Self {
+        self.element().set_layout(LayoutProperty::BoxSizing(sizing));
         self.clone()
     }
 
@@ -926,7 +1001,7 @@ pub trait Widget: Clone + 'static {
 
     // Paint.
 
-    /// Paint order among siblings.
+    /// Paint order among siblings. On a tie, the later child paints above and receives clicks at the overlap.
     fn z_index(&self, z_index: i32) -> Self {
         self.element().update_paint(|paint| paint.z_index = z_index);
         self.clone()
@@ -1099,6 +1174,14 @@ pub trait Widget: Clone + 'static {
     }
 
     /// Called during a frame when layout changes the widget's size.
+    ///
+    /// Each layout round calls these handlers depth first in paint order: a widget's come after those of its earlier
+    /// siblings and all their descendants. Siblings go by [`Self::z_index`], then child order. So a handler on the
+    /// root's last child, with no sibling above its z-index, reads this round's [`rect`](Self::rect) of every
+    /// other widget. Exceptions: a widget added or moved since its last layout is resized when the walk reaches its
+    /// parent, before its siblings; adding a child again counts as a move even where it already is, so keep such a
+    /// last child in place and insert new siblings before it. A [`ScrollBox`]'s rows all come before their children,
+    /// and the children of rows it culls are skipped. A widget added during the walk waits for the next round.
     fn on_resize(&self, handler: impl FnMut(&mut Cx<'_>, &Rect) + 'static) -> Self {
         self.element().handlers.resize.add(handler);
         self.element().add_hooks(Hooks::RESIZE);

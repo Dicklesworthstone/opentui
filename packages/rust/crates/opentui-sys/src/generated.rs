@@ -5,7 +5,7 @@ use core::ffi::c_void;
 
 /// FNV-1a 64-bit hash of the `opentui.h` these declarations were generated from.
 /// The build script rejects native artifacts whose header has a different hash.
-pub const OPENTUI_HEADER_FNV1A64: u64 = 0x6c8ca2888fec70e0;
+pub const OPENTUI_HEADER_FNV1A64: u64 = 0x99dd2d0018a6caa3;
 
 pub type ot_status = i32;
 
@@ -165,6 +165,22 @@ pub const OT_BOX_SIZING_BORDER_BOX: u32 = 0;
 pub const OT_BOX_SIZING_CONTENT_BOX: u32 = 1;
 pub const OT_LAYOUT_MODE_FLEX: u32 = 0;
 pub const OT_LAYOUT_MODE_LIST: u32 = 1;
+pub const OT_DISPLAY_CONTENTS: u32 = 2;
+pub const OT_YOGA_ERRATA_NONE: u32 = 0;
+pub const OT_YOGA_ERRATA_STRETCH_FLEX_BASIS: u32 = 1;
+pub const OT_YOGA_ERRATA_ABSOLUTE_POSITION_WITHOUT_INSETS_EXCLUDES_PADDING: u32 = 2;
+pub const OT_YOGA_ERRATA_ABSOLUTE_PERCENT_AGAINST_INNER_SIZE: u32 = 4;
+pub const OT_YOGA_ERRATA_ALL: u32 = 2147483647;
+pub const OT_YOGA_ERRATA_CLASSIC: u32 = 2147483646;
+pub const OT_YOGA_EXPERIMENTAL_FEATURE_WEB_FLEX_BASIS: u32 = 0;
+pub const OT_YOGA_LOG_LEVEL_ERROR: u32 = 0;
+pub const OT_YOGA_LOG_LEVEL_WARN: u32 = 1;
+pub const OT_YOGA_LOG_LEVEL_INFO: u32 = 2;
+pub const OT_YOGA_LOG_LEVEL_DEBUG: u32 = 3;
+pub const OT_YOGA_LOG_LEVEL_VERBOSE: u32 = 4;
+pub const OT_YOGA_LOG_LEVEL_FATAL: u32 = 5;
+pub const OT_YOGA_NODE_TYPE_DEFAULT: u32 = 0;
+pub const OT_YOGA_NODE_TYPE_TEXT: u32 = 1;
 pub const OT_STYLE_ENUM_DIRECTION_MAX: u32 = 2;
 pub const OT_STYLE_ENUM_FLEX_DIRECTION_MAX: u32 = 3;
 pub const OT_STYLE_ENUM_JUSTIFY_CONTENT_MAX: u32 = 5;
@@ -183,6 +199,7 @@ pub const OT_MEASURE_AT_MOST: u32 = 2;
 pub const OT_LAYOUT_PUBLIC: u32 = 0;
 pub const OT_LAYOUT_YOGA: u32 = 1;
 pub const OT_LAYOUT_PAINT: u32 = 2;
+pub const OT_LAYOUT_CONTENT: u32 = 3;
 pub const OT_BORDER_NONE: u32 = 0;
 pub const OT_BORDER_LEFT: u32 = 1;
 pub const OT_BORDER_BOTTOM: u32 = 2;
@@ -198,9 +215,41 @@ pub const OT_COLOR_INDEXED: u32 = 1;
 pub const OT_COLOR_DEFAULT: u32 = 2;
 pub const OT_COLOR_CHANNEL_MASK: u32 = 255;
 pub const OT_COLOR_META_SHIFT: u32 = 8;
+pub const OT_COLOR_ANSI_0: u32 = 0;
+pub const OT_COLOR_ANSI_1: u32 = 8388608;
+pub const OT_COLOR_ANSI_2: u32 = 32768;
+pub const OT_COLOR_ANSI_3: u32 = 8421376;
+pub const OT_COLOR_ANSI_4: u32 = 128;
+pub const OT_COLOR_ANSI_5: u32 = 8388736;
+pub const OT_COLOR_ANSI_6: u32 = 32896;
+pub const OT_COLOR_ANSI_7: u32 = 12632256;
+pub const OT_COLOR_ANSI_8: u32 = 8421504;
+pub const OT_COLOR_ANSI_9: u32 = 16711680;
+pub const OT_COLOR_ANSI_10: u32 = 65280;
+pub const OT_COLOR_ANSI_11: u32 = 16776960;
+pub const OT_COLOR_ANSI_12: u32 = 255;
+pub const OT_COLOR_ANSI_13: u32 = 16711935;
+pub const OT_COLOR_ANSI_14: u32 = 65535;
+pub const OT_COLOR_ANSI_15: u32 = 16777215;
+pub const OT_COLOR_CUBE_BASE: u32 = 55;
+pub const OT_COLOR_CUBE_STEP: u32 = 40;
+pub const OT_COLOR_GRAY_BASE: u32 = 8;
+pub const OT_COLOR_GRAY_STEP: u32 = 10;
+pub const OT_ATTR_BOLD: u32 = 1;
+pub const OT_ATTR_DIM: u32 = 2;
+pub const OT_ATTR_ITALIC: u32 = 4;
+pub const OT_ATTR_UNDERLINE: u32 = 8;
+pub const OT_ATTR_BLINK: u32 = 16;
+pub const OT_ATTR_INVERSE: u32 = 32;
+pub const OT_ATTR_HIDDEN: u32 = 64;
+pub const OT_ATTR_STRIKETHROUGH: u32 = 128;
+pub const OT_ATTR_BASE_MASK: u32 = 255;
+pub const OT_ATTR_LINK_SHIFT: u32 = 8;
+pub const OT_ATTR_LINK_MASK: u32 = 16777215;
 pub const OT_SCENE_TEXT_SELECTION_RESET: u32 = 0;
 pub const OT_SCENE_TEXT_SELECTION_SET: u32 = 1;
 pub const OT_SCENE_TEXT_SELECTION_UPDATE: u32 = 2;
+pub const OT_SCENE_TEXT_SELECTION_COLORS: u32 = 3;
 pub const OT_SCENE_TEXT_SELECTION_CELL: u32 = 0;
 pub const OT_SCENE_TEXT_SELECTION_WORD: u32 = 1;
 pub const OT_SCENE_TEXT_SELECTION_LINE: u32 = 2;
@@ -217,6 +266,10 @@ pub const OT_SCENE_FULL_PATH_TAINTED: u32 = 8;
 pub const OT_SCENE_FULL_PATH_UNRETAINED: u32 = 16;
 pub const OT_SCENE_FULL_PATH_OPTIONS: u32 = 32;
 pub const OT_SCENE_FULL_PATH_NON_LOCAL: u32 = 64;
+pub const OT_CURSOR_STYLE_BLOCK: u32 = 0;
+pub const OT_CURSOR_STYLE_LINE: u32 = 1;
+pub const OT_CURSOR_STYLE_UNDERLINE: u32 = 2;
+pub const OT_CURSOR_STYLE_DEFAULT: u32 = 3;
 pub const OT_SCENE_HOOK_UPDATE: u32 = 1;
 pub const OT_SCENE_HOOK_RESIZE: u32 = 2;
 pub const OT_SCENE_HOOK_LAYOUT_CHANGED: u32 = 4;
@@ -272,6 +325,7 @@ pub const OT_SCENE_SCROLL_REQUEST_LAYOUT: u32 = 2;
 pub const OT_SCENE_SCROLL_ALIGN_NEAREST: u32 = 0;
 pub const OT_SCENE_SCROLL_ALIGN_START: u32 = 1;
 pub const OT_SCENE_SCROLL_ALIGN_END: u32 = 2;
+pub const OT_SCENE_SCROLL_PADDING_MAX: u32 = 65535;
 pub const OT_SCENE_SCROLL_CHANGED_OFFSET_X: u32 = 1;
 pub const OT_SCENE_SCROLL_CHANGED_OFFSET_Y: u32 = 2;
 pub const OT_SCENE_SCROLL_CHANGED_CONTENT: u32 = 4;
@@ -293,6 +347,7 @@ pub const OT_RENDER_PRESENTED: u32 = 0;
 pub const OT_RENDER_PENDING: u32 = 1;
 pub const OT_RENDER_SKIPPED: u32 = 2;
 pub const OT_RENDER_FAILED: u32 = 3;
+pub const OT_SPLIT_SNAPSHOTS_MAX: u32 = 64;
 pub const OT_SESSION_BUFFER_CURRENT: u32 = 0;
 pub const OT_SESSION_BUFFER_NEXT: u32 = 1;
 pub const OT_WIDTH_METHOD_WCWIDTH: u32 = 0;
@@ -300,10 +355,38 @@ pub const OT_WIDTH_METHOD_UNICODE: u32 = 1;
 pub const OT_WIDTH_METHOD_NO_ZWJ: u32 = 2;
 pub const OT_WIDTH_METHOD_UNICODE_WIDE: u32 = 3;
 pub const OT_BUFFER_RESPECT_ALPHA: u32 = 1;
+pub const OT_EMBEDDED_TERMINAL_CURSOR_BAR: u32 = 0;
+pub const OT_EMBEDDED_TERMINAL_CURSOR_BLOCK: u32 = 1;
+pub const OT_EMBEDDED_TERMINAL_CURSOR_UNDERLINE: u32 = 2;
+pub const OT_EMBEDDED_TERMINAL_CURSOR_BLOCK_HOLLOW: u32 = 3;
+pub const OT_EMBEDDED_TERMINAL_MOD_SHIFT: u32 = 1;
+pub const OT_EMBEDDED_TERMINAL_MOD_CTRL: u32 = 2;
+pub const OT_EMBEDDED_TERMINAL_MOD_ALT: u32 = 4;
+pub const OT_EMBEDDED_TERMINAL_MOD_SUPER: u32 = 8;
+pub const OT_EMBEDDED_TERMINAL_MOD_CAPS_LOCK: u32 = 16;
+pub const OT_EMBEDDED_TERMINAL_MOD_NUM_LOCK: u32 = 32;
+pub const OT_EMBEDDED_TERMINAL_KEY_RELEASE: u32 = 0;
+pub const OT_EMBEDDED_TERMINAL_KEY_PRESS: u32 = 1;
+pub const OT_EMBEDDED_TERMINAL_KEY_REPEAT: u32 = 2;
+pub const OT_EMBEDDED_TERMINAL_MOUSE_PRESS: u32 = 0;
+pub const OT_EMBEDDED_TERMINAL_MOUSE_RELEASE: u32 = 1;
+pub const OT_EMBEDDED_TERMINAL_MOUSE_MOTION: u32 = 2;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_NONE: i32 = -1;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_UNKNOWN: i32 = 0;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_LEFT: i32 = 1;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_RIGHT: i32 = 2;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_MIDDLE: i32 = 3;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_FOUR: i32 = 4;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_FIVE: i32 = 5;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_SIX: i32 = 6;
+pub const OT_EMBEDDED_TERMINAL_BUTTON_SEVEN: i32 = 7;
+pub const OT_EMBEDDED_TERMINAL_INPUT_BYTES_MAX: u32 = 1048576;
 pub const OT_EMBEDDED_TERMINAL_INVALIDATE: u32 = 0;
 pub const OT_EMBEDDED_TERMINAL_SCROLL: u32 = 1;
 pub const OT_EMBEDDED_TERMINAL_CLEAR_SELECTION: u32 = 2;
 pub const OT_EMBEDDED_TERMINAL_SET_TRANSPARENT_BACKGROUND: u32 = 3;
+pub const OT_EMBEDDED_TERMINAL_RESPONSE_BYTES_MAX: u32 = 1048576;
+pub const OT_EDIT_BUFFER_FOLLOW_SESSION_WIDTH: u32 = 1;
 pub const OT_EDIT_CURSOR_CHANGED: u32 = 1;
 pub const OT_EDIT_CONTENT_CHANGED: u32 = 2;
 pub const OT_EDIT_HISTORY_CURSOR_CHANGED: u32 = 4;
@@ -358,6 +441,9 @@ pub const OT_EDIT_CURSOR_OFFSET: u32 = 9;
 pub const OT_EDIT_CLEAR: u32 = 10;
 pub const OT_EDIT_CLEAR_HISTORY: u32 = 11;
 pub const OT_EDIT_DEBUG_ROPE: u32 = 12;
+pub const OT_EDIT_CURSOR_OFFSET_ATOMIC: u32 = 13;
+pub const OT_EDIT_KEEP_OUTSIDE: u32 = 14;
+pub const OT_EDIT_ATOMIC: u32 = 1;
 pub const OT_EDIT_POSITION_CURSOR: u32 = 0;
 pub const OT_EDIT_POSITION_NEXT_WORD: u32 = 1;
 pub const OT_EDIT_POSITION_PREV_WORD: u32 = 2;
@@ -367,15 +453,60 @@ pub const OT_EDIT_POSITION_COORDS: u32 = 5;
 pub const OT_EDIT_POSITION_LINE_START: u32 = 6;
 pub const OT_EDIT_POSITION_END: u32 = 7;
 pub const OT_EDIT_POSITION_PREV_CHAR: u32 = 8;
+pub const OT_EDIT_BYTE_TO_CELL: u32 = 0;
+pub const OT_EDIT_CELL_TO_BYTE: u32 = 1;
+pub const OT_EDIT_UTF16_TO_CELL: u32 = 2;
+pub const OT_EDIT_CELL_TO_UTF16: u32 = 3;
 pub const OT_EDITOR_STYLE_FOREGROUND: u32 = 1;
 pub const OT_EDITOR_STYLE_BACKGROUND: u32 = 2;
 pub const OT_EDITOR_STYLE_ATTRIBUTES: u32 = 4;
+pub const OT_EDITOR_STYLE_ATTRIBUTE_MASK: u32 = 8;
 pub const OT_EDIT_HIGHLIGHT_ADD_LINE: u32 = 0;
 pub const OT_EDIT_HIGHLIGHT_ADD_RANGE: u32 = 1;
 pub const OT_EDIT_HIGHLIGHT_REMOVE_REF: u32 = 2;
 pub const OT_EDIT_HIGHLIGHT_CLEAR_LINE: u32 = 3;
 pub const OT_EDIT_HIGHLIGHT_CLEAR_ALL: u32 = 4;
 pub const OT_STYLE_RUN_FLAG: u32 = 2147483648;
+pub const OT_GROUP_SET_NAME_COUNT_MAX: u32 = 16;
+pub const OT_GROUP_SET_NAME_BYTE_COUNT_MAX: u32 = 64;
+pub const OT_EDIT_MARK_ADD: u32 = 0;
+pub const OT_EDIT_MARK_REMOVE: u32 = 1;
+pub const OT_EDIT_MARK_CLEAR: u32 = 2;
+pub const OT_EDIT_MARK_ATOMIC: u32 = 1;
+pub const OT_EDIT_MARK_STYLE_VALUE: u32 = 2;
+pub const OT_EDIT_MARK_ANY_KIND: u32 = 4294967295;
+pub const OT_MD_CONCEAL: u32 = 1;
+pub const OT_MD_HYPERLINKS: u32 = 2;
+pub const OT_MD_MATH: u32 = 4;
+pub const OT_MD_HOOK: u32 = 8;
+pub const OT_MD_HOOK_FILTER_BYTE_COUNT_MAX: u32 = 256;
+pub const OT_MD_PARAGRAPH: u32 = 0;
+pub const OT_MD_HEADING: u32 = 1;
+pub const OT_MD_CODE: u32 = 2;
+pub const OT_MD_HTML: u32 = 3;
+pub const OT_MD_RULE: u32 = 4;
+pub const OT_MD_TABLE: u32 = 5;
+pub const OT_MD_TABLE_ROW: u32 = 6;
+pub const OT_MD_TABLE_CELL: u32 = 7;
+pub const OT_MD_QUOTE: u32 = 8;
+pub const OT_MD_LIST: u32 = 9;
+pub const OT_MD_ITEM: u32 = 10;
+pub const OT_MD_BLOCK_CLOSED: u32 = 1;
+pub const OT_MD_BLOCK_SETEXT: u32 = 2;
+pub const OT_MD_BLOCK_ORDERED: u32 = 4;
+pub const OT_MD_BLOCK_TIGHT: u32 = 8;
+pub const OT_MD_BLOCK_TASK: u32 = 16;
+pub const OT_MD_BLOCK_CHECKED: u32 = 32;
+pub const OT_MD_BLOCK_BLANK_AFTER: u32 = 64;
+pub const OT_MD_BLOCK_FENCED: u32 = 128;
+pub const OT_MD_BLOCK_HOOKED: u32 = 256;
+pub const OT_MD_BLOCK_MATH: u32 = 512;
+pub const OT_MD_BLOCK_HEADER: u32 = 1024;
+pub const OT_MD_BLOCK_OPEN: u32 = 2048;
+pub const OT_MD_BLOCK_ALIGN_LEFT: u32 = 4096;
+pub const OT_MD_BLOCK_ALIGN_RIGHT: u32 = 8192;
+pub const OT_MD_SPAN_CODE: u32 = 1;
+pub const OT_MD_SPAN_MATH: u32 = 2;
 pub const OT_EDITOR_MOVE_UP: u32 = 0;
 pub const OT_EDITOR_MOVE_DOWN: u32 = 1;
 pub const OT_EDITOR_GOTO_LINE_END: u32 = 2;
@@ -419,6 +550,7 @@ pub const OT_IMAGE_PROTOCOL_SIXEL: u32 = 2;
 pub const OT_IMAGE_PROTOCOL_BLOCKS: u32 = 3;
 pub const OT_IMAGE_DRAW_SOURCE_WIDTH: u32 = 1;
 pub const OT_IMAGE_DRAW_SOURCE_HEIGHT: u32 = 2;
+pub const OT_IMAGE_ENCODED_BYTES_MAX: u32 = 67108864;
 pub const OT_IMAGE_FORMAT_UNKNOWN: u32 = 0;
 pub const OT_IMAGE_FORMAT_PNG: u32 = 1;
 pub const OT_IMAGE_FORMAT_RGBA: u32 = 2;
@@ -488,6 +620,10 @@ pub const OT_BUFFER_STACK_POP_OPACITY: u32 = 5;
 pub const OT_BUFFER_STACK_CLEAR_OPACITY: u32 = 6;
 pub const OT_BUFFER_GRID_INNER: u32 = 1;
 pub const OT_BUFFER_GRID_OUTER: u32 = 2;
+pub const OT_CELL_CHAR_KIND_MASK: u32 = 3221225472;
+pub const OT_CELL_CHAR_IMAGE: u32 = 1073741824;
+pub const OT_CELL_CHAR_GRAPHEME: u32 = 2147483648;
+pub const OT_CELL_CHAR_CONTINUATION: u32 = 3221225472;
 pub const OT_SESSION_CONTROL_PACKET_BYTES: u32 = 4096;
 pub const OT_TERMINAL_ALTERNATE_SCREEN: u32 = 1;
 pub const OT_TERMINAL_MOUSE: u32 = 2;
@@ -497,6 +633,12 @@ pub const OT_TERMINAL_REPLY_SENTINEL: u32 = 16;
 pub const OT_TERMINAL_SYNC_ALWAYS: u32 = 32;
 pub const OT_TERMINAL_SYNC_NEVER: u32 = 64;
 pub const OT_TERMINAL_HOST_MULTIPLEXER: u32 = 128;
+pub const OT_KITTY_KEYBOARD_DISAMBIGUATE: u32 = 1;
+pub const OT_KITTY_KEYBOARD_EVENT_TYPES: u32 = 2;
+pub const OT_KITTY_KEYBOARD_ALTERNATE_KEYS: u32 = 4;
+pub const OT_KITTY_KEYBOARD_ALL_KEYS_AS_ESCAPES: u32 = 8;
+pub const OT_KITTY_KEYBOARD_REPORT_TEXT: u32 = 16;
+pub const OT_KITTY_KEYBOARD_ALL: u32 = 31;
 pub const OT_CONTROL_CAPABILITY_RESPONSE: u32 = 1;
 pub const OT_CONTROL_TITLE: u32 = 2;
 pub const OT_CONTROL_MOUSE: u32 = 3;
@@ -675,6 +817,7 @@ pub const OT_INPUT_PAYLOAD_BYTES_MIN: u32 = 4384;
 pub const OT_INPUT_TIMEOUT_NS: u64 = 20000000;
 pub const OT_DIAGNOSTIC_MESSAGE_BYTES: u32 = 4096;
 pub const OT_DIAGNOSTIC_TRUNCATED: u32 = 1;
+pub const OT_DIAGNOSTIC_QUEUE_MAX: u32 = 64;
 pub const OT_SCENE_RECORD_BYTES_MAX: u32 = 67108864;
 pub const OT_SCENE_RECORD_PHASE_BEFORE: u32 = 0;
 pub const OT_SCENE_RECORD_PHASE_SELF: u32 = 1;
@@ -692,6 +835,7 @@ pub const OT_SCENE_RECORD_EDITOR_VIEW: u32 = 9;
 pub const OT_SCENE_RECORD_SCENE_BODY: u32 = 10;
 pub const OT_SCENE_RECORD_IMAGE: u32 = 11;
 pub const OT_SCENE_RECORD_UNICODE: u32 = 12;
+pub const OT_SCENE_RECORD_CELLS: u32 = 13;
 pub const OT_SCENE_RECORD_GRAYSCALE_FOREGROUND: u32 = 1;
 pub const OT_SCENE_RECORD_GRAYSCALE_BACKGROUND: u32 = 2;
 pub const OT_SCENE_RECORD_GRAYSCALE_SUPERSAMPLED: u32 = 4;
@@ -2294,7 +2438,7 @@ pub struct ot_edit_buffer_options {
     pub struct_size: u32,
     pub abi_version: u32,
     pub width_method: u32,
-    pub reserved: u32,
+    pub flags: u32,
 }
 
 // SAFETY: the record has no padding and only integer or float fields.
@@ -2316,7 +2460,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ot_edit_buffer_options, struct_size) == 0);
     assert!(core::mem::offset_of!(ot_edit_buffer_options, abi_version) == 4);
     assert!(core::mem::offset_of!(ot_edit_buffer_options, width_method) == 8);
-    assert!(core::mem::offset_of!(ot_edit_buffer_options, reserved) == 12);
+    assert!(core::mem::offset_of!(ot_edit_buffer_options, flags) == 12);
 };
 
 #[repr(C)]
@@ -2503,6 +2647,182 @@ const _: () = {
     assert!(core::mem::offset_of!(ot_edit_highlight, style_id) == 8);
     assert!(core::mem::offset_of!(ot_edit_highlight, priority) == 12);
     assert!(core::mem::offset_of!(ot_edit_highlight, r#ref) == 16);
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_highlight_run {
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub group_set: u32,
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_highlight_run {}
+
+impl Default for ot_highlight_run {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_highlight_run>() == 12);
+    assert!(core::mem::align_of::<ot_highlight_run>() == 4);
+    assert!(core::mem::offset_of!(ot_highlight_run, start_byte) == 0);
+    assert!(core::mem::offset_of!(ot_highlight_run, end_byte) == 4);
+    assert!(core::mem::offset_of!(ot_highlight_run, group_set) == 8);
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_edit_mark {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub id: u32,
+    pub kind: u32,
+    pub flags: u32,
+    pub style: u32,
+    pub value: ot_editor_style,
+    pub priority: u32,
+    pub start: u32,
+    pub end: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_edit_mark {}
+
+impl Default for ot_edit_mark {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        let mut value: Self = unsafe { core::mem::zeroed() };
+        value.struct_size = core::mem::size_of::<Self>() as u32;
+        value.abi_version = OT_CONTEXT_ABI_VERSION;
+        value
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_edit_mark>() == 76);
+    assert!(core::mem::align_of::<ot_edit_mark>() == 4);
+    assert!(core::mem::offset_of!(ot_edit_mark, struct_size) == 0);
+    assert!(core::mem::offset_of!(ot_edit_mark, abi_version) == 4);
+    assert!(core::mem::offset_of!(ot_edit_mark, id) == 8);
+    assert!(core::mem::offset_of!(ot_edit_mark, kind) == 12);
+    assert!(core::mem::offset_of!(ot_edit_mark, flags) == 16);
+    assert!(core::mem::offset_of!(ot_edit_mark, style) == 20);
+    assert!(core::mem::offset_of!(ot_edit_mark, value) == 24);
+    assert!(core::mem::offset_of!(ot_edit_mark, priority) == 56);
+    assert!(core::mem::offset_of!(ot_edit_mark, start) == 60);
+    assert!(core::mem::offset_of!(ot_edit_mark, end) == 64);
+    assert!(core::mem::offset_of!(ot_edit_mark, start_byte) == 68);
+    assert!(core::mem::offset_of!(ot_edit_mark, end_byte) == 72);
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_markdown_options {
+    pub struct_size: u32,
+    pub abi_version: u32,
+    pub flags: u32,
+    pub source_byte_limit: u32,
+    pub syntax_style: ot_handle,
+    pub hook_filter_byte_count: u32,
+    pub reserved: u32,
+    pub hook_filter: [u8; 256],
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_markdown_options {}
+
+impl Default for ot_markdown_options {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        let mut value: Self = unsafe { core::mem::zeroed() };
+        value.struct_size = core::mem::size_of::<Self>() as u32;
+        value.abi_version = OT_CONTEXT_ABI_VERSION;
+        value
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_markdown_options>() == 296);
+    assert!(core::mem::align_of::<ot_markdown_options>() == 8);
+    assert!(core::mem::offset_of!(ot_markdown_options, struct_size) == 0);
+    assert!(core::mem::offset_of!(ot_markdown_options, abi_version) == 4);
+    assert!(core::mem::offset_of!(ot_markdown_options, flags) == 8);
+    assert!(core::mem::offset_of!(ot_markdown_options, source_byte_limit) == 12);
+    assert!(core::mem::offset_of!(ot_markdown_options, syntax_style) == 16);
+    assert!(core::mem::offset_of!(ot_markdown_options, hook_filter_byte_count) == 32);
+    assert!(core::mem::offset_of!(ot_markdown_options, reserved) == 36);
+    assert!(core::mem::offset_of!(ot_markdown_options, hook_filter) == 40);
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_markdown_result {
+    pub changed_block_count: u32,
+    pub committed_top_level_count: u32,
+    pub removed_from_index: u32,
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_markdown_result {}
+
+impl Default for ot_markdown_result {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_markdown_result>() == 12);
+    assert!(core::mem::align_of::<ot_markdown_result>() == 4);
+    assert!(core::mem::offset_of!(ot_markdown_result, changed_block_count) == 0);
+    assert!(core::mem::offset_of!(ot_markdown_result, committed_top_level_count) == 4);
+    assert!(core::mem::offset_of!(ot_markdown_result, removed_from_index) == 8);
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_markdown_block {
+    pub index: u32,
+    pub parent_index: u32,
+    pub kind: u16,
+    pub flags: u16,
+    pub source_start_byte: u32,
+    pub source_end_byte: u32,
+    pub info_start_byte: u32,
+    pub info_end_byte: u32,
+    pub number: u32,
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_markdown_block {}
+
+impl Default for ot_markdown_block {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_markdown_block>() == 32);
+    assert!(core::mem::align_of::<ot_markdown_block>() == 4);
+    assert!(core::mem::offset_of!(ot_markdown_block, index) == 0);
+    assert!(core::mem::offset_of!(ot_markdown_block, parent_index) == 4);
+    assert!(core::mem::offset_of!(ot_markdown_block, kind) == 8);
+    assert!(core::mem::offset_of!(ot_markdown_block, flags) == 10);
+    assert!(core::mem::offset_of!(ot_markdown_block, source_start_byte) == 12);
+    assert!(core::mem::offset_of!(ot_markdown_block, source_end_byte) == 16);
+    assert!(core::mem::offset_of!(ot_markdown_block, info_start_byte) == 20);
+    assert!(core::mem::offset_of!(ot_markdown_block, info_end_byte) == 24);
+    assert!(core::mem::offset_of!(ot_markdown_block, number) == 28);
 };
 
 #[repr(C)]
@@ -4176,6 +4496,64 @@ const _: () = {
     assert!(core::mem::offset_of!(ot_scene_record_unicode, background) == 48);
 };
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_scene_cell {
+    pub character: u32,
+    pub attributes: u32,
+    pub foreground: [u16; 4],
+    pub background: [u16; 4],
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_scene_cell {}
+
+impl Default for ot_scene_cell {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_scene_cell>() == 24);
+    assert!(core::mem::align_of::<ot_scene_cell>() == 4);
+    assert!(core::mem::offset_of!(ot_scene_cell, character) == 0);
+    assert!(core::mem::offset_of!(ot_scene_cell, attributes) == 4);
+    assert!(core::mem::offset_of!(ot_scene_cell, foreground) == 8);
+    assert!(core::mem::offset_of!(ot_scene_cell, background) == 16);
+};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ot_scene_record_cells {
+    pub header: ot_scene_record_header,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub count: u32,
+}
+
+// SAFETY: the record has no padding and only integer or float fields.
+unsafe impl Pod for ot_scene_record_cells {}
+
+impl Default for ot_scene_record_cells {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a float, or an array or record of them; all-zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<ot_scene_record_cells>() == 24);
+    assert!(core::mem::align_of::<ot_scene_record_cells>() == 4);
+    assert!(core::mem::offset_of!(ot_scene_record_cells, header) == 0);
+    assert!(core::mem::offset_of!(ot_scene_record_cells, x) == 8);
+    assert!(core::mem::offset_of!(ot_scene_record_cells, y) == 12);
+    assert!(core::mem::offset_of!(ot_scene_record_cells, width) == 16);
+    assert!(core::mem::offset_of!(ot_scene_record_cells, count) == 20);
+};
+
 unsafe extern "C" {
     pub fn ot_scene_set_hooks(context: *mut ot_context, node: *const ot_handle, scene_hooks: *const ot_scene_hooks) -> ot_status;
     pub fn ot_scene_frame_step_with_geometry(context: *mut ot_context, session: *const ot_handle, previous: *const ot_scene_frame_request, scene_frame_options: *const ot_scene_frame_options, recording: *const u8, recording_length: u32, out_request: *mut ot_scene_frame_request, out_geometry: *mut ot_scene_frame_geometry) -> ot_status;
@@ -4187,6 +4565,8 @@ unsafe extern "C" {
     pub fn ot_scene_clear_children(context: *mut ot_context, node: *const ot_handle) -> ot_status;
     pub fn ot_scene_set_measure(context: *mut ot_context, node: *const ot_handle, callback: ot_scene_measure_callback) -> ot_status;
     pub fn ot_scene_has_measure(context: *mut ot_context, node: *const ot_handle, out_enabled: *mut u32) -> ot_status;
+    pub fn ot_scene_reaches_hooks(context: *mut ot_context, node: *const ot_handle, out_reached: *mut u32) -> ot_status;
+    pub fn ot_scene_painted(context: *mut ot_context, node: *const ot_handle, out_painted: *mut u32) -> ot_status;
     pub fn ot_scene_mark_dirty(context: *mut ot_context, node: *const ot_handle) -> ot_status;
     pub fn ot_scene_set_style(context: *mut ot_context, node: *const ot_handle, group: u32, kind: u32, edge: u32, unit: u32, value: f32, flags: u32) -> ot_status;
     pub fn ot_scene_get_style(context: *mut ot_context, node: *const ot_handle, group: u32, kind: u32, edge: u32, out_value: *mut ot_scene_style_value) -> ot_status;
@@ -4213,9 +4593,11 @@ unsafe extern "C" {
     pub fn ot_scene_get_text(context: *mut ot_context, node: *const ot_handle, bytes: *mut u8, capacity: u32, out_count: *mut u32) -> ot_status;
     pub fn ot_scene_get_text_info(context: *mut ot_context, node: *const ot_handle, out_info: *mut ot_scene_text_info) -> ot_status;
     pub fn ot_scene_get_text_lines(context: *mut ot_context, node: *const ot_handle, first_line: u32, lines: *mut ot_scene_text_line, capacity: u32, out_count: *mut u32) -> ot_status;
+    pub fn ot_scene_get_text_byte_at(context: *mut ot_context, node: *const ot_handle, x: i32, y: i32, out_byte: *mut u32) -> ot_status;
     pub fn ot_scene_get_layout(context: *mut ot_context, node: *const ot_handle, observation: u32, out_layout: *mut ot_scene_layout) -> ot_status;
     pub fn ot_scene_paint(context: *mut ot_context, session: *const ot_handle, background: *const u16, use_mouse: u32, excluded_hit_num: u32, out_frame: *mut ot_scene_frame_request) -> ot_status;
     pub fn ot_scene_hit_test(context: *mut ot_context, session: *const ot_handle, x: i32, y: i32, out_num: *mut u32) -> ot_status;
+    pub fn ot_scene_hit_test_excluding(context: *mut ot_context, session: *const ot_handle, x: i32, y: i32, excluded_num: u32, out_num: *mut u32) -> ot_status;
     pub fn ot_scene_get_stats(context: *mut ot_context, session: *const ot_handle, out_stats: *mut ot_scene_stats) -> ot_status;
     pub fn ot_scene_set_debug_flags(context: *mut ot_context, session: *const ot_handle, flags: u32) -> ot_status;
     pub fn ot_scene_get_cursor_state(context: *mut ot_context, session: *const ot_handle, out_state: *mut ot_scene_cursor_state) -> ot_status;
@@ -4262,6 +4644,7 @@ unsafe extern "C" {
     pub fn ot_edit_buffer_history(context: *mut ot_context, handle: *const ot_handle, redo: u32, bytes: *mut u8, capacity: u32, out_count: *mut u32) -> ot_status;
     pub fn ot_edit_buffer_get_position(context: *mut ot_context, handle: *const ot_handle, query: u32, a: u32, b: u32, out_position: *mut ot_edit_position) -> ot_status;
     pub fn ot_edit_buffer_get_range(context: *mut ot_context, handle: *const ot_handle, by_coords: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, bytes: *mut u8, capacity: u32, out_count: *mut u32) -> ot_status;
+    pub fn ot_edit_buffer_convert_offset(context: *mut ot_context, edit_buffer: *const ot_handle, conversion: u32, value: u32, out_value: *mut u32) -> ot_status;
     pub fn ot_edit_buffer_measure_text(context: *mut ot_context, edit_buffer: *const ot_handle, bytes: *const u8, byte_count: u32, out_width: *mut u32) -> ot_status;
     pub fn ot_edit_measure_text(context: *mut ot_context, bytes: *const u8, byte_count: u32, width_method: u32, tab_width: u32, out_width: *mut u32) -> ot_status;
     pub fn ot_edit_buffer_set_defaults(context: *mut ot_context, handle: *const ot_handle, mask: u32, editor_style: *const ot_editor_style) -> ot_status;
@@ -4270,6 +4653,21 @@ unsafe extern "C" {
     pub fn ot_syntax_style_get_count(context: *mut ot_context, handle: *const ot_handle, out_count: *mut u32) -> ot_status;
     pub fn ot_edit_buffer_highlight(context: *mut ot_context, handle: *const ot_handle, operation: u32, argument: u32, highlight: *const ot_edit_highlight) -> ot_status;
     pub fn ot_edit_buffer_get_highlights(context: *mut ot_context, handle: *const ot_handle, line: u32, highlights: *mut ot_edit_highlight, capacity: u32, out_count: *mut u32) -> ot_status;
+    pub fn ot_context_group_set(context: *mut ot_context, names: *const u8, name_byte_count: u32, name_end_bytes: *const u32, name_count: u32, out_group_set: *mut u32) -> ot_status;
+    pub fn ot_edit_buffer_set_layer(context: *mut ot_context, handle: *const ot_handle, layer_id: u32, start_byte: u32, end_byte: u32, runs: *const ot_highlight_run, run_count: u32) -> ot_status;
+    pub fn ot_edit_buffer_mark(context: *mut ot_context, handle: *const ot_handle, operation: u32, mark: *const ot_edit_mark, out_id: *mut u32) -> ot_status;
+    pub fn ot_edit_buffer_get_marks(context: *mut ot_context, handle: *const ot_handle, id: u32, kind: u32, marks: *mut ot_edit_mark, capacity: u32, out_count: *mut u32) -> ot_status;
+    pub fn ot_markdown_create(context: *mut ot_context, markdown_options: *const ot_markdown_options, out_doc: *mut ot_handle) -> ot_status;
+    pub fn ot_markdown_destroy(context: *mut ot_context, doc: *const ot_handle) -> ot_status;
+    pub fn ot_markdown_set_options(context: *mut ot_context, doc: *const ot_handle, markdown_options: *const ot_markdown_options, out: *mut ot_markdown_result) -> ot_status;
+    pub fn ot_markdown_append(context: *mut ot_context, doc: *const ot_handle, bytes: *const u8, byte_count: u32, out: *mut ot_markdown_result) -> ot_status;
+    pub fn ot_markdown_set(context: *mut ot_context, doc: *const ot_handle, bytes: *const u8, byte_count: u32, out: *mut ot_markdown_result) -> ot_status;
+    pub fn ot_markdown_finish(context: *mut ot_context, doc: *const ot_handle, out: *mut ot_markdown_result) -> ot_status;
+    pub fn ot_markdown_get_source(context: *mut ot_context, doc: *const ot_handle, out_bytes: *mut *const u8, out_byte_count: *mut u32) -> ot_status;
+    pub fn ot_markdown_read_changes(context: *mut ot_context, doc: *const ot_handle, blocks: *mut ot_markdown_block, block_capacity: u32, out_block_count: *mut u32) -> ot_status;
+    pub fn ot_markdown_read_source(context: *mut ot_context, doc: *const ot_handle, block_index: u32, bytes: *mut u8, byte_capacity: u32, out_byte_count: *mut u32) -> ot_status;
+    pub fn ot_markdown_read_leaf(context: *mut ot_context, doc: *const ot_handle, block_index: u32, bytes: *mut u8, byte_capacity: u32, out_byte_count: *mut u32, chunks: *mut ot_styled_text_chunk, spans: *mut u32, chunk_capacity: u32, out_chunk_count: *mut u32, urls: *mut u8, url_byte_capacity: u32, out_url_byte_count: *mut u32) -> ot_status;
+    pub fn ot_markdown_bind(context: *mut ot_context, doc: *const ot_handle, block_index: u32, text_node: *const ot_handle) -> ot_status;
     pub fn ot_editor_view_set_viewport(context: *mut ot_context, handle: *const ot_handle, editor_viewport: *const ot_editor_viewport, size_only: u32, move_cursor: u32) -> ot_status;
     pub fn ot_editor_view_get_viewport(context: *mut ot_context, handle: *const ot_handle, out_viewport: *mut ot_editor_viewport) -> ot_status;
     pub fn ot_editor_view_set_scroll_margin(context: *mut ot_context, handle: *const ot_handle, margin: f32) -> ot_status;
@@ -4350,8 +4748,10 @@ unsafe extern "C" {
     pub fn ot_text_buffer_get_range(context: *mut ot_context, handle: *const ot_handle, start: u32, end: u32, out_bytes: *mut u8, capacity: u32, out_count: *mut u32) -> ot_status;
     pub fn ot_text_buffer_set_defaults(context: *mut ot_context, handle: *const ot_handle, mask: u32, editor_style: *const ot_editor_style) -> ot_status;
     pub fn ot_text_buffer_set_tab_width(context: *mut ot_context, handle: *const ot_handle, width: u32) -> ot_status;
+    pub fn ot_text_buffer_set_width_method(context: *mut ot_context, handle: *const ot_handle, width_method: u32) -> ot_status;
     pub fn ot_text_buffer_highlight(context: *mut ot_context, handle: *const ot_handle, operation: u32, argument: u32, edit_highlight: *const ot_edit_highlight) -> ot_status;
     pub fn ot_text_buffer_get_highlights(context: *mut ot_context, handle: *const ot_handle, line: u32, out_edit_highlight: *mut ot_edit_highlight, capacity: u32, out_count: *mut u32) -> ot_status;
+    pub fn ot_text_buffer_set_layer(context: *mut ot_context, handle: *const ot_handle, layer_id: u32, start_byte: u32, end_byte: u32, runs: *const ot_highlight_run, run_count: u32) -> ot_status;
     pub fn ot_text_buffer_view_set_viewport(context: *mut ot_context, handle: *const ot_handle, editor_viewport: *const ot_editor_viewport, size_only: u32) -> ot_status;
     pub fn ot_text_buffer_view_command(context: *mut ot_context, handle: *const ot_handle, command: u32, argument: u32) -> ot_status;
     pub fn ot_text_buffer_view_set_tab_color(context: *mut ot_context, handle: *const ot_handle, color: *const u16) -> ot_status;

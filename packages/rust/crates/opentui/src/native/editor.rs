@@ -3,8 +3,13 @@ use super::{Context, MousePointer, Node, WidthMethod, WrapMode};
 use crate::error::{Result, check, count};
 use crate::native::CursorStyle;
 use crate::style::{Color, EncodedSpans, Span, Style};
+use crate::syntax::SyntaxTheme;
 use crate::sys;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Default colors and attributes for text without a highlight. `None` fields stay unset.
 fn encode_style(style: Style) -> sys::ot_editor_style {
@@ -21,9 +26,41 @@ fn encode_style(style: Style) -> sys::ot_editor_style {
     raw
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `ot_edit_buffer_get_text` calls on this thread, for tests that count the work of an edit.
+    pub(crate) static TEXT_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// `ot_edit_buffer_get_marks` calls on this thread.
+    pub(crate) static MARK_READS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Commands on this thread that apply the cursor rules around atomic marks.
+    pub(crate) static RULE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a command that applies the cursor rules, for tests.
+fn ruled() {
+    #[cfg(test)]
+    RULE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+/// A style that supplies exactly its own attributes, as a registered name or a mark's style value.
+fn encode_supplied(style: Style) -> sys::ot_editor_style {
+    let mut raw = encode_style(style);
+    raw.flags |= sys::OT_EDITOR_STYLE_ATTRIBUTE_MASK;
+    raw.attributes |= raw.attributes << 16;
+    raw
+}
+
 /// A named-style table for edit buffer highlights, which several buffers can share.
 #[derive(Clone)]
-pub struct SyntaxStyle(Rc<Resource>);
+pub struct SyntaxStyle(Rc<Resource>, Rc<RefCell<CapturePalette>>);
+
+/// The syntax theme an editor last set on a table, and the capture names and whole lists registered from it.
+#[derive(Default)]
+struct CapturePalette {
+    theme: Arc<SyntaxTheme>,
+    names: BTreeSet<&'static str>,
+    lists: BTreeSet<Vec<&'static str>>,
+}
 
 impl SyntaxStyle {
     pub fn new(context: &Context) -> Result<Self> {
@@ -33,16 +70,67 @@ impl SyntaxStyle {
             ("ot_syntax_style_destroy", sys::ot_syntax_style_destroy),
             |context, handle| unsafe { sys::ot_syntax_style_create(context, handle) },
         )?;
-        Ok(Self(Rc::new(resource)))
+        Ok(Self(Rc::new(resource), Rc::default()))
+    }
+
+    /// Makes `theme` the table's capture palette, registering every capture name seen on the table again; the
+    /// last theme set wins for all editors sharing the table. Returns whether the palette changed.
+    pub(crate) fn set_capture_theme(&self, theme: &Arc<SyntaxTheme>) -> Result<bool> {
+        if self.1.borrow().theme == *theme {
+            return Ok(false);
+        }
+        self.1.borrow_mut().theme = theme.clone();
+        self.1.borrow().names.iter().try_for_each(|name| self.register_capture(name).map(drop))?;
+        self.1.borrow().lists.iter().try_for_each(|names| self.register_list(names).map(drop))?;
+        Ok(true)
+    }
+
+    /// The style names a group set of the capture-name list `names` composes, registered with the palette:
+    /// `opentui.<name>` for each, or, for a list past the group-set bounds, one name for the whole list with its
+    /// merged style, so no style is lost.
+    pub(crate) fn capture_group(&self, names: &[&'static str]) -> Result<Vec<String>> {
+        let prefixed: Vec<String> = names.iter().map(|name| format!("opentui.{name}")).collect();
+        let bytes = sys::OT_GROUP_SET_NAME_BYTE_COUNT_MAX as usize;
+        if names.len() <= sys::OT_GROUP_SET_NAME_COUNT_MAX as usize && prefixed.iter().all(|name| name.len() <= bytes) {
+            self.register_captures(names)?;
+            return Ok(prefixed);
+        }
+        if !self.1.borrow().lists.contains(names) {
+            self.register_list(names)?;
+            self.1.borrow_mut().lists.insert(names.to_vec());
+        }
+        Ok(vec![list_name(names)])
+    }
+
+    fn register_list(&self, names: &[&'static str]) -> Result<u32> {
+        let style = self.1.borrow().theme.merge(names.iter().copied());
+        self.register(&list_name(names), style)
+    }
+
+    /// Registers the capture names the table has not seen as `opentui.<name>`, with its palette's style.
+    pub(crate) fn register_captures(&self, names: &[&'static str]) -> Result<()> {
+        for &name in names {
+            if !self.1.borrow().names.contains(name) {
+                self.register_capture(name)?;
+                self.1.borrow_mut().names.insert(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn register_capture(&self, name: &str) -> Result<u32> {
+        let style = self.1.borrow().theme.get(name).unwrap_or_default();
+        self.register(&format!("opentui.{name}"), style)
     }
 
     pub(crate) fn handle(&self) -> sys::ot_handle {
         self.0.handle()
     }
 
-    /// Defines or replaces a named style and returns its id for highlights.
+    /// Defines or replaces a named style and returns its id for highlights. In a group set it adds its attributes to
+    /// earlier names' (a [`Style`] has no attribute that says "off"), as [`Style::patch`] does.
     pub fn register(&self, name: &str, style: Style) -> Result<u32> {
-        let raw = encode_style(style);
+        let raw = encode_supplied(style);
         let length = count("ot_syntax_style_register", name.len())?;
         let (context, handle) = self.0.raw();
         let mut id = 0;
@@ -62,6 +150,14 @@ impl SyntaxStyle {
         })?;
         Ok((id != 0).then_some(id))
     }
+}
+
+/// The style name of a capture-name list past the group-set bounds: the same in every table.
+fn list_name(names: &[&str]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    names.hash(&mut hasher);
+    format!("opentui.~{:016x}", hasher.finish())
 }
 
 /// A highlight over a range of display columns.
@@ -99,7 +195,7 @@ pub struct EditInfo {
     pub line_count: u32,
     /// The primary cursor: zero-based row and display column.
     pub cursor: (u32, u32),
-    /// The cursor as a flattened document offset, counting one position per line break.
+    /// Display cells from the document start, counting one cell per line break.
     pub cursor_offset: u32,
     pub can_undo: bool,
     pub can_redo: bool,
@@ -109,8 +205,11 @@ pub struct EditInfo {
 /// A position in an edit buffer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EditPosition {
+    /// Zero-based logical line.
     pub row: u32,
+    /// Display cells from the logical line start.
     pub col: u32,
+    /// Display cells from the document start, counting one per newline.
     pub offset: u32,
 }
 
@@ -121,11 +220,17 @@ pub enum EditCommand {
     Backspace,
     NewLine,
     DeleteLine,
+    /// One cursor stop left, not one byte or necessarily one display cell.
     MoveLeft,
+    /// One cursor stop right, not one byte or necessarily one display cell.
     MoveRight,
+    /// One logical line up, using the desired cell column.
     MoveUp,
+    /// One logical line down, using the desired cell column.
     MoveDown,
+    /// Zero-based logical line.
     GotoLine(u32),
+    /// Document display cells, counting one per newline.
     CursorOffset(u32),
     Clear,
     ClearHistory,
@@ -138,8 +243,11 @@ pub enum EditQuery {
     NextWord,
     PrevWord,
     EndOfLine,
+    /// Document display cells, counting one per newline.
     Offset(u32),
+    /// Zero-based logical line and display-cell column.
     Coords(u32, u32),
+    /// Zero-based logical line.
     LineStart(u32),
 }
 
@@ -154,7 +262,22 @@ impl EditBuffer {
     /// `width_method` is normally the Session's detected method, such as
     /// [`App::width_method`](crate::App::width_method).
     pub fn new(context: &Context, width_method: WidthMethod) -> Result<Self> {
-        let options = sys::ot_edit_buffer_options { width_method: width_method.raw(), ..Default::default() };
+        Self::create(context, width_method, 0)
+    }
+
+    /// Like [`new`](Self::new), but measures with the width method of the Session whose scene shows it,
+    /// including after the terminal's replies change that method; the cursor, selections, marks and undo points keep
+    /// their text.
+    ///
+    /// One Session at a time may show it: binding a view of it to a node of another Session fails with
+    /// `OT_WRONG_SESSION` until the first Session's nodes no longer show it. `WidthMethod::NoZwj` is rejected, as no
+    /// Session measures with it.
+    pub fn following(context: &Context, width_method: WidthMethod) -> Result<Self> {
+        Self::create(context, width_method, sys::OT_EDIT_BUFFER_FOLLOW_SESSION_WIDTH)
+    }
+
+    fn create(context: &Context, width_method: WidthMethod, flags: u32) -> Result<Self> {
+        let options = sys::ot_edit_buffer_options { width_method: width_method.raw(), flags, ..Default::default() };
         let resource = Resource::create(
             context,
             "ot_edit_buffer_create",
@@ -190,7 +313,7 @@ impl EditBuffer {
         })
     }
 
-    /// Deletes from `start` up to, not including, `end`, as (row, column) pairs.
+    /// Deletes a half-open range between (zero-based logical line, display-cell column) pairs.
     pub fn delete_range(&self, start: (u32, u32), end: (u32, u32)) -> Result<()> {
         let (context, handle) = self.raw();
         check("ot_edit_buffer_delete_range", unsafe {
@@ -198,18 +321,23 @@ impl EditBuffer {
         })
     }
 
+    /// Sets the cursor by zero-based logical row and display-cell column.
     pub fn set_cursor(&self, row: u32, col: u32) -> Result<()> {
         let (context, handle) = self.raw();
         check("ot_edit_buffer_set_cursor", unsafe { sys::ot_edit_buffer_set_cursor(context, handle, row, col) })
     }
 
+    /// Returns UTF-8 text with LF line endings. `len()` and string slicing use bytes, not cursor cells.
     pub fn text(&self) -> Result<String> {
         let (context, handle) = self.raw();
         read_string("ot_edit_buffer_get_text", |bytes, capacity, length| unsafe {
+            #[cfg(test)]
+            TEXT_READS.with(|reads| reads.set(reads.get() + 1));
             sys::ot_edit_buffer_get_text(context, handle, bytes, capacity, length)
         })
     }
 
+    /// Returns the cursor's logical line, cell column, and document cell offset (one per newline).
     pub fn info(&self) -> Result<EditInfo> {
         let mut raw = sys::ot_edit_buffer_info::default();
         let (context, handle) = self.raw();
@@ -232,13 +360,39 @@ impl EditBuffer {
     }
 
     pub fn command(&self, command: EditCommand) -> Result<()> {
+        self.send(command, 0)
+    }
+
+    /// As [`command`](Self::command), with the cursor rules around atomic marks for Left, Right, Backspace and
+    /// Delete: a mark is one unit, and a move ends outside every atomic mark. Other commands run as `command`.
+    pub fn command_atomic(&self, command: EditCommand) -> Result<()> {
+        ruled();
+        self.send(command, sys::OT_EDIT_ATOMIC)
+    }
+
+    /// Moves a cursor that atomic marks surround to the outer edge of all of them: the end for `Greater`, the start for
+    /// `Less`, or the nearer one.
+    pub fn keep_outside(&self, toward: std::cmp::Ordering) -> Result<()> {
+        let edge = match toward {
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Less => 2,
+        };
+        ruled();
+        let (context, handle) = self.raw();
+        check("ot_edit_buffer_command", unsafe {
+            sys::ot_edit_buffer_command(context, handle, sys::OT_EDIT_KEEP_OUTSIDE, edge)
+        })
+    }
+
+    fn send(&self, command: EditCommand, atomic: u32) -> Result<()> {
         let (code, argument) = match command {
-            EditCommand::DeleteForward => (sys::OT_EDIT_DELETE_FORWARD, 0),
-            EditCommand::Backspace => (sys::OT_EDIT_BACKSPACE, 0),
+            EditCommand::DeleteForward => (sys::OT_EDIT_DELETE_FORWARD, atomic),
+            EditCommand::Backspace => (sys::OT_EDIT_BACKSPACE, atomic),
             EditCommand::NewLine => (sys::OT_EDIT_NEW_LINE, 0),
             EditCommand::DeleteLine => (sys::OT_EDIT_DELETE_LINE, 0),
-            EditCommand::MoveLeft => (sys::OT_EDIT_MOVE_LEFT, 0),
-            EditCommand::MoveRight => (sys::OT_EDIT_MOVE_RIGHT, 0),
+            EditCommand::MoveLeft => (sys::OT_EDIT_MOVE_LEFT, atomic),
+            EditCommand::MoveRight => (sys::OT_EDIT_MOVE_RIGHT, atomic),
             EditCommand::MoveUp => (sys::OT_EDIT_MOVE_UP, 0),
             EditCommand::MoveDown => (sys::OT_EDIT_MOVE_DOWN, 0),
             EditCommand::GotoLine(line) => (sys::OT_EDIT_GOTO_LINE, line),
@@ -269,6 +423,7 @@ impl EditBuffer {
         self.history(true)
     }
 
+    /// Queries a logical line, cell column, and document cell offset (one per newline), without moving the cursor.
     pub fn position(&self, query: EditQuery) -> Result<Option<EditPosition>> {
         let (code, a, b) = match query {
             EditQuery::Cursor => (sys::OT_EDIT_POSITION_CURSOR, 0, 0),
@@ -287,24 +442,33 @@ impl EditBuffer {
         Ok((raw.valid != 0).then_some(EditPosition { row: raw.row, col: raw.col, offset: raw.offset }))
     }
 
-    /// The text between two flattened document offsets.
+    /// Converts a UTF-8 byte index in `text()` to document cells (one per newline). Rounds down within a grapheme
+    /// and clamps at EOF. The index need not be a char boundary.
+    pub fn byte_index_to_cell_offset(&self, index: usize) -> Result<u32> {
+        self.convert_offset(sys::OT_EDIT_BYTE_TO_CELL, u32::try_from(index).unwrap_or(u32::MAX))
+    }
+
+    /// Converts document cells to a UTF-8 byte index in `text()`. Rounds down within a grapheme, past zero-width
+    /// text at a tie, and clamps at EOF.
+    pub fn cell_offset_to_byte_index(&self, offset: u32) -> Result<usize> {
+        Ok(self.convert_offset(sys::OT_EDIT_CELL_TO_BYTE, offset)? as usize)
+    }
+
+    fn convert_offset(&self, conversion: u32, value: u32) -> Result<u32> {
+        let (context, handle) = self.raw();
+        let mut result = 0;
+        check("ot_edit_buffer_convert_offset", unsafe {
+            sys::ot_edit_buffer_convert_offset(context, handle, conversion, value, &mut result)
+        })?;
+        Ok(result)
+    }
+
+    /// Reads `start..end` in document display cells, counting one per newline. The resulting string uses UTF-8 bytes.
     pub fn range(&self, start: u32, end: u32) -> Result<String> {
         let (context, handle) = self.raw();
         read_string("ot_edit_buffer_get_range", |bytes, capacity, length| unsafe {
             sys::ot_edit_buffer_get_range(context, handle, 0, 0, start, 0, end, bytes, capacity, length)
         })
-    }
-
-    /// The document offset at the end of `text` if it were this buffer's text: its display cells under the buffer's
-    /// width method, tab width, and control notation, plus one per line break.
-    pub(crate) fn measure(&self, text: &str) -> Result<u32> {
-        let length = count("ot_edit_buffer_measure_text", text.len())?;
-        let (context, handle) = self.raw();
-        let mut offset = 0;
-        check("ot_edit_buffer_measure_text", unsafe {
-            sys::ot_edit_buffer_measure_text(context, handle, text.as_ptr(), length, &mut offset)
-        })?;
-        Ok(offset)
     }
 
     /// Sets the colors and attributes of unhighlighted text.
@@ -323,7 +487,7 @@ impl EditBuffer {
         })
     }
 
-    /// Adds a highlight over a document range of display columns.
+    /// Adds a highlight over a document range of display cells excluding newlines.
     pub fn highlight(&self, highlight: Highlight) -> Result<()> {
         let raw = highlight.raw();
         let (context, handle) = self.raw();
@@ -345,11 +509,138 @@ impl EditBuffer {
         })
     }
 
+    /// Removes every highlight and empties every layer.
     pub fn clear_highlights(&self) -> Result<()> {
         let (context, handle) = self.raw();
         check("ot_edit_buffer_highlight", unsafe {
             sys::ot_edit_buffer_highlight(context, handle, sys::OT_EDIT_HIGHLIGHT_CLEAR_ALL, 0, std::ptr::null())
         })
+    }
+
+    /// Replaces layer `layer_id` inside `range` with `runs`. Both count UTF-8 bytes of [`Self::text`]; runs are sorted,
+    /// disjoint, nonempty, and on character boundaries. Runs move with edits, and replacing the whole text empties
+    /// the layer. Layers paint above highlights of priority 0 and below higher ones; a run without a link whose group
+    /// set supplies no field (no fg, bg or attribute) paints as if absent. The editor widgets set layer 1 for filetype
+    /// syntax; other layers on their buffers need another id.
+    pub fn set_layer(&self, layer_id: u32, range: Range<u32>, runs: &[LayerRun]) -> Result<()> {
+        let length = count("ot_edit_buffer_set_layer", runs.len())?;
+        let (context, handle) = self.raw();
+        check("ot_edit_buffer_set_layer", unsafe {
+            sys::ot_edit_buffer_set_layer(context, handle, layer_id, range.start, range.end, runs.as_ptr(), length)
+        })
+    }
+
+    /// Adds a mark over cursor offsets `range` and returns its id; a style paints by value at `priority`.
+    pub(crate) fn add_mark(&self, range: Range<u32>, atomic: bool, style: Option<Style>, priority: u8) -> Result<u32> {
+        let mut raw = sys::ot_edit_mark {
+            start: range.start,
+            end: range.end,
+            priority: u32::from(priority),
+            ..Default::default()
+        };
+        if atomic {
+            raw.flags |= sys::OT_EDIT_MARK_ATOMIC;
+        }
+        if let Some(style) = style {
+            raw.flags |= sys::OT_EDIT_MARK_STYLE_VALUE;
+            raw.value = encode_supplied(style);
+        }
+        self.mark(sys::OT_EDIT_MARK_ADD, Some(&raw))
+    }
+
+    /// Removes mark `id`. Returns whether there was one.
+    pub(crate) fn remove_mark(&self, id: u32) -> Result<bool> {
+        let raw = sys::ot_edit_mark { id, ..Default::default() };
+        Ok(self.mark(sys::OT_EDIT_MARK_REMOVE, Some(&raw))? != 0)
+    }
+
+    pub(crate) fn clear_marks(&self) -> Result<()> {
+        self.mark(sys::OT_EDIT_MARK_CLEAR, None).map(drop)
+    }
+
+    fn mark(&self, operation: u32, raw: Option<&sys::ot_edit_mark>) -> Result<u32> {
+        let mut id = 0;
+        let out = if raw.is_some() { &mut id as *mut u32 } else { std::ptr::null_mut() };
+        let (context, handle) = self.raw();
+        check("ot_edit_buffer_mark", unsafe {
+            sys::ot_edit_buffer_mark(context, handle, operation, raw.map_or(std::ptr::null(), |raw| raw), out)
+        })?;
+        Ok(id)
+    }
+
+    /// Every mark in (start, id) order, with its style value decoded.
+    pub(crate) fn marks(&self) -> Result<Vec<(sys::ot_edit_mark, Option<Style>)>> {
+        let (context, handle) = self.raw();
+        let mut length = 0;
+        let any = sys::OT_EDIT_MARK_ANY_KIND;
+        #[cfg(test)]
+        MARK_READS.with(|reads| reads.set(reads.get() + 1));
+        check("ot_edit_buffer_get_marks", unsafe {
+            sys::ot_edit_buffer_get_marks(context, handle, 0, any, std::ptr::null_mut(), 0, &mut length)
+        })?;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let mut marks = vec![sys::ot_edit_mark::default(); length as usize];
+        #[cfg(test)]
+        MARK_READS.with(|reads| reads.set(reads.get() + 1));
+        check("ot_edit_buffer_get_marks", unsafe {
+            sys::ot_edit_buffer_get_marks(context, handle, 0, any, marks.as_mut_ptr(), length, &mut length)
+        })?;
+        Ok(marks
+            .into_iter()
+            .map(|mark| (mark, (mark.flags & sys::OT_EDIT_MARK_STYLE_VALUE != 0).then(|| decode_style(&mark.value))))
+            .collect())
+    }
+}
+
+/// A style value as `encode_supplied` wrote it.
+fn decode_style(raw: &sys::ot_editor_style) -> Style {
+    let color = |flag, words| (raw.flags & flag != 0).then(|| Color::from_raw(words));
+    Style {
+        fg: color(sys::OT_EDITOR_STYLE_FOREGROUND, raw.foreground),
+        bg: color(sys::OT_EDITOR_STYLE_BACKGROUND, raw.background),
+        attributes: crate::style::Attributes::from_bits(raw.attributes as u8),
+    }
+}
+
+/// One run of a highlight layer: UTF-8 bytes `start_byte..end_byte`, painted with the group set `group_set`.
+pub type LayerRun = sys::ot_highlight_run;
+
+impl Context {
+    /// The id of an ordered list of style names, for [`LayerRun`]s. Equal lists give equal ids on this Context. Paint
+    /// composes the names against the buffer's style table, later names winning. A list holds at most
+    /// [`OT_GROUP_SET_NAME_COUNT_MAX`](sys::OT_GROUP_SET_NAME_COUNT_MAX) (16) names of at most
+    /// [`OT_GROUP_SET_NAME_BYTE_COUNT_MAX`](sys::OT_GROUP_SET_NAME_BYTE_COUNT_MAX) (64) bytes. Ids are never freed: a
+    /// Context holds at most 4,096 lists and 64 KiB of names in them, so 2,621 one-name lists of 25 bytes. Past a
+    /// bound, new lists fail with [`Status::ObjectLimit`](crate::Status::ObjectLimit).
+    pub fn group_set(&self, names: &[&str]) -> Result<u32> {
+        let mut ends = Vec::with_capacity(names.len());
+        let mut pool = String::new();
+        for name in names {
+            pool.push_str(name);
+            ends.push(count("ot_context_group_set", pool.len())?);
+        }
+        let (byte_count, name_count) =
+            (count("ot_context_group_set", pool.len())?, count("ot_context_group_set", ends.len())?);
+        let mut id = 0;
+        check("ot_context_group_set", unsafe {
+            sys::ot_context_group_set(self.as_raw(), pool.as_ptr(), byte_count, ends.as_ptr(), name_count, &mut id)
+        })?;
+        Ok(id)
+    }
+
+    /// The document cell offset at the end of `text` as an [`EditBuffer`] with this width method and tab width lays
+    /// it out, without a buffer: its cells, control notation included, plus one per line break (LF, CR, or CRLF). A
+    /// `tab_width` of 0 gives a new buffer's tab width; other values round as in [`EditBuffer::set_tab_width`], and
+    /// one over 255 fails. Core's `measureEditText`.
+    pub fn measure_edit_text(&self, text: &str, width_method: WidthMethod, tab_width: u32) -> Result<u32> {
+        let length = count("ot_edit_measure_text", text.len())?;
+        let mut width = 0;
+        check("ot_edit_measure_text", unsafe {
+            sys::ot_edit_measure_text(self.as_raw(), text.as_ptr(), length, width_method.raw(), tab_width, &mut width)
+        })?;
+        Ok(width)
     }
 }
 
@@ -367,9 +658,13 @@ pub struct Viewport {
 pub struct EditorPosition {
     /// Row within the viewport's wrapped lines.
     pub visual_row: u32,
+    /// Display cells from the viewport's left edge.
     pub visual_col: u32,
+    /// Zero-based logical line.
     pub logical_row: u32,
+    /// Display cells from the logical line start.
     pub logical_col: u32,
+    /// Display cells from the document start, counting one per newline.
     pub offset: u32,
 }
 
@@ -408,6 +703,22 @@ impl SelectionUnit {
 pub struct SelectionColors {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
+}
+
+impl SelectionColors {
+    /// The editor and text views' selection record, whose flags are `OT_SCENE_TEXT_FOREGROUND` and `_BACKGROUND`.
+    pub(super) fn editor_selection(self, operation: u32) -> sys::ot_editor_selection {
+        let mut raw = sys::ot_editor_selection { operation, ..Default::default() };
+        if let Some(color) = self.fg {
+            raw.flags |= sys::OT_SCENE_TEXT_FOREGROUND;
+            raw.foreground = color.to_raw();
+        }
+        if let Some(color) = self.bg {
+            raw.flags |= sys::OT_SCENE_TEXT_BACKGROUND;
+            raw.background = color.to_raw();
+        }
+        raw
+    }
 }
 
 /// Editor view state.
@@ -517,12 +828,21 @@ impl EditorView {
     }
 
     /// Moves the cursor one wrapped line up.
+    /// Moves up one wrapped row.
     pub fn move_up(&self) -> Result<()> {
         self.command(sys::OT_EDITOR_MOVE_UP, 0)
     }
 
+    /// Moves down one wrapped row.
     pub fn move_down(&self) -> Result<()> {
         self.command(sys::OT_EDITOR_MOVE_DOWN, 0)
+    }
+
+    /// Moves one wrapped line down or up; landing in an atomic mark leaves it by its nearer edge, as
+    /// [`EditBuffer::command_atomic`] moves do.
+    pub fn move_atomic(&self, down: bool) -> Result<()> {
+        ruled();
+        self.command(if down { sys::OT_EDITOR_MOVE_DOWN } else { sys::OT_EDITOR_MOVE_UP }, sys::OT_EDIT_ATOMIC)
     }
 
     /// Moves the cursor to the end of its wrapped line.
@@ -534,6 +854,7 @@ impl EditorView {
         self.command(sys::OT_EDITOR_DELETE_SELECTION, 0)
     }
 
+    /// Moves the cursor in document display cells, counting one per newline.
     pub fn set_cursor_offset(&self, offset: u32) -> Result<()> {
         self.command(sys::OT_EDITOR_CURSOR_OFFSET, offset)
     }
@@ -563,23 +884,22 @@ impl EditorView {
         Ok(changed != 0)
     }
 
-    fn colored(operation: u32, colors: SelectionColors) -> sys::ot_editor_selection {
-        let mut raw = sys::ot_editor_selection { operation, ..Default::default() };
-        if let Some(color) = colors.fg {
-            raw.flags |= sys::OT_SCENE_TEXT_SELECTION_FOREGROUND;
-            raw.foreground = color.to_raw();
-        }
-        if let Some(color) = colors.bg {
-            raw.flags |= sys::OT_SCENE_TEXT_SELECTION_BACKGROUND;
-            raw.background = color.to_raw();
-        }
-        raw
+    /// Selects `start..end` in document display cells, counting one per newline.
+    pub fn select_range(&self, start: u32, end: u32, colors: SelectionColors) -> Result<()> {
+        self.select(sys::ot_editor_selection { start, end, ..colors.editor_selection(sys::OT_EDITOR_SELECT_SET) })
+            .map(drop)
     }
 
-    /// Selects document offsets `start..end`.
-    pub fn select_range(&self, start: u32, end: u32, colors: SelectionColors) -> Result<()> {
-        self.select(sys::ot_editor_selection { start, end, ..Self::colored(sys::OT_EDITOR_SELECT_SET, colors) })
+    /// Selects document cells (one per newline) and, in cell occupancy, includes the grapheme at the larger
+    /// offset unless a line ends there.
+    pub fn select_inclusive(&self, start: u32, end: u32, colors: SelectionColors) -> Result<()> {
+        self.select(sys::ot_editor_selection { start, end, ..colors.editor_selection(sys::OT_EDITOR_SELECT_INCLUSIVE) })
             .map(drop)
+    }
+
+    /// Makes a word or line selection a cell one from its start to its last cell, and puts the cursor on that cell.
+    pub fn convert_selection_to_cell(&self) -> Result<bool> {
+        self.select(sys::ot_editor_selection { operation: sys::OT_EDITOR_SELECT_CELL, ..Default::default() })
     }
 
     pub fn clear_selection(&self) -> Result<()> {
@@ -607,7 +927,7 @@ impl EditorView {
             focus_x: focus.0,
             focus_y: focus.1,
             update_cursor: u32::from(move_cursor),
-            ..Self::colored(operation, colors)
+            ..colors.editor_selection(operation)
         })
     }
 
@@ -652,7 +972,7 @@ impl EditorView {
             .collect())
     }
 
-    /// Selected document offsets, without preparing lines.
+    /// Half-open bounds in document display cells, counting one per newline, without preparing lines.
     pub fn selection(&self) -> Result<Option<(u32, u32)>> {
         let mut raw = sys::ot_editor_view_info::default();
         let (context, handle) = self.raw();
@@ -660,6 +980,7 @@ impl EditorView {
         Ok((raw.selection_present != 0).then_some((raw.selection_start, raw.selection_end)))
     }
 
+    /// Returns the selected UTF-8 text; string slicing uses byte indices, not selection offsets.
     pub fn selected_text(&self) -> Result<String> {
         let (context, handle) = self.raw();
         read_string("ot_editor_view_get_selected_text", |bytes, capacity, length| unsafe {
@@ -667,6 +988,7 @@ impl EditorView {
         })
     }
 
+    /// Queries logical and viewport cell coordinates. The document offset counts one cell per newline.
     pub fn position(&self, query: EditorQuery) -> Result<EditorPosition> {
         let code = match query {
             EditorQuery::Cursor => sys::OT_EDITOR_POSITION_CURSOR,

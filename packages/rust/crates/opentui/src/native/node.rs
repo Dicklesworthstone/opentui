@@ -46,7 +46,7 @@ impl NodeKind {
 /// Common paint properties. `set_paint` replaces all of them; the defaults match a new native node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Paint {
-    /// Paint order among siblings.
+    /// Paint order among siblings. On a tie, the later child paints above and wins the hit test at the overlap.
     pub z_index: i32,
     /// Multiplies with ancestor opacity, 0 through 1.
     pub opacity: f32,
@@ -408,6 +408,18 @@ impl Node {
             virtual_line_count: raw.virtual_line_count,
             width_max: raw.width_cols_max,
         })
+    }
+
+    /// The byte, in the text last set, where the grapheme the latest finished frame drew at screen cell `(x, y)`
+    /// starts. `None` when that frame did not paint the node, when its text or view options changed since, and on
+    /// cells without a whole grapheme, such as padding or a wide character an edge cuts. It does not check what
+    /// covers the cell; [`Session::hit_test`](super::Session::hit_test) does.
+    pub fn text_byte_at(&self, x: i32, y: i32) -> Result<Option<u32>> {
+        let mut byte = 0;
+        check("ot_scene_get_text_byte_at", unsafe {
+            sys::ot_scene_get_text_byte_at(self.context(), &self.handle, x, y, &mut byte)
+        })?;
+        Ok((byte != u32::MAX).then_some(byte))
     }
 
     /// Stores this node as the scene's focus target, or clears it if it is the target.

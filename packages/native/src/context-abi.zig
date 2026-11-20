@@ -8,6 +8,7 @@ const ObjectHandle = @import("context-handles.zig").Handle;
 const ObjectKind = @import("context-handles.zig").Kind;
 const scene = @import("scene.zig");
 const scene_record = @import("scene-record.zig");
+const highlight_layers = @import("highlight-layers.zig");
 
 const editor_transport = @import("context-editor-abi.zig");
 const text_transport = @import("context-text-abi.zig");
@@ -19,6 +20,7 @@ const image_transport = @import("context-image-abi.zig");
 const video_transport = @import("context-video-abi.zig");
 const audio_transport = @import("context-audio-abi.zig");
 const clipboard_transport = @import("clipboard-abi.zig");
+const markdown_transport = @import("context-markdown-abi.zig");
 const utils = @import("utils.zig");
 
 /// Each C Context owns a private allocator. Test builds back it with
@@ -199,17 +201,58 @@ pub fn ot_context_get_link_url(
     return c.OT_OK;
 }
 
+comptime {
+    std.debug.assert(highlight_layers.group_set_name_count_max == c.OT_GROUP_SET_NAME_COUNT_MAX);
+    std.debug.assert(highlight_layers.group_set_name_byte_count_max == c.OT_GROUP_SET_NAME_BYTE_COUNT_MAX);
+}
+
+pub fn ot_context_group_set(
+    context: ?*ContextHandle,
+    names: ?[*]const u8,
+    name_byte_count: u32,
+    name_end_bytes: ?[*]const u32,
+    name_count: u32,
+    out: ?*u32,
+) callconv(.c) c.ot_status {
+    const status = sessionContextStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    if (out == null or names == null or name_end_bytes == null) return sessionError(owner, error.InvalidOptions);
+    if (name_count > highlight_layers.group_set_name_count_max) return sessionError(owner, error.GroupSetLimit);
+    var slices: [highlight_layers.group_set_name_count_max][]const u8 = undefined;
+    var start: u32 = 0;
+    for (name_end_bytes.?[0..name_count], slices[0..name_count]) |end, *slice| {
+        if (end < start or end > name_byte_count) return sessionError(owner, error.InvalidOptions);
+        slice.* = names.?[start..end];
+        start = end;
+    }
+    if (start != name_byte_count) return sessionError(owner, error.InvalidOptions);
+    out.?.* = owner.core.groupSet(slices[0..name_count]) catch |err| return sessionError(owner, err);
+    return c.OT_OK;
+}
+
 pub fn ot_edit_buffer_create(context: ?*ContextHandle, options_ptr: ?*const c.ot_edit_buffer_options, out_ptr: ?*c.ot_handle) callconv(.c) c.ot_status {
     const status = sessionContextStatus(context);
     if (status != c.OT_OK) return status;
     const owner = context.?;
     const options = options_ptr orelse return sessionError(owner, error.InvalidOptions);
     const out = out_ptr orelse return sessionError(owner, error.InvalidOptions);
-    if (options.struct_size != @sizeOf(c.ot_edit_buffer_options) or options.reserved != 0) return sessionError(owner, error.InvalidOptions);
+    if (options.struct_size != @sizeOf(c.ot_edit_buffer_options)) return sessionError(owner, error.InvalidOptions);
     if (options.abi_version != c.OT_CONTEXT_ABI_VERSION) return sessionError(owner, error.UnsupportedVersion);
     const width_method = widthMethodFromC(options.width_method) catch |err| return sessionError(owner, err);
-    out.* = handleToC(owner.core.createEditBuffer(width_method) catch |err| return sessionError(owner, err));
+    const follow = followSessionWidth(options.*) catch |err| return sessionError(owner, err);
+    const handle = owner.core.createEditBuffer(width_method) catch |err| return sessionError(owner, err);
+    (owner.core.raw().getEditBuffer(handle) catch unreachable).follow_width = follow;
+    out.* = handleToC(handle);
     return c.OT_OK;
+}
+
+/// Whether creation options ask a buffer to follow its session's width method.
+pub fn followSessionWidth(options: c.ot_edit_buffer_options) error{InvalidOptions}!bool {
+    if (options.flags & ~c.OT_EDIT_BUFFER_FOLLOW_SESSION_WIDTH != 0) return error.InvalidOptions;
+    const follow = options.flags != 0;
+    if (follow and options.width_method == c.OT_WIDTH_METHOD_NO_ZWJ) return error.InvalidOptions;
+    return follow;
 }
 
 pub fn ot_edit_buffer_destroy(context: ?*ContextHandle, edit_ptr: ?*const c.ot_handle) callconv(.c) c.ot_status {
@@ -1183,7 +1226,7 @@ pub fn ot_session_setup_terminal(
     const known_flags: u32 = c.OT_TERMINAL_ALTERNATE_SCREEN | c.OT_TERMINAL_MOUSE |
         c.OT_TERMINAL_MOUSE_MOVEMENT | c.OT_TERMINAL_CLEAR_ON_CLOSE | c.OT_TERMINAL_REPLY_SENTINEL | sync_flags |
         c.OT_TERMINAL_HOST_MULTIPLEXER;
-    if (options.flags & ~known_flags != 0 or options.kitty_keyboard_flags > 31) {
+    if (options.flags & ~known_flags != 0 or options.kitty_keyboard_flags & ~@as(u32, c.OT_KITTY_KEYBOARD_ALL) != 0) {
         return sessionError(owner, error.InvalidOptions);
     }
     owner.core.setupSessionTerminal(handleFromC(id.*), .{
@@ -1321,7 +1364,7 @@ pub fn ot_session_control(
         options.kind == c.OT_CONTROL_PROGRAM_STATUS;
     const argument_max: u32 = switch (options.kind) {
         c.OT_CONTROL_MOUSE => @backingInt(@import("session.zig").MouseMode.motion),
-        c.OT_CONTROL_KITTY_KEYBOARD_FLAGS => 31,
+        c.OT_CONTROL_KITTY_KEYBOARD_FLAGS => c.OT_KITTY_KEYBOARD_ALL,
         c.OT_CONTROL_QUERY_PIXEL_RESOLUTION, c.OT_CONTROL_QUERY_THEME_COLORS, c.OT_CONTROL_PALETTE_QUERY => 1,
         else => 0,
     };
@@ -1342,7 +1385,7 @@ pub fn ot_session_control(
             if (bytes.len != @sizeOf(c.ot_session_cursor_update)) return sessionError(owner, error.InvalidOptions);
             var update: c.ot_session_cursor_update = undefined;
             @memcpy(std.mem.asBytes(&update), bytes);
-            if (update.fields & ~@as(u32, c.OT_CURSOR_POSITION | c.OT_CURSOR_STYLE | c.OT_CURSOR_BLINKING | c.OT_CURSOR_COLOR | c.OT_CURSOR_MOUSE_POINTER) != 0 or update.visible > 1 or update.style > 3 or
+            if (update.fields & ~@as(u32, c.OT_CURSOR_POSITION | c.OT_CURSOR_STYLE | c.OT_CURSOR_BLINKING | c.OT_CURSOR_COLOR | c.OT_CURSOR_MOUSE_POINTER) != 0 or update.visible > 1 or update.style > c.OT_CURSOR_STYLE_DEFAULT or
                 update.blinking > 1 or update.mouse_pointer > c.OT_MOUSE_POINTER_MAX) return sessionError(owner, error.InvalidOptions);
             if (update.fields & c.OT_CURSOR_POSITION == 0 and (update.x != 0 or update.y != 0 or update.visible != 0)) {
                 return sessionError(owner, error.InvalidOptions);
@@ -1641,6 +1684,26 @@ pub fn ot_scene_has_measure(context: ?*ContextHandle, node_ptr: ?*const c.ot_han
     const id = node_ptr orelse return sessionError(owner, error.InvalidOptions);
     const out = out_ptr orelse return sessionError(owner, error.InvalidOptions);
     out.* = @intFromBool(owner.core.sceneHasMeasure(handleFromC(id.*)) catch |err| return sessionError(owner, err));
+    return c.OT_OK;
+}
+
+pub fn ot_scene_reaches_hooks(context: ?*ContextHandle, node_ptr: ?*const c.ot_handle, out_ptr: ?*u32) callconv(.c) c.ot_status {
+    const status = sceneReadStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    const id = node_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const out = out_ptr orelse return sessionError(owner, error.InvalidOptions);
+    out.* = @intFromBool(owner.core.sceneReachesHooks(handleFromC(id.*)) catch |err| return sessionError(owner, err));
+    return c.OT_OK;
+}
+
+pub fn ot_scene_painted(context: ?*ContextHandle, node_ptr: ?*const c.ot_handle, out_ptr: ?*u32) callconv(.c) c.ot_status {
+    const status = sceneReadStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    const id = node_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const out = out_ptr orelse return sessionError(owner, error.InvalidOptions);
+    out.* = @intFromBool(owner.core.scenePainted(handleFromC(id.*)) catch |err| return sessionError(owner, err));
     return c.OT_OK;
 }
 
@@ -1998,7 +2061,7 @@ pub fn ot_scene_get_layout(context: ?*ContextHandle, node_ptr: ?*const c.ot_hand
     const result = (switch (observation) {
         c.OT_LAYOUT_PUBLIC => owner.core.sceneGetLayout(handleFromC(id.*), false),
         c.OT_LAYOUT_YOGA => owner.core.sceneGetLayout(handleFromC(id.*), true),
-        c.OT_LAYOUT_PAINT => owner.core.sceneGetPaintLayout(handleFromC(id.*)),
+        c.OT_LAYOUT_PAINT, c.OT_LAYOUT_CONTENT => owner.core.sceneGetPaintLayout(handleFromC(id.*), observation == c.OT_LAYOUT_CONTENT),
         else => return sessionError(owner, error.InvalidOptions),
     }) catch |err| return sessionError(owner, err);
     out.* = sceneLayoutToC(result);
@@ -2286,6 +2349,17 @@ pub fn ot_scene_get_text_lines(context: ?*ContextHandle, node_ptr: ?*const c.ot_
     return c.OT_OK;
 }
 
+pub fn ot_scene_get_text_byte_at(context: ?*ContextHandle, node_ptr: ?*const c.ot_handle, x: i32, y: i32, out_byte_ptr: ?*u32) callconv(.c) c.ot_status {
+    const status = sceneReadStatus(context);
+    if (status != c.OT_OK) return status;
+    const owner = context.?;
+    const node = node_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const out = out_byte_ptr orelse return sessionError(owner, error.InvalidOptions);
+    const byte = owner.core.sceneGetTextByteAt(handleFromC(node.*), x, y) catch |err| return sessionError(owner, err);
+    out.* = byte orelse std.math.maxInt(u32);
+    return c.OT_OK;
+}
+
 pub fn ot_scene_set_hooks(context: ?*ContextHandle, node_ptr: ?*const c.ot_handle, options_ptr: ?*const c.ot_scene_hooks) callconv(.c) c.ot_status {
     const status = sessionContextStatus(context);
     if (status != c.OT_OK) return status;
@@ -2369,7 +2443,7 @@ pub fn ot_scene_frame_step_with_geometry(context: ?*ContextHandle, session_ptr: 
     if (result.kind == c.OT_SCENE_FRAME_DONE or result.kind == c.OT_SCENE_FRAME_RECORD) return c.OT_OK;
     const node = result.node;
     // Public observations advance during refresh, after the ticket is created.
-    if (owner.core.sceneGetPaintLayout(node)) |layout| {
+    if (owner.core.sceneGetPaintLayout(node, false)) |layout| {
         geometry.paint = sceneLayoutToC(layout);
         geometry.flags |= c.OT_SCENE_GEOMETRY_PAINT;
     } else |_| {}
@@ -2494,13 +2568,16 @@ pub fn ot_scene_paint(context: ?*ContextHandle, session_ptr: ?*const c.ot_handle
 }
 
 pub fn ot_scene_hit_test(context: ?*ContextHandle, session_ptr: ?*const c.ot_handle, x: i32, y: i32, out_ptr: ?*u32) callconv(.c) c.ot_status {
+    return ot_scene_hit_test_excluding(context, session_ptr, x, y, 0, out_ptr);
+}
+
+pub fn ot_scene_hit_test_excluding(context: ?*ContextHandle, session_ptr: ?*const c.ot_handle, x: i32, y: i32, excluded_num: u32, out_ptr: ?*u32) callconv(.c) c.ot_status {
     const status = sessionContextStatus(context);
     if (status != c.OT_OK) return status;
     const owner = context.?;
     const id = session_ptr orelse return sessionError(owner, error.InvalidOptions);
     const out = out_ptr orelse return sessionError(owner, error.InvalidOptions);
-    const result = owner.core.sceneHitTest(handleFromC(id.*), x, y) catch |err| return sessionError(owner, err);
-    out.* = result;
+    out.* = owner.core.sceneHitTestExcluding(handleFromC(id.*), x, y, excluded_num) catch |err| return sessionError(owner, err);
     return c.OT_OK;
 }
 
@@ -2608,7 +2685,7 @@ pub fn sessionError(owner: *ContextHandle, err: anyerror) c.ot_status {
         error.Busy, error.PresentationPending, error.SplitRenderPending => c.OT_OUTPUT_BUSY,
         error.StaleRequest, error.InvalidTicket => c.OT_STALE_OUTPUT,
         error.SessionFailed, error.PresentationFailed => c.OT_OUTPUT_FAILED,
-        error.ObjectLimit, error.RequestLimit, error.TrackerLimit => c.OT_OBJECT_LIMIT,
+        error.ObjectLimit, error.RequestLimit, error.TrackerLimit, error.LayerLimit, error.GroupSetLimit => c.OT_OBJECT_LIMIT,
         error.RendererAlreadyAttached => c.OT_RENDERER_ATTACHED,
         error.RendererNotAttached => c.OT_RENDERER_NOT_ATTACHED,
         error.InvalidTerminalState, error.TerminalInactive => c.OT_INVALID_PHASE,
@@ -2972,6 +3049,14 @@ test "Context buffer ABI rejects invalid arguments without writing outputs" {
     var unicode = kept;
     try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, unicode_transport.ot_unicode_create(context, "a", 1, c.OT_WIDTH_METHOD_UNICODE_WIDE + 1, &unicode));
     try std.testing.expectEqual(kept, unicode);
+    // Unknown flags, and following a session with a method no session uses, are rejected.
+    for ([_][2]u32{ .{ c.OT_WIDTH_METHOD_UNICODE, 2 }, .{ c.OT_WIDTH_METHOD_NO_ZWJ, 1 }, .{ c.OT_WIDTH_METHOD_UNICODE, 0 }, .{ c.OT_WIDTH_METHOD_WCWIDTH, 1 } }) |row| {
+        const edit_options: c.ot_edit_buffer_options = .{ .struct_size = @sizeOf(c.ot_edit_buffer_options), .abi_version = c.OT_CONTEXT_ABI_VERSION, .width_method = row[0], .flags = row[1] };
+        const valid_flags = row[1] < 2 and row[0] != c.OT_WIDTH_METHOD_NO_ZWJ;
+        try std.testing.expectEqual(if (valid_flags) c.OT_OK else c.OT_INVALID_ARGUMENT, ot_edit_buffer_create(context, &edit_options, &out));
+        if (valid_flags) try std.testing.expectEqual(row[1] == 1, (try core.raw().getEditBuffer(handleFromC(out))).follow_width);
+        if (valid_flags) try std.testing.expectEqual(c.OT_OK, ot_edit_buffer_destroy(context, &out));
+    }
     for (std.enums.values(WidthMethod)) |method| {
         var width_options = valid;
         width_options.width_method = @backingInt(method);
@@ -3130,7 +3215,7 @@ test "Context editor transport commands preserve provider unset and reject reent
     try std.testing.expectEqual(c.OT_OK, editor_transport.ot_edit_buffer_command(handle, &edit, c.OT_EDIT_MOVE_RIGHT, 0));
     try std.testing.expectEqual(1, (try core.raw().getEditBuffer(handleFromC(edit))).buffer.getPrimaryCursor().col);
     try std.testing.expect(!try core.sceneHasMeasure(node));
-    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, editor_transport.ot_edit_buffer_command(handle, &edit, c.OT_EDIT_MOVE_RIGHT, 1));
+    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, editor_transport.ot_edit_buffer_command(handle, &edit, c.OT_EDIT_MOVE_RIGHT, c.OT_EDIT_ATOMIC + 1));
     core.mutating = true;
     try std.testing.expectEqual(c.OT_CONTEXT_BUSY, editor_transport.ot_edit_buffer_command(handle, &edit, c.OT_EDIT_DELETE_FORWARD, 0));
     core.mutating = false;
@@ -3683,6 +3768,7 @@ fn expectSceneWrapperRules(comptime wrapper: anytype, comptime read: bool, conte
             } else args[index] = switch (@typeInfo(param.?)) {
                 .optional => null,
                 .float => @floatFromInt(fill),
+                .int => @intCast(fill),
                 else => fill,
             };
         }
@@ -3729,8 +3815,9 @@ test "Scene ABI wrappers share admission handle and record rules and keep output
         try expectSceneWrapperRules(wrapper, false, handle, &nodes, 0);
     }
     inline for (.{
-        ot_scene_has_measure,       ot_scene_get_style, ot_scene_get_layout,    ot_scene_get_text_selection,
-        ot_scene_get_selected_text, ot_scene_get_text,  ot_scene_get_text_info, ot_scene_get_text_lines,
+        ot_scene_has_measure,       ot_scene_get_style,        ot_scene_get_layout,    ot_scene_get_text_selection,
+        ot_scene_get_selected_text, ot_scene_get_text,         ot_scene_get_text_info, ot_scene_get_text_lines,
+        ot_scene_reaches_hooks,     ot_scene_get_text_byte_at, ot_scene_painted,
     }) |wrapper| {
         try expectSceneWrapperRules(wrapper, true, handle, &nodes, 0);
     }
@@ -4220,7 +4307,7 @@ test "Scene ABI records preserve rejected outputs and read real Session metadata
     try std.testing.expectEqual(c.OT_OK, ot_scene_get_layout(handle, &box, 0, &layout));
     try std.testing.expectEqual(@as(f32, 3), layout.width);
     const before_selector = layout;
-    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_scene_get_layout(handle, &box, 3, &layout));
+    try std.testing.expectEqual(c.OT_INVALID_ARGUMENT, ot_scene_get_layout(handle, &box, c.OT_LAYOUT_CONTENT + 1, &layout));
     try std.testing.expectEqualDeep(before_selector, layout);
     try owner.core.sceneSetStyle(handleFromC(box), 4, 0, 0, 1, 0, 1);
     try std.testing.expectEqual(c.OT_OK, ot_scene_frame_cancel(handle, &session_c, frame.frame_id));
@@ -4467,7 +4554,7 @@ test "Scene text selection ABI validates records pointers and readonly outputs" 
     for (0..6) |case| {
         var invalid = options;
         switch (case) {
-            0 => invalid.operation = 3,
+            0 => invalid.operation = c.OT_SCENE_TEXT_SELECTION_COLORS + 1,
             1 => invalid.behavior = 3,
             2 => invalid.flags = 4,
             3 => invalid.background[0] = 1,
@@ -5150,6 +5237,7 @@ const abi_modules = .{
     video_transport,
     audio_transport,
     clipboard_transport,
+    markdown_transport,
 };
 
 // The library opts into exports. Each export must match its opentui.h prototype.
@@ -5241,4 +5329,9 @@ comptime {
             @compileError("ot_scene_text_line differs from scene.TextLine: " ++ name);
     }
     if (@import("link.zig").MAX_URL_LENGTH != 512) @compileError("opentui.h documents 512-byte URLs");
+    const session = @import("session.zig");
+    if (session.program_status_id_bytes_max != 128 or session.program_status_id_segment_bytes_max != 32 or
+        session.program_status_id_segments_max != 8 or session.program_status_app_bytes_max != 32 or
+        session.program_status_title_bytes_max != 192 or session.program_status_message_bytes_max != 2048)
+        @compileError("opentui.h and program-status.mdx document the program status limits");
 }

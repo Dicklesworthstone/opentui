@@ -1,10 +1,13 @@
 import {
+  NativeEditAtomic,
   NativeEditCommand,
   NativeEditPositionQuery,
   NativeEditorStyleMask,
   NativeEditHighlightOperation,
+  NativeEditMarkOperation,
   resolveRenderLib,
   type LogicalCursor,
+  type NativeEditMark,
   type RenderLib,
   type ContextEditBufferHandle,
   type NativeEditorStyle,
@@ -45,7 +48,13 @@ export class EditBuffer extends EventEmitter {
     })
   }
 
-  static create(widthMethod: WidthMethod, source: NativeResourceOwner): EditBuffer {
+  /**
+   * With `followSessionWidth`, the buffer measures with the width method of the renderer whose scene shows it,
+   * including when the terminal's replies change that method; the cursor, selections, marks and undo points keep
+   * their text. Otherwise it keeps `widthMethod`. One renderer at a time may show such a buffer: showing it in another
+   * one throws until the first stops showing it (`NativeError` with `status === NativeStatus.WrongSession`).
+   */
+  static create(widthMethod: WidthMethod, source: NativeResourceOwner, followSessionWidth = false): EditBuffer {
     const owner = source?.resourceContext
     if (!owner)
       throw new Error(
@@ -53,13 +62,17 @@ export class EditBuffer extends EventEmitter {
       )
     owner.assertAlive()
     const lib = owner.renderLib
-    const handle = lib.createContextEditBuffer(owner.context, { widthMethod })
+    const handle = lib.createContextEditBuffer(owner.context, { widthMethod, followSessionWidth })
     try {
       return new EditBuffer(lib, handle, owner)
     } catch (error) {
       lib.destroyContextEditBuffer(owner.context, handle)
       throw error
     }
+  }
+
+  public get isDestroyed(): boolean {
+    return this._destroyed
   }
 
   private guard(): void {
@@ -105,9 +118,13 @@ export class EditBuffer extends EventEmitter {
     this.lib.contextEditBufferSetDefaults(this.native.handle.context, this.native.handle, mask, style)
   }
 
+  /** @internal Called when text replacement drops the marks with the history, or on destroy: nothing can restore them. */
+  public _onHistoryReset?: () => void
+
   private setNativeText(text: string, preserveHistory = false): void {
     const textBytes = this.lib.encoder.encode(text)
     this.lib.contextEditBufferSetText(this.native.handle.context, this.native.handle, textBytes, preserveHistory)
+    if (!preserveHistory) this._onHistoryReset?.()
   }
 
   /**
@@ -143,17 +160,20 @@ export class EditBuffer extends EventEmitter {
     return this.lib.contextEditBufferGetInfo(this.native.handle.context, this.native.handle).lineCount
   }
 
+  /** Sets the fixed width of each tab in display cells. */
   public setTabWidth(width: number): void {
     this.runMutation(() => {
       this.lib.contextEditBufferSetTabWidth(this.native.handle.context, this.native.handle, width)
     })
   }
 
+  /** Returns the fixed width of each tab in display cells. */
   public getTabWidth(): number {
     this.guard()
     return this.lib.contextEditBufferGetInfo(this.native.handle.context, this.native.handle).tabWidth
   }
 
+  /** Returns the buffer text with LF line breaks. JavaScript indexes this string in UTF-16 code units. */
   public getText(): string {
     this.guard()
     return this.lib.contextEditBufferGetText(this.native.handle.context, this.native.handle)
@@ -177,14 +197,22 @@ export class EditBuffer extends EventEmitter {
     )
   }
 
+  /** @internal Set by extmarks controllers: whether the cursor rules around virtual extmarks apply now. */
+  public _atomic?: () => boolean
+
+  private rules(): number {
+    return this._atomic?.() ? NativeEditAtomic : 0
+  }
+
   public deleteChar(): void {
-    this.command(NativeEditCommand.DeleteForward)
+    this.command(NativeEditCommand.DeleteForward, this.rules())
   }
 
   public deleteCharBackward(): void {
-    this.command(NativeEditCommand.Backspace)
+    this.command(NativeEditCommand.Backspace, this.rules())
   }
 
+  /** Deletes a half-open range between (zero-based logical line, display-cell column) pairs. */
   public deleteRange(startLine: number, startCol: number, endLine: number, endCol: number): void {
     this.guard()
     return this.lib.contextEditBufferDeleteRange(
@@ -205,76 +233,98 @@ export class EditBuffer extends EventEmitter {
     this.command(NativeEditCommand.DeleteLine)
   }
 
+  /** Moves to the previous cursor stop, not necessarily one display cell or UTF-16 code unit. */
   public moveCursorLeft(): void {
-    this.command(NativeEditCommand.MoveLeft)
+    this.command(NativeEditCommand.MoveLeft, this.rules())
   }
 
+  /** Moves to the next cursor stop, not necessarily one display cell or UTF-16 code unit. */
   public moveCursorRight(): void {
-    this.command(NativeEditCommand.MoveRight)
+    this.command(NativeEditCommand.MoveRight, this.rules())
   }
 
+  /** Moves up one logical line using the desired display-cell column. */
   public moveCursorUp(): void {
     this.command(NativeEditCommand.MoveUp)
   }
 
+  /** Moves down one logical line using the desired display-cell column. */
   public moveCursorDown(): void {
     this.command(NativeEditCommand.MoveDown)
   }
 
+  /** Moves to a zero-based logical line. */
   public gotoLine(line: number): void {
     this.command(NativeEditCommand.GotoLine, line)
   }
 
+  /** Sets the cursor by zero-based logical line and display-cell column. */
   public setCursor(line: number, col: number): void {
     this.guard()
     return this.lib.contextEditBufferSetCursor(this.native.handle.context, this.native.handle, line, col)
   }
 
+  /** Sets the cursor by zero-based logical line and display-cell column. */
   public setCursorToLineCol(line: number, col: number): void {
     this.guard()
     return this.lib.contextEditBufferSetCursor(this.native.handle.context, this.native.handle, line, col)
   }
 
+  /** Sets the cursor in display cells from the document start, counting each newline as one cell. Offsets past the end clamp to the end. */
   public setCursorByOffset(offset: number): void {
-    this.command(NativeEditCommand.CursorOffset, offset)
+    this.command(this.rules() ? NativeEditCommand.CursorOffsetAtomic : NativeEditCommand.CursorOffset, offset)
   }
 
+  /** @internal Moves a cursor inside virtual extmarks to their outer edge: the end (> 0), the start (< 0) or nearer. */
+  public _keepOutside(direction: number): void {
+    this.command(NativeEditCommand.KeepOutside, direction > 0 ? 1 : direction < 0 ? 2 : 0)
+  }
+
+  /** Returns the logical line, display-cell column, and document cell offset (one cell per newline). */
   public getCursorPosition(): LogicalCursor {
     this.guard()
     return this.lib.contextEditBufferGetInfo(this.native.handle.context, this.native.handle).cursor
   }
 
+  /** Returns the next word boundary in logical line and cell coordinates. */
   public getNextWordBoundary(): LogicalCursor {
     return this.position(NativeEditPositionQuery.NextWord)!
   }
 
+  /** Returns the previous word boundary in logical line and cell coordinates. */
   public getPrevWordBoundary(): LogicalCursor {
     return this.position(NativeEditPositionQuery.PrevWord)!
   }
 
+  /** Returns the logical line end in display cells. */
   public getEOL(): LogicalCursor {
     return this.position(NativeEditPositionQuery.Eol)!
   }
 
-  /** @internal Extmarks read the end without moving the cursor. */
-  public _getEOF(): LogicalCursor {
-    return this.position(NativeEditPositionQuery.End)!
+  /** @internal Extmarks are stored in the native buffer, which moves them with edits, undo and redo. */
+  public _mark(operation: NativeEditMarkOperation, mark?: Partial<NativeEditMark>): number {
+    this.guard()
+    return this.lib.contextEditBufferMark(this.native.handle.context, this.native.handle, operation, mark)
   }
 
-  /** @internal Extmarks read where Left would move without moving the cursor. */
-  public _getPrevCharBoundary(): LogicalCursor {
-    return this.position(NativeEditPositionQuery.PrevChar)!
+  /** @internal */
+  public _getMarks(id?: number, kind?: number): NativeEditMark[] {
+    this.guard()
+    return this.lib.contextEditBufferGetMarks(this.native.handle.context, this.native.handle, id, kind)
   }
 
+  /** Maps document cells (one per newline) to a logical row and cell column, not a string index. */
   public offsetToPosition(offset: number): { row: number; col: number } | null {
     const result = this.position(NativeEditPositionQuery.Offset, offset)
     return result && { row: result.row, col: result.col }
   }
 
+  /** Maps a logical row and cell column to document cells, counting one cell per newline. */
   public positionToOffset(row: number, col: number): number {
     return this.position(NativeEditPositionQuery.Coords, row, col)?.offset ?? 0
   }
 
+  /** Returns a logical line's start in document cells, counting one cell per newline. */
   public getLineStartOffset(row: number): number {
     return this.position(NativeEditPositionQuery.LineStart, row)?.offset ?? 0
   }
@@ -293,6 +343,19 @@ export class EditBuffer extends EventEmitter {
     )
   }
 
+  /** Converts a UTF-16 index in getText() to document cells (one per newline). Rounds down within a grapheme; clamps at EOF. */
+  public stringIndexToCellOffset(index: number): number {
+    this.guard()
+    return this.lib.contextEditBufferConvertOffset(this.native.handle.context, this.native.handle, index, true)
+  }
+
+  /** Converts document cells to a UTF-16 index in getText(). Rounds down within a grapheme, past zero-width text at a tie, and clamps at EOF. */
+  public cellOffsetToStringIndex(offset: number): number {
+    this.guard()
+    return this.lib.contextEditBufferConvertOffset(this.native.handle.context, this.native.handle, offset, false)
+  }
+
+  /** Reads [startOffset, endOffset) in document display cells, counting one cell per newline. */
   public getTextRange(startOffset: number, endOffset: number): string {
     this.guard()
     if (startOffset >= endOffset) return ""
@@ -307,6 +370,7 @@ export class EditBuffer extends EventEmitter {
     )
   }
 
+  /** Reads a half-open range between (zero-based logical row, display-cell column) pairs. */
   public getTextRangeByCoords(startRow: number, startCol: number, endRow: number, endCol: number): string {
     this.guard()
     return this.lib.contextEditBufferGetRange(
@@ -381,10 +445,12 @@ export class EditBuffer extends EventEmitter {
     return this._syntaxStyle ?? null
   }
 
+  /** Highlights a range in display cells relative to the logical line. */
   public addHighlight(lineIdx: number, highlight: Highlight): void {
     this.highlight(NativeEditHighlightOperation.AddLine, lineIdx, highlight)
   }
 
+  /** Highlights a range in document display cells excluding newlines, not UTF-16 indices. */
   public addHighlightByCharRange(highlight: Highlight): void {
     this.highlight(NativeEditHighlightOperation.AddRange, 0, highlight)
   }
@@ -418,6 +484,7 @@ export class EditBuffer extends EventEmitter {
           this.lib.destroyContextEditBuffer(this.native.handle.context, this.native.handle),
         )
       this._destroyed = true
+      this._onHistoryReset?.()
       this.unsubscribe?.()
       this.unsubscribe = undefined
       this.removeAllListeners()

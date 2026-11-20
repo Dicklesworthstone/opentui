@@ -18,11 +18,9 @@ on:
       - "v*"
       - "*snapshot*"
 
+# Read-only by default, so a dependency's install script cannot push. A job that writes asks for it.
 permissions:
-  contents: write
-
-env:
-  NODE_VERSION: 26.13.0
+  contents: read
 
 jobs:
   # Decides whether this push is a release, and extracts the version and the dry-run flag.
@@ -30,6 +28,9 @@ jobs:
     name: Prepare Release
     if: ${{ !contains(github.ref_name, 'snapshot') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      # Pushes the release tag.
+      contents: write
     outputs:
       release: ${{ steps.extract.outputs.release }}
       version: ${{ steps.extract.outputs.version }}
@@ -69,7 +70,7 @@ jobs:
         if: steps.versions.outputs.current != steps.versions.outputs.previous
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version-file: package.json
 
       - name: Extract version and dry-run flag
         id: extract
@@ -187,7 +188,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Check version matches package.json files
         run: |
@@ -212,8 +213,8 @@ jobs:
             fi
           done
 
-          # The Rust crates are not published, but prepare-release gives them the same version.
-          RUST_VERSIONS=$(sed -n 's/^version = "\(.*\)"$/\1/p' packages/rust/Cargo.toml; grep -A1 -E '^name = "opentui(-ssh|-sys)?"$' packages/rust/Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          # prepare-release gives the Rust crates the same version.
+          RUST_VERSIONS=$(sed -n 's/^version = "\(.*\)"$/\1/p' packages/rust/Cargo.toml; grep -A1 -E '^name = "opentui(-sys|-ssh)?"$' packages/rust/Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
           if [ "$(echo $RUST_VERSIONS)" != "$TAG_VERSION $TAG_VERSION $TAG_VERSION $TAG_VERSION" ]; then
             echo "❌ packages/rust versions ($(echo $RUST_VERSIONS)) do not match tag version ($TAG_VERSION)"
             FAILED=true
@@ -231,7 +232,65 @@ jobs:
           echo ""
           echo "✅ All package versions match tag version: $TAG_VERSION"
 
-  # Build native libraries and packages
+  # The heavy CI runs after merge. A release waits for the run of its commit instead of repeating it: a release from
+  # main shares its push with Build Core and Build Packages, and a vX.Y.Z tag points at a commit on main that already
+  # passed. Build Native runs beside it, but nothing is signed or published until both runs passed, so a broken
+  # commit never reaches npm or a GitHub release.
+  ci-gate:
+    name: Verify CI on the release commit
+    if: ${{ needs.prepare.outputs.release == 'true' }}
+    needs: prepare
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Skip the check for a dry run
+        if: ${{ needs.prepare.outputs.isDryRun == 'true' }}
+        run: echo "A dry run publishes nothing, so it does not wait for CI"
+
+      - name: Wait for the heavy CI of this commit
+        if: ${{ needs.prepare.outputs.isDryRun != 'true' }}
+        run: |
+          set -eu
+          for workflow in build-core.yml build-packages.yml; do
+            echo "Waiting for $workflow on $SHA"
+            start=$SECONDS
+            deadline=$((SECONDS + 2400))
+            while :; do
+              # A tag push has no head_branch, so this selects the run of the branch push that carried the commit.
+              line=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?head_sha=$SHA&per_page=20" \
+                --jq '[.workflow_runs[] | select(.event == "push" and .head_branch != null)] | first | if . == null then "none" else "\(.status) \(.conclusion)" end')
+              case "$line" in
+                "completed success")
+                  echo "$workflow passed"
+                  break
+                  ;;
+                "completed "*)
+                  echo "::error::$workflow finished $line for $SHA"
+                  exit 1
+                  ;;
+                "none")
+                  # A tag can point at a commit that never had CI, such as one from before this workflow existed.
+                  if [ "$((SECONDS - start))" -ge 120 ]; then
+                    echo "::error::$workflow has no push run for $SHA"
+                    exit 1
+                  fi
+                  ;;
+              esac
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::$workflow did not pass for $SHA in time"
+                exit 1
+              fi
+              sleep 20
+            done
+          done
+
+  # Build native libraries and packages. Their artifacts stay in this run, so the build does not wait for ci-gate.
   build-native:
     name: Build Native
     if: ${{ needs.prepare.outputs.release == 'true' }}
@@ -265,12 +324,12 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version-file: package.json
 
       - name: Extract and test npm packages
         uses: ./.github/actions/extract-npm-packages
@@ -282,7 +341,7 @@ jobs:
   npm-publish:
     name: NPM Publish
     if: ${{ needs.prepare.outputs.release == 'true' }}
-    needs: [prepare, sign-windows-artifacts, smoke-test]
+    needs: [prepare, ci-gate, sign-windows-artifacts, smoke-test]
     uses: ./.github/workflows/npm-latest-release.yml
     permissions:
       contents: read
@@ -294,10 +353,89 @@ jobs:
       smokeTest: false
       distTag: ${{ needs.prepare.outputs.distTag }}
 
+  # Publishes the Rust crates with crates.io trusted publishing: crates.io trades this job's OIDC token for a
+  # 30-minute publish token, so no secret is stored. Each crate's trusted publisher names this file and no
+  # environment. A prerelease publishes too: Cargo never picks one unless a dependency asks for it.
+  crates-publish:
+    name: Crates Publish
+    if: ${{ needs.prepare.outputs.release == 'true' }}
+    needs: [prepare, ci-gate, sign-windows-artifacts, smoke-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: 0
+      DRY_RUN: ${{ needs.prepare.outputs.isDryRun }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # rustup reads rust-toolchain.toml from the working directory.
+      - name: Install the pinned toolchain
+        working-directory: packages/rust
+        run: rustup toolchain install
+
+      # The -sys build script links the library of this release, which the crates' header check matches.
+      - name: Download native binaries artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: native-binaries-${{ needs.prepare.outputs.fullTag }}
+          path: artifacts/native
+
+      - name: Extract the Linux x64 library
+        run: |
+          unzip -q artifacts/native/native-linux-x64.zip -d "$RUNNER_TEMP"
+          echo "OPENTUI_LIB_DIR=$RUNNER_TEMP/native-linux-x64" >> "$GITHUB_ENV"
+
+      # Packages and builds each crate from its .crate before the token exists, so the publish below starts warm.
+      - name: Verify the crates
+        working-directory: packages/rust
+        run: cargo publish --dry-run --locked --workspace
+
+      - name: Authenticate with crates.io
+        id: auth
+        if: env.DRY_RUN != 'true'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      # A rerun after a partial publish skips the versions crates.io already has: cargo fails on them. The crates
+      # require each other at the exact version, and cargo uploads them in dependency order.
+      - name: Publish the crates
+        if: env.DRY_RUN != 'true'
+        working-directory: packages/rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          exclude=()
+          for crate in opentui-sys opentui opentui-ssh; do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' -A 'opentui-release (github.com/anomalyco/opentui)' \
+              "https://crates.io/api/v1/crates/$crate/$VERSION")
+            case "$status" in
+              200)
+                echo "$crate@$VERSION is already on crates.io; skipping"
+                exclude+=(--exclude "$crate")
+                ;;
+              404) ;;
+              *)
+                echo "::error::crates.io returned $status for $crate@$VERSION"
+                exit 1
+                ;;
+            esac
+          done
+          if [ "${#exclude[@]}" -eq 6 ]; then
+            echo "Every crate is already on crates.io"
+            exit 0
+          fi
+          cargo publish --locked --workspace "${exclude[@]}"
+
+  # Signing waits for ci-gate, and so does every job after it. npm-publish and github-release name it too.
   sign-windows-artifacts:
     name: Sign Windows DLL Artifacts
     if: ${{ needs.prepare.outputs.release == 'true' }}
-    needs: [prepare, build-native]
+    needs: [prepare, ci-gate, build-native]
     runs-on: blacksmith-8vcpu-windows-2025
     permissions:
       id-token: write
@@ -515,12 +653,12 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: .node-version
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version-file: package.json
 
       # The packages that npm-publish published, to compare npm's contents with.
       - name: Extract npm packages
@@ -546,7 +684,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version-file: package.json
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -586,8 +724,11 @@ jobs:
   github-release:
     name: Create GitHub Release
     if: ${{ needs.prepare.outputs.release == 'true' }}
-    needs: [prepare, build-examples, npm-publish]
+    needs: [prepare, ci-gate, build-examples, npm-publish]
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      # Creates the release and uploads its assets.
+      contents: write
 
     steps:
       - name: Checkout code
@@ -696,7 +837,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version-file: package.json
 
       # The release commit carries the release notes (packages/web/src/content/docs/releases). They open the
       # GitHub release, and GitHub appends its list of pull requests. Without notes the file is empty.

@@ -3,7 +3,8 @@ import { StyledText } from "../lib/styled-text.js"
 import { SyntaxStyle } from "../syntax-style.js"
 import { getTreeSitterClient, TreeSitterClient } from "../lib/tree-sitter/index.js"
 import { TextBufferRenderable, type TextBufferOptions } from "./TextBufferRenderable.js"
-import type { NativeRenderableIntegration } from "../Renderable.js"
+import { ScrollBoxRenderable } from "./ScrollBox.js"
+import type { NativeRenderableIntegration, Renderable } from "../Renderable.js"
 import type { OptimizedBuffer } from "../buffer.js"
 import type { SimpleHighlight } from "../lib/tree-sitter/types.js"
 import type { TextChunk } from "../text-buffer.js"
@@ -46,6 +47,10 @@ export interface CodeOptions extends TextBufferOptions {
 
 type ConcealLineRange = [start: number, end: number]
 
+const PREVIEW = -2
+// The layer a streamed fence's syntax goes in, as in Rust's editor.
+const SYNTAX_LAYER = 1
+
 export class CodeRenderable extends TextBufferRenderable {
   static override readonly nativeIntegration: NativeRenderableIntegration = {
     ...TextBufferRenderable.nativeIntegration,
@@ -66,7 +71,10 @@ export class CodeRenderable extends TextBufferRenderable {
   private _isHighlighting: boolean = false
   private _treeSitterClient: TreeSitterClient
   private _highlightsDirty: boolean = false
-  private _highlightSnapshotId: number = 0
+  // Every input change makes a new version. The buffer holds the highlight of `_shownVersion`, raw text at -1, or a
+  // preview, or what a failure kept, at PREVIEW.
+  private _version: number = 0
+  private _shownVersion: number = -1
   private _highlightLoopActive: boolean = false
   private _highlightPromise?: Promise<void>
   private _highlightRerun: boolean = false
@@ -75,7 +83,7 @@ export class CodeRenderable extends TextBufferRenderable {
   private _shouldRenderTextBuffer: boolean = true
   private _streaming: boolean
   private _initialStyledText?: StyledText
-  private _hadInitialContent: boolean = false
+  private _checkPainted = false
   private _baseHighlight?: string
   private _onHighlight?: OnHighlightCallback
   private _onChunks?: OnChunksCallback
@@ -83,6 +91,12 @@ export class CodeRenderable extends TextBufferRenderable {
   // Temporary rendered-line -> source-line map for concealment; native extmarks should replace this.
   private _renderedLineSources?: number[]
   private _mappedLineInfo?: LineInfo
+  // While set, the buffer holds `_content` and grows only by appends; the worker's copy `id` holds its first `sent`
+  // units, and each reply writes the syntax layer for the prefix it covers (record 312).
+  private _deltas?: { client: TreeSitterClient; id: number; filetype: string; sent: number }
+  private _groupSets = new Map<string, number>()
+  private static nextCopy = 0
+  private _streamsDeltas = false
 
   protected _contentDefaultOptions = {
     content: "",
@@ -118,6 +132,7 @@ export class CodeRenderable extends TextBufferRenderable {
       }
 
       this.setHighlightsDirty(this._content.length > 0)
+      this.onLifecyclePass = this.checkPainted
     } catch (error) {
       this.rollbackConstruction(error)
     }
@@ -127,9 +142,70 @@ export class CodeRenderable extends TextBufferRenderable {
     return this._content
   }
 
-  private invalidateHighlights(): void {
+  // `streaming` and `drawUnstyledText` change what shows while a highlight runs, not the highlight.
+  private invalidateHighlights(renders = true): void {
     this.setHighlightsDirty(true)
-    this._highlightSnapshotId++
+    if (renders) this._version++
+    if (this.isDestroyed) return
+    // A change made after the frame's update hooks still paints in that frame.
+    if (!this._drawUnstyledText && this._filetype) this.paintHighlightsOnly()
+    if (this._shownVersion < 0 || this._shownVersion === this._version) return
+    // An older highlight stays only through frames that paint the block, whose update hook replaces it. Decided against
+    // the last painted frame, not the layout in progress, so the order of changes within a turn does not matter: a block
+    // that frame did not paint shows its current text now, which layout measures; one it painted is checked again before
+    // each later frame's layout (its lifecycle pass, which a custom onLifecyclePass replaces).
+    if (this.onLifecyclePass === this.checkPainted && this._ctx.nativeScene.painted(this)) {
+      this._checkPainted = true
+      this._ctx.nativeScene.lifecyclePasses.refresh(this)
+    } else this.showPlainText()
+  }
+
+  private showPlainText(): void {
+    this.setShouldRenderTextBuffer(false)
+    this.textBuffer.setText(this._content)
+    this._shownVersion = -1
+    this.setRenderedLineSources(undefined)
+    this.updateTextInfo()
+  }
+
+  // Before a frame's layout: a block that the last frame painted keeps its older highlight until its update hook's
+  // highlight lands; one it culled shows its current text, which this frame measures (one frame late). It is the block's
+  // lifecycle pass.
+  private readonly checkPainted = (): void => {
+    const stale = !this.isDestroyed && this._shownVersion >= 0 && this._shownVersion !== this._version
+    if (stale && this._ctx.nativeScene.painted(this)) return
+    this._checkPainted = false
+    this._ctx.nativeScene.lifecyclePasses.refresh(this)
+    if (!stale) return
+    this.showPlainText()
+    // Culled below the view before its update hook ran: a callback that scrolls it back in a later frame finds the
+    // highlight sooner. Above the view its new height would move the rows in view; a request in flight would make the
+    // next one wait for it.
+    if (this._highlightsDirty && !this._highlightLoopActive && this.belowView()) this.scheduleHighlights()
+  }
+
+  // Below the view of a shown ScrollBox; no highlight starts while the block or an ancestor is hidden.
+  private belowView(): boolean {
+    let box: ScrollBoxRenderable | undefined
+    for (let node: Renderable | null = this; node; node = node.parent) {
+      if (!node.visible) return false
+      if (!box && node instanceof ScrollBoxRenderable) box = node
+    }
+    return !!box && this.y >= box.viewport.y
+  }
+
+  override _needsLifecyclePass(): boolean {
+    if (this.onLifecyclePass !== this.checkPainted) return super._needsLifecyclePass()
+    return this._checkPainted
+  }
+
+  // A style input changed. A block that shows its current highlight keeps what it paints and its height, as the current
+  // version, and asks the worker; the new highlight replaces it. Otherwise it highlights again.
+  private changeStyle(): void {
+    if (this._shownVersion < 0 || this._shownVersion !== this._version || this.isDestroyed)
+      return this.invalidateHighlights()
+    this._shownVersion = ++this._version
+    this.setHighlightsDirty(true)
   }
 
   private setHighlightsDirty(value: boolean): void {
@@ -146,30 +222,78 @@ export class CodeRenderable extends TextBufferRenderable {
 
   set content(value: string) {
     if (this._content === value) return
-    this.runMutation(() => {
-      // Streaming keeps the shown highlight until the next one lands (_hadInitialContent implies _streaming).
-      if (this._hadInitialContent && this._shouldRenderTextBuffer && this._filetype && !this._drawUnstyledText) {
-        this._content = value
-        this.invalidateHighlights()
-        this.requestRender()
-        return
-      }
+    this.runMutation(() => this.writeContent(value))
+  }
 
-      if (value && this._initialStyledText && this._drawUnstyledText) {
-        this.textBuffer.setStyledText(this._initialStyledText)
-      } else {
-        this.textBuffer.setText(value)
-      }
-      this._content = value
-      this.invalidateHighlights()
-      this.setRenderedLineSources(undefined)
+  private writeContent(value: string): void {
+    const delta = this._deltas && value.startsWith(this._content) ? value.slice(this._content.length) : undefined
+    this._content = value
+    if (delta !== undefined) {
+      this.textBuffer.append(delta)
+      this._version++
+      this.setHighlightsDirty(true)
       this.updateTextInfo()
-    })
+      this.requestRender()
+      return
+    }
+    this.stopDeltas()
+    // Streaming keeps a painted highlight until the next one lands.
+    if (this._streaming && this._shouldRenderTextBuffer && this._shownVersion >= 0 && !this._drawUnstyledText) {
+      this.invalidateHighlights()
+      this.requestRender()
+      return
+    }
+    if (value && this._initialStyledText && this._drawUnstyledText) {
+      this.textBuffer.setStyledText(this._initialStyledText)
+      this._shownVersion = PREVIEW
+    } else {
+      this.textBuffer.setText(value)
+      this._shownVersion = -1
+      if (this._streamsDeltas && this.deltasAllowed()) {
+        const id = CodeRenderable.nextCopy++
+        this._deltas = { client: this._treeSitterClient, id, filetype: this._filetype!, sent: 0 }
+      }
+    }
+    this.invalidateHighlights()
+    this.setRenderedLineSources(undefined)
+    this.updateTextInfo()
+  }
+
+  // Only a streamed Markdown fence on the default path: no hook, no conceal, no preview. Markdown ends a fence's lines
+  // with "\n" alone, so its UTF-8 offsets are native's.
+  private deltasAllowed(): boolean {
+    return (
+      this._streaming &&
+      !!this._filetype &&
+      !this._conceal &&
+      !this._onHighlight &&
+      !this._onChunks &&
+      !this._baseHighlight &&
+      !this._initialStyledText
+    )
+  }
+
+  /**
+   * @internal Markdown marks a fence while its block is open: while it streams, its appends go to the highlighter as
+   * deltas. A closed block's text is final, so its worker copy goes (C4 question 4): now if the last reply covers the
+   * text, else once the reply for the rest lands.
+   */
+  public _setStreamsDeltas(open: boolean): void {
+    this._streamsDeltas = open
+    if (!open && this._shownVersion === this._version) this.stopDeltas()
+  }
+
+  private stopDeltas(): void {
+    const deltas = this._deltas
+    this._deltas = undefined
+    // A destroyed client has freed its copies; the worker ignores one it never had.
+    deltas?.client.removeCopy(deltas.id).catch(() => {})
   }
 
   public updateStreamingPreview(content: string, initialStyledText: StyledText): void {
     this._content = content
     this._initialStyledText = initialStyledText
+    this._shownVersion = PREVIEW
     this.invalidateHighlights()
     this.textBuffer.setStyledText(initialStyledText)
     this.setRenderedLineSources(undefined)
@@ -239,7 +363,7 @@ export class CodeRenderable extends TextBufferRenderable {
   set syntaxStyle(value: SyntaxStyle) {
     if (this._syntaxStyle !== value) {
       this._syntaxStyle = value
-      this.invalidateHighlights()
+      this.changeStyle()
     }
   }
 
@@ -250,7 +374,7 @@ export class CodeRenderable extends TextBufferRenderable {
   set conceal(value: boolean) {
     if (this._conceal !== value) {
       this._conceal = value
-      this.invalidateHighlights()
+      this.changeStyle()
     }
   }
 
@@ -261,7 +385,7 @@ export class CodeRenderable extends TextBufferRenderable {
   set drawUnstyledText(value: boolean) {
     if (this._drawUnstyledText !== value) {
       this._drawUnstyledText = value
-      this.invalidateHighlights()
+      this.invalidateHighlights(false)
     }
   }
 
@@ -270,22 +394,32 @@ export class CodeRenderable extends TextBufferRenderable {
   }
 
   set initialStyledText(value: StyledText | undefined) {
-    if (this._initialStyledText !== value) {
-      if (value && this._streaming && this._drawUnstyledText && this._isHighlighting) {
-        this.updateStreamingPreview(this._content, value)
-        return
-      }
-
-      this._initialStyledText = value
-      this.invalidateHighlights()
-    }
+    if (this._initialStyledText === value) return
+    this._initialStyledText = value
+    // A preview changes what shows while a highlight runs, not the highlight. A buffer without one holds the new
+    // preview, or the source, now (also culled); while streaming, a preview replaces a highlight on its way out. A
+    // cleared preview that painted stays until the highlight lands (the end of a stream), so a chunk callback's text
+    // never shows raw; the source that replaces a preview where unstyled text is not drawn does not paint.
+    const shows = value && this._drawUnstyledText
+    const replaces = shows && this._streaming && this._isHighlighting
+    const previewed = this._shownVersion === PREVIEW
+    if (!this._content || !(this._shownVersion < 0 || replaces) || (!value && previewed)) return
+    this.runMutation(() => {
+      if (shows) this.textBuffer.setStyledText(value)
+      else this.textBuffer.setText(this._content)
+      if (!shows && previewed && !this._drawUnstyledText && this._filetype) this.setShouldRenderTextBuffer(false)
+      this._shownVersion = shows ? PREVIEW : -1
+      this.setRenderedLineSources(undefined)
+      this.updateTextInfo()
+    })
   }
 
   set streaming(value: boolean) {
     if (this._streaming !== value) {
       this._streaming = value
-      this._hadInitialContent = false
-      this.invalidateHighlights()
+      // At once, since a hidden block runs no update hook to do it.
+      if (!value) this.stopDeltas()
+      this.invalidateHighlights(false)
     }
   }
 
@@ -311,14 +445,14 @@ export class CodeRenderable extends TextBufferRenderable {
   set baseHighlight(value: string | undefined) {
     if (this._baseHighlight !== value) {
       this._baseHighlight = value
-      this.invalidateHighlights()
+      this.changeStyle()
     }
   }
 
   set onHighlight(value: OnHighlightCallback | undefined) {
     if (this._onHighlight !== value) {
       this._onHighlight = value
-      this.invalidateHighlights()
+      this.changeStyle()
     }
   }
 
@@ -329,7 +463,7 @@ export class CodeRenderable extends TextBufferRenderable {
   set onChunks(value: OnChunksCallback | undefined) {
     if (this._onChunks !== value) {
       this._onChunks = value
-      this.invalidateHighlights()
+      this.changeStyle()
     }
   }
 
@@ -348,49 +482,72 @@ export class CodeRenderable extends TextBufferRenderable {
     return modified ?? chunks
   }
 
+  // Streaming keeps what it paints until the next highlight lands, except raw text where unstyled text is not drawn. A
+  // current highlight stays.
   private ensureVisibleTextBeforeHighlight(): void {
-    const content = this._content
-    const isInitialContent = this._streaming && !this._hadInitialContent
-    const shouldDrawUnstyledNow = this._streaming ? isInitialContent && this._drawUnstyledText : this._drawUnstyledText
-
-    if (this._streaming && !isInitialContent) {
-      if (this._drawUnstyledText) this.setShouldRenderTextBuffer(true)
-    } else if (shouldDrawUnstyledNow) {
-      if (this._initialStyledText) {
-        this.textBuffer.setStyledText(this._initialStyledText)
-      } else {
-        this.textBuffer.setText(content)
-      }
-      this.setRenderedLineSources(undefined)
+    const keeps = this._streaming && this._shouldRenderTextBuffer
+    if (this._drawUnstyledText) {
+      if (!keeps && this._shownVersion !== this._version) {
+        if (this._initialStyledText) {
+          this.textBuffer.setStyledText(this._initialStyledText)
+        } else {
+          this.textBuffer.setText(this._content)
+        }
+        this._shownVersion = this._initialStyledText ? PREVIEW : -1
+        this.setRenderedLineSources(undefined)
+        // The constructor's preview, kept by its first update, has painted from now on.
+      } else if (keeps && this._shownVersion === -1 && this._initialStyledText) this._shownVersion = PREVIEW
       this.setShouldRenderTextBuffer(true)
     } else {
-      this.setShouldRenderTextBuffer(false)
+      this.paintHighlightsOnly()
     }
   }
 
+  private paintHighlightsOnly(): void {
+    if (!this._streaming || !this._shouldRenderTextBuffer || this._shownVersion === -1)
+      this.setShouldRenderTextBuffer(this._shownVersion === this._version)
+  }
+
+  // The delta state while it still describes the block: the same client and filetype, and still eligible.
+  private currentDeltas(): CodeRenderable["_deltas"] {
+    const deltas = this._deltas
+    const same = deltas?.client === this._treeSitterClient && deltas.filetype === this._filetype
+    return same && this.deltasAllowed() ? deltas : undefined
+  }
+
   private async startHighlight(): Promise<void> {
+    const deltas = this.currentDeltas()
+    if (deltas) return this.highlightDelta(deltas)
+    this.stopDeltas()
     const content = this._content
     const filetype = this._filetype
-    const snapshotId = ++this._highlightSnapshotId
+    const version = this._version
 
     if (!filetype) return
 
-    const isInitialContent = this._streaming && !this._hadInitialContent
-    if (isInitialContent) {
-      this._hadInitialContent = true
+    this._isHighlighting = true
+    // A reply for an older version is dropped.
+    const current = () => {
+      if (version !== this._version) this.requestRender()
+      return version === this._version && !this.isDestroyed
     }
 
-    this._isHighlighting = true
-
+    // Text a chunk callback has not seen is never shown: a failed highlight (a rejection or an error answer) keeps what
+    // the block shows (its preview or an earlier highlight), else the chunk path runs without highlights.
+    const keeps = () => (this._initialStyledText && this._drawUnstyledText) || this._shownVersion !== -1
     try {
-      const result = await this._treeSitterClient.highlightOnce(content, filetype)
-
-      if (snapshotId !== this._highlightSnapshotId) {
-        this.requestRender()
-        return
-      }
-
-      if (this.isDestroyed) return
+      const result = await this._treeSitterClient
+        .highlightOnce(content, filetype)
+        .then((answer) => {
+          if (answer.error) throw new Error(answer.error)
+          return answer
+        })
+        .catch((error) => {
+          if (!this._onChunks || keeps()) throw error
+          console.warn("Code highlighting failed, rendering without highlights:", error)
+          return { highlights: [] }
+        })
+      if (!current()) return
 
       let highlights = result.highlights ?? []
 
@@ -406,12 +563,7 @@ export class CodeRenderable extends TextBufferRenderable {
         }
       }
 
-      if (snapshotId !== this._highlightSnapshotId) {
-        this.requestRender()
-        return
-      }
-
-      if (this.isDestroyed) return
+      if (!current()) return
 
       if (highlights.length > 0 || this._onChunks || this._baseHighlight) {
         const sourceRanges: Array<{ start: number; end: number }> | undefined = this._onChunks ? [] : undefined
@@ -433,42 +585,85 @@ export class CodeRenderable extends TextBufferRenderable {
 
         chunks = await this.transformChunks(chunks, context)
 
-        if (snapshotId !== this._highlightSnapshotId) {
-          this.requestRender()
-          return
-        }
-
-        if (this.isDestroyed) return
-
-        const styledText = new StyledText(chunks)
-        this.textBuffer.setStyledText(styledText)
-        this.setRenderedLineSources(renderedLineSources)
+        if (!current()) return
+        this.settle(version, new StyledText(chunks), renderedLineSources)
       } else {
-        this.textBuffer.setText(content)
-        this.setRenderedLineSources(undefined)
+        this.settle(version, undefined, undefined)
       }
-
-      this.setShouldRenderTextBuffer(true)
-      this._isHighlighting = false
-      this.setHighlightsDirty(false)
-      this.updateTextInfo()
-      this.requestRender()
     } catch (error) {
-      if (snapshotId !== this._highlightSnapshotId) {
+      if (version !== this._version) {
         this.requestRender()
         return
       }
 
       console.warn("Code highlighting failed, falling back to plain text:", error)
       if (this.isDestroyed) return
-      this.textBuffer.setText(content)
-      this.setRenderedLineSources(undefined)
-      this.setShouldRenderTextBuffer(true)
-      this._isHighlighting = false
-      this.setHighlightsDirty(false)
-      this.updateTextInfo()
-      this.requestRender()
+      this.settle(-1, undefined, undefined, !!this._onChunks)
     }
+  }
+
+  // Sends the text the worker has not seen; the reply covers that prefix and is never stale: text appended meanwhile
+  // stays plain until the next step sends it. A failure, or a name native rejects, goes back to whole highlights.
+  private async highlightDelta(deltas: NonNullable<CodeRenderable["_deltas"]>): Promise<void> {
+    const version = this._version
+    const offset = deltas.sent
+    const content = this._content
+    deltas.sent = content.length
+    this._isHighlighting = true
+    const answer = await deltas.client
+      .highlightAppend(deltas.id, offset, content.slice(offset), deltas.filetype)
+      .catch((error: unknown) => ({ highlights: undefined, error: String(error) }))
+    // A reply for a block that changed language, concealment or hooks meanwhile is not shown; the next step goes whole.
+    if (this.currentDeltas() !== deltas || this.isDestroyed) return
+    try {
+      if (!answer.highlights) throw new Error(answer.error)
+      const names: string[][] = []
+      // No captures paint the buffer's defaults, as a whole highlight without any does: an empty layer.
+      const { highlights } = answer
+      const options = { enabled: false, names }
+      const chunks = highlights.length ? treeSitterToTextChunks(content, highlights, this._syntaxStyle, options) : []
+      const runs: number[] = []
+      let end = 0
+      chunks.forEach((chunk, index) => {
+        // A capture past the text (Markdown's closing backticks parse with a line break after them) leaves an empty one.
+        if (!chunk.text) return
+        const start = end
+        // UTF-8 as native stores it (a lone surrogate becomes U+FFFD, 3 bytes).
+        end += Buffer.byteLength(chunk.text)
+        const key = names[index]!
+        let set = this._groupSets.get(key.join("\n"))
+        if (set === undefined) this._groupSets.set(key.join("\n"), (set = this.textBuffer._groupSet(key)))
+        runs.push(start, end, set)
+      })
+      if (this.textBuffer.getSyntaxStyle() !== this._syntaxStyle) this.textBuffer.setSyntaxStyle(this._syntaxStyle)
+      this.textBuffer._setLayer(SYNTAX_LAYER, 0, Buffer.byteLength(content), new Uint32Array(runs))
+    } catch {
+      this.stopDeltas()
+      this._highlightRerun = true
+      return
+    }
+    this._shownVersion = version
+    this._isHighlighting = false
+    // A closed block's copy goes once a reply covers all its text.
+    if (!this._streamsDeltas && deltas.sent === this._content.length) this.stopDeltas()
+    this.setShouldRenderTextBuffer(true)
+    // A layer changes no text, so nothing else asks for the frame that shows it.
+    this.requestRender()
+  }
+
+  // Without styled text the highlight is the plain content; version -1 marks a failed highlight. A block that keeps what
+  // it shows keeps its buffer and paint: hidden raw text stays hidden, painted text counts as kept.
+  private settle(version: number, text: StyledText | undefined, lineSources: number[] | undefined, keep = false): void {
+    if (!keep) {
+      if (text) this.textBuffer.setStyledText(text)
+      else this.textBuffer.setText(this._content)
+      this.setRenderedLineSources(lineSources)
+      this._shownVersion = version
+      this.setShouldRenderTextBuffer(true)
+    } else if (this._shouldRenderTextBuffer) this._shownVersion = PREVIEW
+    this._isHighlighting = false
+    this.setHighlightsDirty(false)
+    this.updateTextInfo()
   }
 
   private async runHighlights(): Promise<void> {
@@ -485,7 +680,6 @@ export class CodeRenderable extends TextBufferRenderable {
   }
 
   private clearPendingHighlight(): void {
-    this._highlightSnapshotId++
     this._isHighlighting = false
     this._highlightRerun = false
     this._highlightingPromise = Promise.resolve()
@@ -613,15 +807,14 @@ export class CodeRenderable extends TextBufferRenderable {
 
     const hasContent = this._content.length > 0
     if (!hasContent || !this._filetype) {
+      this.stopDeltas()
       this.setShouldRenderTextBuffer(hasContent)
       this.setHighlightsDirty(false)
       this.clearPendingHighlight()
-
-      if (hasContent) {
-        this.textBuffer.setText(this._content)
-        this.setRenderedLineSources(undefined)
-        this.updateTextInfo()
-      }
+      this.textBuffer.setText(this._content)
+      this._shownVersion = -1
+      this.setRenderedLineSources(undefined)
+      this.updateTextInfo()
       return
     }
 
@@ -648,6 +841,7 @@ export class CodeRenderable extends TextBufferRenderable {
   protected override destroyOwnedResources(): void {
     this.runCleanup((run) => {
       run(() => this.clearPendingHighlight())
+      run(() => this.stopDeltas())
       run(() => super.destroyOwnedResources())
     })
   }

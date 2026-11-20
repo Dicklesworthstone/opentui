@@ -219,6 +219,9 @@ fn keys_encode_in_the_programs_keyboard_mode() {
         (3, b"\x1b[?62c\x1b", "\x1b[27u"),
         (3, b"\x1b[97;3u", "\x1b[97;3u"),
         (3, b"\x1b[97;9u", "\x1b[97;9u"),
+        // Kitty Meta goes as Alt: the emulator has no Meta.
+        (0, b"\x1b[97;33u", "\x1ba"),
+        (3, b"\x1b[97;33u", "\x1b[97;3u"),
         // A legacy line feed is Ctrl+J to the program.
         (0, b"\n", "\n"),
         (1, b"\n", "\x1b[106;5u"),
@@ -654,13 +657,21 @@ mod windows_programs {
         // session starts with it ignored. Restore the normal handling the program should inherit.
         unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) };
         let app = TestApp::new(20, 4);
-        let exited = Rc::new(Cell::new(false));
-        let pty = Pty::spawn(&app, long_running(), 80, 24).unwrap().on_exit({
-            let exited = Rc::clone(&exited);
-            move |_cx, _status| exited.set(true)
-        });
-        // Give ping time to start before Ctrl+C reaches it.
-        std::thread::sleep(Duration::from_millis(500));
+        let (output, exited) = (Rc::new(RefCell::new(Vec::new())), Rc::new(Cell::new(false)));
+        let pty = Pty::spawn(&app, long_running(), 80, 24)
+            .unwrap()
+            .on_output({
+                let output = Rc::clone(&output);
+                move |_cx, bytes| output.borrow_mut().extend_from_slice(bytes)
+            })
+            .on_exit({
+                let exited = Rc::clone(&exited);
+                move |_cx, _status| exited.set(true)
+            });
+        // Ctrl+C reaches ping only once it runs, which its first line, naming the address, shows.
+        let started =
+            app.wait_until(Duration::from_secs(10), || String::from_utf8_lossy(&output.borrow()).contains("127.0.0.1"));
+        assert!(started, "ping printed nothing: {:?}", String::from_utf8_lossy(&output.borrow()));
         pty.signal(2).unwrap();
         assert!(app.wait_until(Duration::from_secs(10), || exited.get()), "Ctrl+C did not stop the program");
     }

@@ -400,6 +400,23 @@ describe("TextTableRenderable", () => {
     expect(borderXs).toEqual(expected)
   })
 
+  test("aligns each column's lines and follows a columnAlignments change", async () => {
+    const table = new TextTableRenderable(renderer, {
+      columnWidthMode: "content",
+      columnAlignments: ["right", "center"],
+      content: [
+        [cell("Key"), cell("Value")],
+        [cell("a"), cell("b")],
+      ],
+    })
+    renderer.root.add(table)
+    await renderOnce()
+    expect(captureFrame().split("\n")[3]!.trimEnd()).toBe("│  a│  b  │")
+    table.columnAlignments = ["left"]
+    await renderOnce()
+    expect(captureFrame().split("\n")[3]!.trimEnd()).toBe("│a  │b    │")
+  })
+
   test("fills available width in no-wrap mode when columnWidthMode is full", async () => {
     const table = new TextTableRenderable(renderer, {
       left: 0,
@@ -1184,6 +1201,32 @@ describe("TextTableRenderable", () => {
     await renderOnce()
 
     expect(table.getSelectedText()).toBe("Status\nOK\nDEGRADED\nERROR")
+  })
+
+  test("a selection from outside anchors by position after an earlier selection in the table ends", async () => {
+    const text = new TextRenderable(renderer, { left: 0, top: 0, content: "text" })
+    const table = new TextTableRenderable(renderer, {
+      left: 0,
+      top: 1,
+      border: false,
+      outerBorder: false,
+      columnWidthMode: "content",
+      content: [
+        [cell("aaaa"), cell("bbbb")],
+        [cell("cccc"), cell("dddd")],
+      ],
+    })
+    renderer.root.add(text)
+    renderer.root.add(table)
+    await renderOnce()
+    // A drag inside "dddd", then cleared: its pressed cell must not anchor the next gesture.
+    renderer.startSelection(table, table.x + 5, table.y + 1)
+    renderer.updateSelection(table, table.x + 6, table.y + 1, { finishDragging: true })
+    expect(table.getSelectedText()).toBe("dd")
+    renderer.clearSelection()
+    renderer.startSelection(text, text.x + 1, text.y)
+    renderer.updateSelection(table, table.x + 6, table.y + 1)
+    expect(table.getSelectedText()).toBe("aaaa\tbbbb\ncccc\tddd")
   })
 
   test("reverse drag across full table keeps left cells selected", async () => {

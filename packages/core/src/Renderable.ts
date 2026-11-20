@@ -1,6 +1,8 @@
 import { EventEmitter } from "events"
+import util from "node:util"
 import {
   Align,
+  BoxSizing,
   Dimension,
   Display,
   Edge,
@@ -34,7 +36,9 @@ import type { MouseEventType } from "./lib/parse.mouse.js"
 import type { Selection } from "./lib/selection.js"
 import {
   parseAlign,
+  parseAlignContent,
   parseAlignItems,
+  parseBoxSizing,
   parseFlexDirection,
   parseJustify,
   parseLayoutMode,
@@ -42,6 +46,7 @@ import {
   parsePositionType,
   parseWrap,
   type AlignString,
+  type BoxSizingString,
   type FlexDirectionString,
   type JustifyString,
   type LayoutModeString,
@@ -49,7 +54,6 @@ import {
   type PositionTypeString,
   type WrapString,
 } from "./lib/yoga.options.js"
-import { isVNode, maybeMakeRenderable, type VNode } from "./renderables/composition/vnode.js"
 import type { MouseEvent } from "./renderer.js"
 import type { RenderContext } from "./types.js"
 import { RGBA } from "./lib/RGBA.js"
@@ -137,9 +141,13 @@ export interface LayoutOptions extends BaseRenderableOptions {
   /** `"list"` stacks children as a column with `overflow: "scroll"` does, without a flex pass over them. */
   layoutMode?: LayoutModeString
   alignItems?: AlignString
+  alignContent?: AlignString
+  aspectRatio?: number
+  /** `"content-box"` adds padding and border to the width and height; `"border-box"`, the default, includes them. */
+  boxSizing?: BoxSizingString
   justifyContent?: JustifyString
   alignSelf?: AlignString
-  flexBasis?: number | "auto" | undefined
+  flexBasis?: number | "auto" | `${number}%` | undefined
   position?: PositionTypeString
   overflow?: OverflowString
   top?: number | "auto" | `${number}%`
@@ -170,6 +178,7 @@ export interface LayoutOptions extends BaseRenderableOptions {
 export interface RenderableOptions<T extends BaseRenderable = BaseRenderable> extends Partial<LayoutOptions> {
   width?: number | "auto" | `${number}%`
   height?: number | "auto" | `${number}%`
+  /** At equal zIndex, the later sibling in child order paints above and receives clicks at the overlap. */
   zIndex?: number
   visible?: boolean
   buffered?: boolean
@@ -251,9 +260,9 @@ export abstract class BaseRenderable extends EventEmitter {
     this._id = options.id ?? `renderable-${this.num}`
   }
 
-  public abstract add(obj: BaseRenderable | unknown, index?: number): number
+  public abstract add(obj: unknown, index?: number): number
   public abstract remove(child: BaseRenderable): void
-  public abstract insertBefore(obj: BaseRenderable | unknown, anchor: BaseRenderable | unknown): void
+  public abstract insertBefore(obj: unknown, anchor: unknown): void
   public abstract getChildren(): BaseRenderable[]
   public abstract getChildrenCount(): number
   public abstract getRenderable(id: string): BaseRenderable | undefined
@@ -758,7 +767,22 @@ export abstract class Renderable extends BaseRenderable {
 
   /** @internal Native built-ins may suspend lifecycle work without losing their registration position. */
   _needsLifecyclePass(): boolean {
-    return this.onLifecyclePass !== null
+    return this.onLifecyclePass !== null || this._builtinLifecyclePass !== null
+  }
+
+  private _builtinLifecyclePass: (() => void) | null = null
+
+  /** A widget's own lifecycle pass: it runs before `onLifecyclePass`, which callers may read, wrap or replace. */
+  protected setBuiltinLifecyclePass(pass: (() => void) | null): void {
+    this._builtinLifecyclePass = pass
+    this.syncLifecyclePass()
+  }
+
+  /** @internal Runs the widget's own lifecycle pass, then the caller's published one: a hook defined on the
+   * instance runs only once `refreshHooks()` adopts it. */
+  _runLifecyclePass(): void {
+    this._builtinLifecyclePass?.call(this)
+    if (!this._isDestroyed) this._hooks.onLifecyclePass?.call(this)
   }
 
   public get translateX(): number {
@@ -1145,6 +1169,18 @@ export abstract class Renderable extends BaseRenderable {
     return this.yogaGetEnum(YogaEnumKind.AlignItems, Align.Stretch) as Align
   }
 
+  getAlignContent(): Align {
+    return this.yogaGetEnum(YogaEnumKind.AlignContent, Align.FlexStart) as Align
+  }
+
+  getAspectRatio(): number {
+    return this.yogaGetFloat(YogaFloatKind.AspectRatio)
+  }
+
+  getBoxSizing(): BoxSizing {
+    return this.yogaGetEnum(YogaEnumKind.BoxSizing, BoxSizing.BorderBox) as BoxSizing
+  }
+
   getJustifyContent(): Justify {
     return this.yogaGetEnum(YogaEnumKind.JustifyContent, Justify.FlexStart) as Justify
   }
@@ -1246,6 +1282,9 @@ export abstract class Renderable extends BaseRenderable {
     node.setFlexDirection(parseFlexDirection(options.flexDirection))
     node.setFlexWrap(parseWrap(options.flexWrap))
     if (options.layoutMode !== undefined) node.layoutMode = options.layoutMode
+    if (options.alignContent !== undefined) node.alignContent = options.alignContent
+    if (options.aspectRatio !== undefined) node.aspectRatio = options.aspectRatio
+    if (options.boxSizing !== undefined) node.boxSizing = options.boxSizing
     node.setAlignItems(parseAlignItems(options.alignItems))
     node.setJustifyContent(parseJustify(options.justifyContent))
     node.setAlignSelf(parseAlign(options.alignSelf))
@@ -1435,6 +1474,21 @@ export abstract class Renderable extends BaseRenderable {
     this.requestRender()
   }
 
+  public set alignContent(alignContent: AlignString | null | undefined) {
+    this.yogaSetEnum(YogaEnumKind.AlignContent, parseAlignContent(alignContent))
+    this.requestRender()
+  }
+
+  public set aspectRatio(aspectRatio: number | null | undefined) {
+    this.yogaSetFloat(YogaFloatKind.AspectRatio, aspectRatio ?? undefined)
+    this.requestRender()
+  }
+
+  public set boxSizing(boxSizing: BoxSizingString | null | undefined) {
+    this.yogaSetEnum(YogaEnumKind.BoxSizing, parseBoxSizing(boxSizing))
+    this.requestRender()
+  }
+
   public set justifyContent(justifyContent: JustifyString | null | undefined) {
     this.setJustifyContent(parseJustify(justifyContent))
     this.requestRender()
@@ -1445,7 +1499,7 @@ export abstract class Renderable extends BaseRenderable {
     this.requestRender()
   }
 
-  public set flexBasis(basis: number | "auto" | null | undefined) {
+  public set flexBasis(basis: number | "auto" | `${number}%` | null | undefined) {
     this.setStyleValue(YogaValueKind.FlexBasis, NATIVE_EDGE_NONE, basis, isFlexBasisType)
   }
 
@@ -1645,7 +1699,7 @@ export abstract class Renderable extends BaseRenderable {
           const passes = previous._ctx.getLifecyclePasses()
           lifecycle = new Map([[passes, false]])
         }
-        if (typeof child.onLifecyclePass === "function") {
+        if (typeof child.onLifecyclePass === "function" || child._builtinLifecyclePass) {
           const passes = target._ctx.getLifecyclePasses()
           lifecycle ??= new Map()
           lifecycle.set(passes, true)
@@ -1674,14 +1728,15 @@ export abstract class Renderable extends BaseRenderable {
     })
   }
 
-  public add(obj: Renderable | VNode<any, any[]> | unknown, index?: number): number {
+  public add(obj: Renderable, index?: number): number {
     if (!obj) {
       return -1
     }
-    if (isVNode(obj)) this.assertMutable()
 
-    const renderable = maybeMakeRenderable(this._ctx, obj)
-    if (!renderable) {
+    if (!isRenderable(obj)) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("add() received an invalid renderable", util.inspect(obj, { depth: 2 }))
+      }
       return -1
     }
 
@@ -1692,9 +1747,9 @@ export abstract class Renderable extends BaseRenderable {
       return -1
     }
 
-    if (renderable.isDestroyed) {
+    if (obj.isDestroyed) {
       if (process.env.NODE_ENV !== "production") {
-        console.warn(`Renderable with id ${renderable.id} was already destroyed, skipping add`)
+        console.warn(`Renderable with id ${obj.id} was already destroyed, skipping add`)
       }
       return -1
     }
@@ -1702,13 +1757,13 @@ export abstract class Renderable extends BaseRenderable {
     const anchorRenderable = index !== undefined ? this._childrenInLayoutOrder[index] : undefined
 
     if (anchorRenderable) {
-      return this.insertBefore(renderable, anchorRenderable)
+      return this.insertBefore(obj, anchorRenderable)
     }
 
-    return this.placeChild(renderable)
+    return this.placeChild(obj)
   }
 
-  insertBefore(obj: Renderable | VNode<any, any[]> | unknown, anchor?: Renderable | unknown): number {
+  insertBefore(obj: Renderable, anchor?: Renderable): number {
     if (!anchor) {
       return this.add(obj)
     }
@@ -1716,10 +1771,11 @@ export abstract class Renderable extends BaseRenderable {
     if (!obj) {
       return -1
     }
-    if (isVNode(obj)) this.assertMutable()
 
-    const renderable = maybeMakeRenderable(this._ctx, obj)
-    if (!renderable) {
+    if (!isRenderable(obj)) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("insertBefore() received an invalid renderable", util.inspect(obj, { depth: 2 }))
+      }
       return -1
     }
 
@@ -1730,9 +1786,9 @@ export abstract class Renderable extends BaseRenderable {
       return -1
     }
 
-    if (renderable.isDestroyed) {
+    if (obj.isDestroyed) {
       if (process.env.NODE_ENV !== "production") {
-        console.warn(`Renderable with id ${renderable.id} was already destroyed, skipping insertBefore`)
+        console.warn(`Renderable with id ${obj.id} was already destroyed, skipping insertBefore`)
       }
       return -1
     }
@@ -1755,14 +1811,14 @@ export abstract class Renderable extends BaseRenderable {
       return -1
     }
 
-    if (renderable === anchor) {
+    if (obj === anchor) {
       if (process.env.NODE_ENV !== "production") {
-        console.warn(`Anchor is the same as the node ${renderable.id} being inserted, skipping insertBefore`)
+        console.warn(`Anchor is the same as the node ${obj.id} being inserted, skipping insertBefore`)
       }
       return -1
     }
 
-    return this.placeChild(renderable, anchor)
+    return this.placeChild(obj, anchor)
   }
 
   // TODO: that naming is meh
@@ -1771,7 +1827,7 @@ export abstract class Renderable extends BaseRenderable {
   }
 
   public remove(child: BaseRenderable): void {
-    if (!(child instanceof BaseRenderable)) {
+    if (!isRenderable(child)) {
       throw new Error("remove expects a renderable child object")
     }
 
@@ -1880,7 +1936,7 @@ export abstract class Renderable extends BaseRenderable {
   }
 
   private syncLifecyclePass(): void {
-    if (!this.onLifecyclePass) this._ctx.unregisterLifecyclePass(this)
+    if (!this.onLifecyclePass && !this._builtinLifecyclePass) this._ctx.unregisterLifecyclePass(this)
     else if (this.parent) this._ctx.registerLifecyclePass(this)
     else this._ctx.nativeScene.lifecyclePasses.refresh(this)
   }

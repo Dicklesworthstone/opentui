@@ -9,6 +9,7 @@ const link = @import("link.zig");
 const utf8 = @import("utf8.zig");
 const event_emitter = @import("event-emitter.zig");
 const text_work = @import("text-work.zig");
+const edit_marks = @import("edit-marks.zig");
 
 const UnifiedTextBuffer = tb.UnifiedTextBuffer;
 const TextChunk = seg_mod.TextChunk;
@@ -46,6 +47,12 @@ pub const Cursor = struct {
 };
 
 const CursorCoords = struct { row: u32, col: u32 };
+
+/// What cursor columns are measured with: they move when either changes.
+pub const Measure = struct {
+    tab_width: u8,
+    width_method: utf8.WidthMethod,
+};
 
 const CursorMeta = struct {
     row: u32,
@@ -102,6 +109,27 @@ const CursorMeta = struct {
         if (decoded.tab_width == null) return bytes;
         const last_separator = std.mem.lastIndexOfScalar(u8, bytes, ':') orelse return bytes;
         return bytes[0..last_separator];
+    }
+};
+
+/// An undo record written under another width method than the buffer started with: main's
+/// record and the method. Records of the starting method keep main's format, so stable editing
+/// parses nothing more.
+const MethodMeta = struct {
+    cursor: CursorMeta,
+    width_method: utf8.WidthMethod,
+
+    fn encode(self: MethodMeta, out_buffer: []u8) ![]const u8 {
+        const cursor = self.cursor;
+        return std.fmt.bufPrint(out_buffer, "cursor:{d}:{d}:{d}:{d}:{d}", .{ cursor.row, cursor.col, cursor.desired_col, cursor.tab_width.?, @backingInt(self.width_method) });
+    }
+
+    fn decode(bytes: []const u8) ?MethodMeta {
+        const end = std.mem.lastIndexOfScalar(u8, bytes, ':') orelse return null;
+        const cursor = CursorMeta.decode(bytes[0..end]) orelse return null;
+        if (cursor.tab_width == null) return null;
+        const value = std.fmt.parseInt(u8, bytes[end + 1 ..], 10) catch return null;
+        return .{ .cursor = cursor, .width_method = std.enums.fromInt(utf8.WidthMethod, value) orelse return null };
     }
 };
 
@@ -182,6 +210,12 @@ pub const EditBuffer = struct {
     events: event_emitter.EventEmitter(EditBufferEvent),
     segment_splitter: UnifiedRope.Node.LeafSplitFn,
     notify: ?NativeEventNotify,
+    /// The id of the next mark; ids are never reused, undo included.
+    next_mark_id: u32 = 1,
+    /// The method undo records leave out; a record names any other method it was written under.
+    start_width_method: utf8.WidthMethod,
+    /// The method changed at least once, so history may hold records of another method than the current one.
+    width_method_changed: bool = false,
 
     pub fn init(
         allocator: Allocator,
@@ -220,6 +254,7 @@ pub const EditBuffer = struct {
             .events = event_emitter.EventEmitter(EditBufferEvent).init(allocator),
             .segment_splitter = .{ .ctx = self, .splitFn = splitSegmentCallback, .joinFn = joinSegmentCallback },
             .notify = notify,
+            .start_width_method = width_method,
         };
 
         return self;
@@ -269,11 +304,16 @@ pub const EditBuffer = struct {
     }
 
     pub fn setCursorByOffset(self: *EditBuffer, offset: u32) !void {
-        const coords = iter_mod.offsetToCoords(self.tb.rope(), offset) orelse iter_mod.Coords{ .row = 0, .col = 0 };
+        const coords = iter_mod.offsetToCoords(self.tb.rope(), @min(offset, self.tb.rope().totalWeight())).?;
         try self.setCursor(coords.row, coords.col);
     }
 
-    fn remapCol(self: *EditBuffer, row: u32, target_col: u32, old_tab_width: u8) ?u32 {
+    fn measure(self: *const EditBuffer) Measure {
+        return .{ .tab_width = self.tb.tabWidth(), .width_method = self.tb.widthMethod() };
+    }
+
+    /// The column under the current measure of the text at `target_col` under `old`.
+    fn remapCol(self: *EditBuffer, row: u32, target_col: u32, old: Measure) ?u32 {
         var seg_idx = (iter_mod.lineStart(self.tb.rope(), row) orelse return null).leaf_index + 1;
         var old_col: u32 = 0;
         var new_col: u32 = 0;
@@ -284,16 +324,16 @@ pub const EditBuffer = struct {
             const chunk = seg.asText() orelse continue;
             const bytes = chunk.getBytes(self.tb.memRegistry());
             // The restored root's cached widths use the current policy, not the checkpoint's.
-            const next_col = old_col +| utf8.calculateTextWidth(bytes, old_tab_width, self.tb.controlDisplay(), chunk.isAsciiOnly(), self.tb.widthMethod());
+            const next_col = old_col +| utf8.calculateTextWidth(bytes, old.tab_width, self.tb.controlDisplay(), chunk.isAsciiOnly(), old.width_method);
             if (target_col <= next_col) {
                 const pos = utf8.findPosByWidth(
                     bytes,
                     target_col -| old_col,
-                    old_tab_width,
+                    old.tab_width,
                     self.tb.controlDisplay(),
                     chunk.isAsciiOnly(),
                     false,
-                    self.tb.widthMethod(),
+                    old.width_method,
                 );
                 return new_col +| utf8.calculateTextWidth(
                     bytes[0..pos.byte_offset],
@@ -311,12 +351,28 @@ pub const EditBuffer = struct {
     }
 
     pub fn setTabWidth(self: *EditBuffer, width: u8) void {
-        const old_width = self.tb.tabWidth();
+        const old = self.measure();
         self.tb.setTabWidth(width);
-        if (old_width == self.tb.tabWidth()) return;
+        self.remapCursor(old);
+    }
 
+    /// Measures with another `method` from now on; the cursor stays on the same text.
+    pub fn setWidthMethod(self: *EditBuffer, method: utf8.WidthMethod) void {
+        self.remapCursor(self.remeasure(method));
+    }
+
+    /// The first half of `setWidthMethod`: views move what they keep in cells before `remapCursor` publishes.
+    pub fn remeasure(self: *EditBuffer, method: utf8.WidthMethod) Measure {
+        const old = self.measure();
+        self.tb.setWidthMethod(method);
+        self.width_method_changed = true;
+        return old;
+    }
+
+    pub fn remapCursor(self: *EditBuffer, old: Measure) void {
+        if (std.meta.eql(old, self.measure())) return;
         const cursor = &self.cursor;
-        const new_col = self.remapCol(cursor.row, cursor.col, old_width) orelse
+        const new_col = self.remapCol(cursor.row, cursor.col, old) orelse
             @min(cursor.col, iter_mod.lineWidthAt(self.tb.rope(), cursor.row));
         if (cursor.desired_col == cursor.col) cursor.desired_col = new_col;
         cursor.col = new_col;
@@ -456,8 +512,11 @@ pub const EditBuffer = struct {
         const span = try candidate.insertSliceByWeight(insert_offset, insertBias(cursor), result.segments.items, &self.segment_splitter);
         const added_lines = iter_mod.getLineCount(&candidate) - self.tb.lineCount();
         const end = endCursor(.{ .row = cursor.row, .col = cursor.col, .offset = insert_offset }, added_lines, &candidate, span.end);
+        var splice = self.editSplice(cursor.row, cursor.col, insert_offset, false);
+        const marks = try splice.nextMarks(self.tb.rope().allocator, &candidate);
         try self.autoStoreUndo();
         self.tb.rope().root = candidate.root;
+        splice.inserted(self.tb, marks);
         self.cursor = end;
 
         self.tb.markViewsDirty();
@@ -485,8 +544,11 @@ pub const EditBuffer = struct {
         errdefer checkpoint.restore(self.tb, &self.add_buffer);
         var candidate = rope.*;
         const span = try self.replaceByWeight(&candidate, start_offset, end_offset, &.{});
+        var splice = self.editSplice(start.row, start.col, start_offset, false);
+        const marks = try splice.nextMarks(rope.allocator, &candidate);
         try self.autoStoreUndo();
         self.tb.rope().root = candidate.root;
+        splice.deleted(self.tb, marks);
 
         self.tb.markViewsDirty();
         self.cursor = endCursor(.{ .row = start.row, .col = start.col, .offset = start_offset }, 0, &candidate, deletedCursorOffset(span));
@@ -540,9 +602,86 @@ pub const EditBuffer = struct {
         const step_count = @as(usize, @intFromBool(has_deletion)) + @intFromBool(bytes.len > 0);
         const history_storage = try self.tb.rope().allocator.alloc(u8, history_step_size * step_count);
         var history_allocator = std.heap.FixedBufferAllocator.init(history_storage);
-        if (has_deletion) self.publishReplacementStep(&deleted, deleted_cursor, history_allocator.allocator());
+        // One splice byte for both steps: seeking the cell again in the deleted text can land
+        // elsewhere when the deletion joined graphemes. Both mark versions precede publication.
+        // after_delete may set a layer, which the insertion must move too.
+        var splice = self.editSplice(start.row, start.col, start.offset, true);
+        const deleted_marks = if (has_deletion) try splice.nextMarks(self.tb.rope().allocator, &deleted) else 0;
+        const inserted_marks = if (bytes.len > 0) try splice.nextMarks(self.tb.rope().allocator, &inserted) else 0;
+        if (has_deletion) {
+            self.publishReplacementStep(&deleted, deleted_cursor, history_allocator.allocator());
+            splice.deleted(self.tb, deleted_marks);
+        }
         after_delete.handle(after_delete.ctx);
-        if (bytes.len > 0) self.publishReplacementStep(&inserted, inserted_cursor, history_allocator.allocator());
+        if (bytes.len > 0) {
+            self.publishReplacementStep(&inserted, inserted_cursor, history_allocator.allocator());
+            splice.inserted(self.tb, inserted_marks);
+        }
+    }
+
+    /// Where an edit at rope weight `offset` starts in text bytes, and the text's byte count, so
+    /// highlight layers and marks can follow each step once its root is published. Free without
+    /// either.
+    const EditSplice = struct {
+        active: bool,
+        start_byte: u32 = 0,
+        byte_count: u32 = 0,
+        /// The marks after the steps that `nextMarks` prepared, and the text bytes after them.
+        marks: usize = 0,
+        marks_byte_count: u32 = 0,
+        /// Whether the edit started with marks: only then does it publish their next version.
+        marked: bool = false,
+
+        /// The marks once the text becomes `after`, one step on from the last call: built before
+        /// the step publishes, so publishing cannot fail.
+        inline fn nextMarks(self: *EditSplice, allocator: Allocator, after: *const UnifiedRope) !usize {
+            if (edit_marks.live(self.marks).len == 0) return self.marks;
+            return self.prepareMarks(allocator, after);
+        }
+
+        fn prepareMarks(self: *EditSplice, allocator: Allocator, after: *const UnifiedRope) !usize {
+            text_work.add(.mark_preparations, 1);
+            const byte_count = iter_mod.textBytes(&after.root.metrics());
+            const before = self.marks_byte_count;
+            self.marks = (try edit_marks.splice(allocator, self.marks, self.start_byte, before -| byte_count, byte_count -| before)) orelse self.marks;
+            self.marks_byte_count = byte_count;
+            return self.marks;
+        }
+
+        fn inserted(self: *EditSplice, text_buffer: *UnifiedTextBuffer, marks: usize) void {
+            if (!self.active) return;
+            const byte_count = text_buffer.getByteSize();
+            text_buffer.layers.insertBytes(self.start_byte, byte_count - self.byte_count);
+            self.published(text_buffer, byte_count, marks);
+        }
+
+        fn deleted(self: *EditSplice, text_buffer: *UnifiedTextBuffer, marks: usize) void {
+            if (!self.active) return;
+            const byte_count = text_buffer.getByteSize();
+            text_buffer.layers.deleteBytes(text_buffer.global_allocator, text_buffer.link_pool, self.start_byte, self.start_byte + (self.byte_count - byte_count));
+            self.published(text_buffer, byte_count, marks);
+        }
+
+        fn published(self: *EditSplice, text_buffer: *UnifiedTextBuffer, byte_count: u32, marks: usize) void {
+            self.byte_count = byte_count;
+            if (self.marked) text_buffer.rope().aux = marks;
+            text_buffer.assertLayerBoundaries();
+            text_buffer.assertMarks();
+        }
+    };
+
+    inline fn editSplice(self: *const EditBuffer, row: u32, col: u32, offset: u32, always: bool) EditSplice {
+        if (!always and self.tb.layers.isEmpty() and self.tb.marks().len == 0) return .{ .active = false };
+        return self.activeSplice(row, col, offset);
+    }
+
+    fn activeSplice(self: *const EditBuffer, row: u32, col: u32, offset: u32) EditSplice {
+        const marks = self.tb.rope().aux;
+        // At a line start an edit goes before zero-width text (`insertBias`, `replaceByWeight`);
+        // elsewhere after it, where the weight seek lands.
+        const start_byte = if (col == 0) self.tb.lineStartByte(row) else self.tb.byteOffsetAtWeight(offset);
+        const marks_byte_count = iter_mod.textBytes(&self.tb.rope().root.metrics());
+        return .{ .active = true, .start_byte = start_byte, .byte_count = self.tb.getByteSize(), .marks = marks, .marks_byte_count = marks_byte_count, .marked = marks != 0 };
     }
 
     fn publishReplacementStep(self: *EditBuffer, candidate: *const UnifiedRope, cursor: Cursor, history_allocator: Allocator) void {
@@ -731,7 +870,9 @@ pub const EditBuffer = struct {
         self.finishTextReplacement();
     }
 
+    /// A whole-text replacement leaves no marks; undo restores the ones before it.
     fn finishTextReplacement(self: *EditBuffer) void {
+        self.tb.rope().aux = 0;
         self.cursor = .{ .row = 0, .col = 0 };
         self.publishCursor(true);
     }
@@ -795,8 +936,9 @@ pub const EditBuffer = struct {
     }
 
     fn encodeCurrentCursorMeta(self: *EditBuffer, out_buffer: []u8) ![]const u8 {
-        const cursor = self.getPrimaryCursor();
-        return CursorMeta.fromCursor(cursor, self.tb.tabWidth()).encode(out_buffer);
+        const cursor = CursorMeta.fromCursor(self.getPrimaryCursor(), self.tb.tabWidth());
+        if (self.width_method_changed) return (MethodMeta{ .cursor = cursor, .width_method = self.tb.widthMethod() }).encode(out_buffer);
+        return cursor.encode(out_buffer);
     }
 
     fn autoStoreUndo(self: *EditBuffer) !void {
@@ -817,15 +959,33 @@ pub const EditBuffer = struct {
 
     /// Moves the cursor to a restored step's metadata and returns its public part.
     fn restoreHistoryStep(self: *EditBuffer, meta: []const u8) ![]const u8 {
+        if (self.width_method_changed) return self.restoreRemeasuredStep(meta);
         const current = self.getPrimaryCursor();
         // Unknown metadata keeps the cursor, clamped to the restored text.
         const decoded = CursorMeta.decode(meta) orelse
             CursorMeta{ .row = current.row, .col = current.col, .desired_col = current.col };
         const width_changed = if (decoded.tab_width) |width| width != self.tb.tabWidth() else false;
         const col = if (width_changed)
-            self.remapCol(decoded.row, decoded.col, decoded.tab_width.?) orelse decoded.col
+            self.remapCol(decoded.row, decoded.col, .{ .tab_width = decoded.tab_width.?, .width_method = self.start_width_method }) orelse decoded.col
         else
             decoded.col;
+        return self.placeHistoryCursor(meta, decoded, col, width_changed);
+    }
+
+    /// Records of a buffer whose method changed name the method they were written under; a plain
+    /// record was written under the starting method.
+    noinline fn restoreRemeasuredStep(self: *EditBuffer, meta: []const u8) ![]const u8 {
+        const current = self.getPrimaryCursor();
+        const tagged = MethodMeta.decode(meta);
+        const decoded = (if (tagged) |value| value.cursor else CursorMeta.decode(meta)) orelse
+            CursorMeta{ .row = current.row, .col = current.col, .desired_col = current.col };
+        const old: ?Measure = if (decoded.tab_width) |width| .{ .tab_width = width, .width_method = if (tagged) |value| value.width_method else self.start_width_method } else null;
+        const width_changed = if (old) |measured| !std.meta.eql(measured, self.measure()) else false;
+        const col = if (width_changed) self.remapCol(decoded.row, decoded.col, old.?) orelse decoded.col else decoded.col;
+        return self.placeHistoryCursor(if (tagged == null) meta else meta[0..std.mem.lastIndexOfScalar(u8, meta, ':').?], decoded, col, width_changed);
+    }
+
+    inline fn placeHistoryCursor(self: *EditBuffer, meta: []const u8, decoded: CursorMeta, col: u32, width_changed: bool) ![]const u8 {
         try self.setCursor(decoded.row, col);
         self.cursor.desired_col = if (width_changed and decoded.desired_col == decoded.col)
             col
@@ -854,8 +1014,185 @@ pub const EditBuffer = struct {
 
     pub fn clear(self: *EditBuffer) !void {
         try self.tb.clear();
+        self.tb.rope().aux = 0;
         try self.setCursor(0, 0);
         self.emitNativeEvent(.content_changed);
+    }
+
+    pub const MarkOptions = struct {
+        kind: u32 = 0,
+        atomic: bool = false,
+        /// A SyntaxStyle id, unless `style_value` is set.
+        style: u32 = 0,
+        style_value: ?tb.StyleDefinition = null,
+        priority: u32 = 0,
+        /// Cursor offsets, `start <= end`; past the text they mean its end.
+        start: u32,
+        end: u32,
+    };
+
+    /// Adds a mark and returns its id.
+    pub fn addMark(self: *EditBuffer, options: MarkOptions) !u32 {
+        std.debug.assert(options.start <= options.end);
+        const rope = self.tb.rope();
+        if (self.tb.marks().len == edit_marks.count_max or self.next_mark_id == std.math.maxInt(u32)) return error.ObjectLimit;
+        const style = if (options.style_value) |value| try self.tb.internMarkStyle(value) else options.style;
+        const mark: edit_marks.Mark = .{
+            .id = self.next_mark_id,
+            .kind = options.kind,
+            .style = style,
+            .start_byte = self.tb.byteAtOffset(options.start),
+            .end_byte = self.tb.byteAtOffset(options.end),
+            .priority = options.priority,
+            .atomic = options.atomic,
+            .style_value = options.style_value != null,
+        };
+        self.setMarks(try edit_marks.add(rope.allocator, rope.aux, rope.aux_owned, mark));
+        self.next_mark_id += 1;
+        return mark.id;
+    }
+
+    /// Removes mark `id`; returns whether there was one.
+    pub fn removeMark(self: *EditBuffer, id: u32) !bool {
+        const rope = self.tb.rope();
+        self.setMarks((try edit_marks.remove(rope.allocator, rope.aux, rope.aux_owned, id)) orelse return false);
+        return true;
+    }
+
+    /// Removes every mark; undo can restore them with the text they belong to.
+    pub fn clearMarks(self: *EditBuffer) void {
+        const rope = self.tb.rope();
+        if (self.tb.marks().len > 0) self.setMarks(edit_marks.clear(rope.aux, rope.aux_owned));
+    }
+
+    /// A mark operation's version is the buffer's alone until history stores or loads one.
+    fn setMarks(self: *EditBuffer, marks: usize) void {
+        self.tb.rope().aux = marks;
+        self.tb.rope().aux_owned = true;
+        self.tb.assertMarks();
+        self.tb.span_generation += 1;
+    }
+
+    /// The cursor offsets of `mark`: its start rounds down and its end up to a cursor stop.
+    pub fn markOffsets(self: *const EditBuffer, mark: edit_marks.Mark) struct { start: u32, end: u32 } {
+        return .{ .start = self.tb.weightAtByte(mark.start_byte, true), .end = self.tb.weightAtByte(mark.end_byte, false) };
+    }
+
+    // The cursor rules around atomic marks (tracks/c5-native-marks.md, C5.3). Of overlapping marks the
+    // rules take the oldest (lowest id) first; every move ends outside all of them.
+
+    pub const Toward = enum { nearer, end, start };
+    const Span = struct { start: u32, end: u32 };
+
+    /// The oldest atomic mark that contains `at`, starts at or after `start_min` and ends at or before `end_max`.
+    fn oldestAtomic(self: *const EditBuffer, at: u32, start_min: u32, end_max: u32) ?Span {
+        var found: ?Span = null;
+        var found_id: u32 = std.math.maxInt(u32);
+        for (self.tb.marks()) |mark| {
+            if (!mark.atomic or mark.id > found_id) continue;
+            const span = self.markOffsets(mark);
+            if (span.start <= at and at < span.end and span.start >= start_min and span.end <= end_max) {
+                found = .{ .start = span.start, .end = span.end };
+                found_id = mark.id;
+            }
+        }
+        return found;
+    }
+
+    /// Where a plain Left from `offset` goes: a unit back, or to the end of the line above.
+    fn prevStop(self: *EditBuffer, offset: u32) u32 {
+        const at = iter_mod.offsetToCoords(self.tb.rope(), offset) orelse return offset;
+        return if (at.col > 0) offset - self.tb.getPrevGraphemeWidth(at.row, at.col) else offset -| 1;
+    }
+
+    /// One unit before the marks that surround `start`: Left steps over one chip. A chip that touches it
+    /// there stops it at the touching edge.
+    fn unitBefore(self: *EditBuffer, start: u32) u32 {
+        const s = self.outside(start, false);
+        const p = self.prevStop(s);
+        return if (self.oldestAtomic(p, 0, std.math.maxInt(u32)) != null) s else p;
+    }
+
+    /// The first offset from `offset` toward the end or the start that no atomic mark surrounds.
+    fn outside(self: *const EditBuffer, offset: u32, to_end: bool) u32 {
+        var x = offset;
+        var moved = true;
+        while (moved) {
+            moved = false;
+            for (self.tb.marks()) |mark| {
+                if (!mark.atomic) continue;
+                const span = self.markOffsets(mark);
+                if (span.start < x and x < span.end) {
+                    x = if (to_end) span.end else span.start;
+                    moved = true;
+                }
+            }
+        }
+        return x;
+    }
+
+    /// Moves the cursor to the start of the unit it is in, then, when atomic marks surround it, to the outer
+    /// edge of them toward `toward`.
+    pub fn keepOutside(self: *EditBuffer, toward: Toward) !void {
+        const col = self.snapColumn(self.cursor.row, self.cursor.col);
+        if (col != self.cursor.col) try self.setCursor(self.cursor.row, col);
+        const c = self.cursor.offset;
+        const start = self.outside(c, false);
+        if (start == c) return;
+        const end = self.outside(c, true);
+        const to_end = switch (toward) {
+            .nearer => end - c <= c - start,
+            .end => true,
+            .start => false,
+        };
+        try self.setCursorByOffset(if (to_end) end else start);
+    }
+
+    /// Left from an atomic mark's end goes one unit before it; Right from its start, or from one cell before it,
+    /// to its end. Each steps over one chip; a move ends outside every mark.
+    pub fn moveAtomic(self: *EditBuffer, right: bool) !void {
+        const c = self.cursor.offset;
+        const mark = if (right) self.oldestAtomic(c + 1, c, std.math.maxInt(u32)) else if (c > 0) self.oldestAtomic(c - 1, 0, c) else null;
+        if (mark) |m| {
+            try self.setCursorByOffset(if (right) m.end else self.unitBefore(m.start));
+        } else if (right) self.moveRight() else self.moveLeft();
+        try self.keepOutside(if (right) .end else .start);
+    }
+
+    /// Moves to `offset`, past an atomic mark there as Left and Right do.
+    pub fn setCursorByOffsetAtomic(self: *EditBuffer, offset: u32) !void {
+        const c = self.cursor.offset;
+        const mark = if (offset > c) self.oldestAtomic(offset, c, std.math.maxInt(u32)) else if (offset < c) self.oldestAtomic(offset, 0, c) else null;
+        try self.setCursorByOffset(if (mark) |m| (if (offset > c) m.end else self.unitBefore(m.start)) else offset);
+        try self.keepOutside(if (offset > c) .end else if (offset < c) .start else .nearer);
+    }
+
+    /// After a vertical move from `from` into an atomic mark: nearer its start, one unit before it, nearer its
+    /// end, past it; but Down never goes back to or before `from`, and Up never forward to or past it.
+    pub fn leaveAtomic(self: *EditBuffer, from: u32, down: bool) !void {
+        const c = self.cursor.offset;
+        if (self.oldestAtomic(c, 0, std.math.maxInt(u32))) |mark| {
+            const p = self.prevStop(mark.start);
+            const end = self.outside(mark.end, true);
+            const to_start = if (c - mark.start < mark.end - c) !down or p > from else !down and end >= from;
+            try self.setCursorByOffset(if (to_start) self.outside(p, down) else end);
+        }
+        try self.keepOutside(if (down) .end else .start);
+    }
+
+    /// Backspace at an atomic mark's end or Delete at its start deletes the whole mark as one edit; of marks
+    /// with that edge there, the oldest.
+    pub fn deleteAtomic(self: *EditBuffer, forward_delete: bool) !void {
+        const c = self.cursor.offset;
+        const mark = if (forward_delete) self.oldestAtomic(c, c, std.math.maxInt(u32)) else if (c > 0) self.oldestAtomic(c - 1, 0, c) else null;
+        if (mark) |m| {
+            const rope = self.tb.rope();
+            const start = iter_mod.offsetToCoords(rope, m.start).?;
+            const end = iter_mod.offsetToCoords(rope, m.end).?;
+            try self.deleteRange(.{ .row = start.row, .col = start.col }, .{ .row = end.row, .col = end.col });
+        } else if (forward_delete) try self.deleteForward() else try self.backspace();
+        // A delete that joins graphemes can move a mark's edge across the cursor.
+        try self.keepOutside(.nearer);
     }
 
     pub fn getNextWordBoundary(self: *EditBuffer) Cursor {

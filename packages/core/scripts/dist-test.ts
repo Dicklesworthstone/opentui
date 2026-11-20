@@ -190,6 +190,12 @@ function ensureBuildArtifacts(): void {
     if (!/\bgetBuildOptions\b/.test(elf)) {
       throw new Error("Packaged production native library lost its dynamic FFI exports")
     }
+    const plt = runCommand("objdump", ["-d", "-j", ".plt", nativeLibrary], rootDir, "Failed to read packaged PLT", {
+      stdio: "pipe",
+    }).stdout.toString("utf8")
+    const weakYoga = /\sFUNC\s+WEAK\s+DEFAULT\s+\d+\s+_ZN[rVKRO]*8facebook4yoga/
+    if (weakYoga.test(elf) || plt.includes("constrainMaxSizeForMode"))
+      throw new Error("Packaged native library calls Yoga's C++ helpers through the PLT")
     if (!elf.includes(".note.gnu.build-id") || !elf.includes(".gnu_debuglink")) {
       throw new Error("Packaged native ELF cannot be matched to its separate release symbols")
     }
@@ -488,6 +494,35 @@ function writeBunTest(bunDir: string): void {
     `import { describe, expect, test } from "bun:test"
 
 describe("${packageJson.name} dist smoke test", () => {
+  test("removes and destroys children from the other runtime bundle", async () => {
+    const core = await import(${JSON.stringify(packageJson.name)})
+    const otherCore = await import(new URL("./index.node.js", import.meta.resolve(${JSON.stringify(packageJson.name)})).href)
+    const { createTestRenderer } = await import(${JSON.stringify(`${packageJson.name}/testing`)})
+    const { renderer } = await createTestRenderer({ width: 20, height: 5 })
+
+    try {
+      const child = new otherCore.BoxRenderable(renderer, { id: "other-bundle-child" })
+      expect(child instanceof core.BaseRenderable).toBe(false)
+      expect(core.isRenderable(child)).toBe(true)
+
+      expect(renderer.root.add(child)).toBe(0)
+      renderer.root.remove(child)
+
+      expect(renderer.root.getChildren()).toEqual([])
+      expect(child.parent).toBeNull()
+      expect(child.isDestroyed).toBe(false)
+
+      renderer.root.add(child)
+      renderer.root.destroyRecursively()
+
+      expect(child.isDestroyed).toBe(true)
+      expect(child.parent).toBeNull()
+      expect(renderer.root.getChildren()).toEqual([])
+    } finally {
+      renderer.destroy()
+    }
+  })
+
   test("imports portable and Bun-only entrypoints", async () => {
     const core = await import(${JSON.stringify(packageJson.name)})
     const testing = await import(${JSON.stringify(`${packageJson.name}/testing`)})

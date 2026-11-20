@@ -1,7 +1,7 @@
 import { describe, expect, it, afterEach, spyOn } from "bun:test"
 import { TextareaRenderable } from "../renderables/Textarea.js"
 import { createTestRenderer, type TestRenderer, type MockInput } from "../testing/test-renderer.js"
-import { type ExtmarksController } from "./extmarks.js"
+import { createExtmarksController, type ExtmarksController } from "./extmarks.js"
 import { SyntaxStyle } from "../syntax-style.js"
 import { RGBA } from "./RGBA.js"
 
@@ -272,24 +272,37 @@ describe("ExtmarksController", () => {
       expect(textarea.cursorOffset).toBe(2)
     })
 
-    it("should jump to position BEFORE extmark start when moving left from after extmark", async () => {
-      await setup("abcdefgh")
+    // A mark that overlaps the one moved over is skipped too; one that touches it is the next step.
+    for (const [end, to] of [
+      [4, 4],
+      [5, 1],
+    ]) {
+      it(`should jump over virtual extmarks at 2..${end} and 4..6 when moving left to ${to}`, async () => {
+        await setup("ab@x@y")
 
-      textarea.focus()
-      textarea.cursorOffset = 6
+        textarea.focus()
+        textarea.cursorOffset = 6
+        extmarks.create({ start: 2, end, virtual: true })
+        extmarks.create({ start: 4, end: 6, virtual: true })
 
-      extmarks.create({
-        start: 3,
-        end: 6,
-        virtual: true,
+        currentMockInput.pressArrow("left")
+        expect(textarea.cursorOffset).toBe(to)
       })
+    }
 
-      expect(textarea.cursorOffset).toBe(6)
-
-      // When moving left from position 6 (right after extmark end),
-      // should jump to position 2 (before extmark start at 3)
-      currentMockInput.pressArrow("left")
-      expect(textarea.cursorOffset).toBe(2)
+    // Chips whose separator spaces were deleted: Right steps over one, Backspace deletes the one before the cursor
+    // and Delete the one after it.
+    it("should step over and delete touching virtual extmarks one at a time", async () => {
+      await setup("xx @a@b@c yy")
+      textarea.focus()
+      textarea.cursorOffset = 2
+      for (const start of [3, 5, 7]) extmarks.create({ start, end: start + 2, virtual: true })
+      currentMockInput.pressArrow("right")
+      expect(textarea.cursorOffset).toBe(5)
+      currentMockInput.pressKey("DELETE")
+      expect(textarea.plainText).toBe("xx @a@c yy")
+      currentMockInput.pressBackspace()
+      expect([textarea.plainText, textarea.cursorOffset]).toEqual(["xx @c yy", 3])
     })
 
     it("should allow normal cursor movement left outside virtual extmark", async () => {
@@ -312,6 +325,29 @@ describe("ExtmarksController", () => {
     })
   })
 
+  // The second cell of a wide character is not a stop: the setters go to its start.
+  it("should keep the cursor off the second cell of a wide character", async () => {
+    await setup("a日b")
+    textarea.focus()
+    textarea.cursorOffset = 0
+    extmarks.create({ start: 0, end: 1, virtual: true })
+    textarea.editBuffer.setCursorByOffset(2)
+    expect(textarea.cursorOffset).toBe(1)
+    textarea.cursorOffset = 4
+    textarea.cursorOffset = 2
+    expect(textarea.cursorOffset).toBe(1)
+  })
+
+  // A move that applies no rule, such as Home into a mark across lines, still ends outside it, at the nearer edge.
+  it("should keep the cursor outside a virtual extmark after Home", async () => {
+    await setup("ab\ncde")
+    textarea.focus()
+    textarea.cursorOffset = 6
+    extmarks.create({ start: 2, end: 5, virtual: true })
+    textarea.gotoLineHome()
+    expect(textarea.cursorOffset).toBe(2)
+  })
+
   describe("Virtual Extmark - Selection Mode", () => {
     it("should allow selection through virtual extmark", async () => {
       await setup("abcdefgh")
@@ -332,6 +368,93 @@ describe("ExtmarksController", () => {
       expect(textarea.cursorOffset).toBe(3)
       expect(textarea.hasSelection()).toBe(true)
     })
+  })
+
+  describe("Virtual Extmark - Mouse, Wheel and Offset Setter", () => {
+    // One row of 24 columns. While a selection is left the cursor and the selection are `held`; then it is cleared. A
+    // press's handlers see the pressed cell; then a pointer leaves the cursor at the nearer outer edge of the marks
+    // around it, a cleared drag at the side it came from, the wheel and the setter at the edge they moved toward.
+    // "press" drags through its other cells and types Z before the release. After ", " comes a key, a wheel step, an offset, a selection or a click. The
+    // rows match the Rust editor's but Shift+Left, which extends a selection into a mark here, and the rejected offset.
+    const pasted = "x [Pasted ~20 lines] y"
+    // Rows "@file ", "abcdefghijklmnopqrstuvwx", "yzabcdefghijklmnopqrstuv", "wxyz", "q": a wheel step lands on "wxyz".
+    const wrapped = "@file abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\nq"
+    for (const [text, marks, from, gesture, held, to] of [
+      ["x @file y", "2..7", 9, "click 2", null, 2],
+      ["x @file y", "2..7", 9, "click 3", null, 2],
+      ["x @file y", "2..7", 9, "click 5", null, 7],
+      ["x @file y", "2..7", 9, "press 3", null, 3],
+      ["x @file y", "2..7", 9, "press 3 5 3", null, 3],
+      ["x @file y", "2..7", 9, "offset -1, click 3", null, 2],
+      [pasted, "2..20", 22, "click 15", null, 20],
+      ["x @file y", "2..7", 9, "double-click 4", "4 2..7", 2],
+      ["x @file y", "2..7", 9, "double-click 4, offset 3", null, 2],
+      ["x @file y", "2..7", 9, "double-click 4, select 2 7", "4 2..7", 2],
+      ["x @file y", "2..7", 9, "drag 0 4", "4 0..5", 2],
+      ["x @file y", "2..7", 9, "drag 8 4", "4 4..9", 7],
+      ["x @file y", "2..7", 9, "drag 8 6", "6 6..9", 7],
+      ["x @file y", "2..7", 9, "drag 3 5 3", null, 2],
+      ["x @file y", "2..7", 9, "drag 0 4, right", null, 7],
+      ["b ca", "0..3 0..4", 4, "click 2", null, 4],
+      ["b ca", "0..4 0..3", 4, "click 2", null, 4],
+      ["abcdefgh", "0..6 2..8", 8, "click 3", null, 0],
+      ["abcdefgh", "2..8 0..6", 8, "click 3", null, 0],
+      ["b ca", "0..3 0..4", 0, "offset 2", null, 4],
+      ["b ca", "0..4 0..3", 4, "offset 2", null, 0],
+      ["abcd", "2..4 1..3 0..2", 0, "offset 1", null, 4],
+      ["ab\n@file\nc", "3..8", 2, "wheel down", null, 8],
+      ["ab\n@file\nc", "3..8", 10, "wheel up", null, 3],
+      [wrapped, "0..5", 60, "wheel up", null, 55],
+      ["abcd\n@file\nc", "5..10", 0, "double-click 2, wheel down", "7 0..4", 5],
+    ] as const) {
+      it(`${gesture} from ${from} in ${JSON.stringify(text)} with ${marks} → ${to}`, async () => {
+        const result = await createTestRenderer({ width: 24, height: 2 })
+        currentRenderer = result.renderer
+        textarea = new TextareaRenderable(currentRenderer, { width: 24, height: 1, initialValue: text })
+        currentRenderer.root.add(textarea)
+        textarea.focus()
+        extmarks = textarea.extmarks
+        for (const [start, end] of marks.split(" ").map((mark) => mark.split("..").map(Number))) {
+          extmarks.create({ start, end, virtual: true })
+        }
+        textarea.cursorOffset = from
+        await result.renderOnce()
+        // As OpenCode's prompt: a press looks up the mark under the cursor.
+        let pressed: number | undefined
+        textarea.onMouseDown = () => (pressed = textarea.cursorOffset)
+        const [first, then = ""] = gesture.split(", ")
+        const [kind, a, b, c] = first.split(" ")
+        const mouse = result.mockMouse
+        if (kind === "click") await mouse.click(Number(a), 0)
+        else if (kind === "press") {
+          await mouse.pressDown(Number(a), 0)
+          for (const x of [b, c].filter(Boolean)) await mouse.moveTo(Number(x), 0)
+          await result.mockInput.typeText("Z")
+          await mouse.release(Number(c ?? a), 0)
+          expect(textarea.plainText).toBe("x Z@file y")
+        } else if (kind === "double-click") await mouse.doubleClick(Number(a), 0)
+        else if (kind === "drag" && c) {
+          await mouse.pressDown(Number(a), 0)
+          await mouse.moveTo(Number(b), 0)
+          await mouse.moveTo(Number(c), 0)
+          await mouse.release(Number(c), 0)
+        } else if (kind === "drag") await mouse.drag(Number(a), 0, Number(b), 0)
+        else if (kind === "offset" && Number(a) < 0) expect(() => (textarea.cursorOffset = Number(a))).toThrow()
+        else if (kind === "offset") textarea.cursorOffset = Number(a)
+        else await mouse.scroll(0, 0, a as "up" | "down")
+        if (kind === "click" || kind === "press") expect(pressed).toBe(Number(a))
+        const [step, x, y] = then.split(" ")
+        if (step === "wheel") await mouse.scroll(0, 0, x as "up" | "down")
+        else if (step === "offset") textarea.cursorOffset = Number(x)
+        else if (step === "select") textarea.setSelection(Number(x), Number(y))
+        else if (step === "click") await mouse.click(Number(x), 0)
+        else if (step) result.mockInput.pressArrow(step as "right")
+        const selection = textarea.getSelection()
+        expect(selection && `${textarea.cursorOffset} ${selection.start}..${selection.end}`).toBe(held)
+        if (selection) textarea.clearSelection()
+        expect(textarea.cursorOffset).toBe(to)
+      })
+    }
   })
 
   describe("Virtual Extmark - Backspace Deletion", () => {
@@ -388,6 +511,35 @@ describe("ExtmarksController", () => {
 
       expect(textarea.plainText).toBe("abc[INK]def")
     })
+
+    // Overlapping virtual extmarks are seen in creation order, not in start order.
+    it("should delete the first-created of overlapping virtual extmarks", async () => {
+      await setup("abcd")
+      textarea.focus()
+      textarea.cursorOffset = 4
+      const later = extmarks.create({ start: 1, end: 4, virtual: true })
+      const earlier = extmarks.create({ start: 0, end: 4, virtual: true })
+      expect(extmarks.getAll().map((mark) => mark.id)).toEqual([earlier, later])
+      currentMockInput.pressBackspace()
+      expect(textarea.plainText).toBe("a")
+    })
+
+    // An older mark around the cursor does not hide a newer one whose edge is there: Delete and Backspace take it
+    // whole.
+    for (const [at, key] of [
+      [3, "DELETE"],
+      [6, "BACKSPACE"],
+    ] as const) {
+      it(`should delete a whole nested virtual extmark with ${key} at ${at}`, async () => {
+        await setup("abcdefghijklmno")
+        textarea.focus()
+        textarea.cursorOffset = at
+        extmarks.create({ start: 1, end: 8, virtual: true })
+        extmarks.create({ start: 3, end: 6, virtual: true })
+        currentMockInput.pressKey(key)
+        expect(textarea.plainText).toBe("abcghijklmno")
+      })
+    }
   })
 
   describe("Virtual Extmark - Delete Key", () => {
@@ -612,6 +764,38 @@ describe("ExtmarksController", () => {
       expect(extmark?.start).toBe(0)
       expect(extmark?.end).toBe(3)
     })
+
+    // An edit that changes part of a virtual extmark drops it and changes exactly the text it asked for; a plain one
+    // grows or is clipped. Q1: insert inside; Q2: a range delete that cuts in; Q2b: a selection delete that cuts in.
+    it.each<[string, () => void, string, [number, number]]>([
+      [
+        "Q1 insert inside",
+        () => (textarea.editBuffer.setCursor(0, 8), textarea.editBuffer.insertText("X")),
+        "Hello WoXrld",
+        [6, 12],
+      ],
+      ["Q2 deleteRange", () => textarea.deleteRange(0, 4, 0, 8), "Hellrld", [4, 7]],
+      [
+        "Q2b selection delete",
+        () => (textarea.editorView.setSelection(4, 8), textarea.editorView.deleteSelectedText()),
+        "Hellrld",
+        [4, 7],
+      ],
+      [
+        "Q2b selection replace",
+        () => (textarea.editorView.setSelection(4, 8), textarea.editorView._replaceSelectedText("_")),
+        "Hell_rld",
+        [5, 8],
+      ],
+    ])("%s drops a virtual extmark and moves a plain one", async (_, edit, text, plain) => {
+      await setup("Hello World")
+      const virtual = extmarks.create({ start: 6, end: 11, virtual: true })
+      const id = extmarks.create({ start: 6, end: 11 })
+      edit()
+      expect(textarea.plainText).toBe(text)
+      expect(extmarks.get(virtual)).toBeNull()
+      expect(extmarks.get(id)).toMatchObject({ start: plain[0], end: plain[1] })
+    })
   })
 
   describe("Highlighting Integration", () => {
@@ -807,6 +991,77 @@ describe("ExtmarksController", () => {
         errors.mockRestore()
       }
     })
+
+    // A typed key, a prompt's typed query after it, Left, Right, Delete and Backspace (Delete at a virtual mark), Left
+    // over a mark, a paste, a selection and the key that replaces it make the same native calls whatever the number of
+    // styled marks after them; the query is one call, and every other operation applies the cursor rules once.
+    it("should make the same FFI calls per key at 0, 10 and 40 styled marks", async () => {
+      const calls: number[][] = []
+      const rules: number[][] = []
+      for (const count of [0, 10, 40]) {
+        if (count) currentRenderer.destroy()
+        await setup("ab".repeat(60))
+        const style = SyntaxStyle.create(currentRenderer.nativeScene)
+        const styleId = style.registerStyle("link", { fg: RGBA.fromValues(0, 0, 1, 1) })
+        textarea.syntaxStyle = style
+        extmarks.create({ start: 4, end: 6, virtual: true })
+        extmarks.create({ start: 8, end: 10, virtual: true })
+        for (let i = 0; i < count; i++) extmarks.create({ start: 20 + 2 * i, end: 21 + 2 * i, styleId, virtual: true })
+        textarea.focus()
+        textarea.cursorOffset = 0
+        // The query's record buffer grows once, to the largest list read.
+        extmarks.getAll()
+        const symbols = (currentRenderer.nativeScene.driver.renderLib as any).opentui.symbols
+        const originals = { ...symbols }
+        let made = 0
+        let ruled = 0
+        for (const name of Object.keys(originals))
+          symbols[name] = (...args: any[]) => (made++, originals[name](...args))
+        // A rule command: a buffer or view move or delete with the atomic flag, the atomic setter or KEEP_OUTSIDE.
+        symbols.ot_edit_buffer_command = (...args: any[]) => {
+          const [op, flag] = [args[2], args[3]]
+          if (([0, 1, 4, 5].includes(op) && flag === 1) || op === 13 || op === 14) ruled++
+          return (made++, originals.ot_edit_buffer_command(...args))
+        }
+        symbols.ot_editor_view_command = (...args: any[]) => {
+          if (args[2] <= 1 && args[3] === 1) ruled++
+          return (made++, originals.ot_editor_view_command(...args))
+        }
+        calls.push([])
+        rules.push([])
+        const counted = async (operation: () => unknown) => {
+          const [before, beforeRules] = [made, ruled]
+          await operation()
+          calls.at(-1)!.push(made - before)
+          rules.at(-1)!.push(ruled - beforeRules)
+        }
+        try {
+          await counted(() => currentMockInput.pressKey("X"))
+          await new Promise((resolve) => setTimeout(resolve, 0))
+          await counted(() => extmarks.getAllForTypeId(0))
+          await counted(() => currentMockInput.pressArrow("left"))
+          await counted(() => currentMockInput.pressArrow("right"))
+          textarea.cursorOffset = 5
+          await counted(() => currentMockInput.pressKey("DELETE"))
+          await counted(() => currentMockInput.pressBackspace())
+          textarea.cursorOffset = 8
+          await counted(() => currentMockInput.pressArrow("left"))
+          await counted(() => currentMockInput.pasteBracketedText("p"))
+          await counted(() => textarea.setSelection(0, 1))
+          await counted(() => currentMockInput.pressKey("Y"))
+        } finally {
+          Object.assign(symbols, originals)
+        }
+        expect([textarea.plainText.slice(0, 7), textarea.cursorOffset]).toEqual(["Yabaapb", 1])
+        if (count) expect(extmarks.getAll().at(-1)).toMatchObject({ start: 2 * count + 17, end: 2 * count + 18 })
+      }
+      // With the rules in TypeScript: Left 16, Right 17, Delete 8, Backspace 6, Left over a mark 18. A new selection
+      // holds the cursor at its focus, so making one applies no rule.
+      expect({ calls, rules }).toEqual({
+        calls: [0, 10, 40].map(() => [4, 1, 6, 6, 4, 4, 6, 6, 3, 4]),
+        rules: [0, 10, 40].map(() => [1, 0, 1, 1, 1, 1, 1, 1, 0, 1]),
+      })
+    })
   })
 
   describe("Multiline Text Support", () => {
@@ -868,6 +1123,20 @@ describe("ExtmarksController", () => {
       textarea.cursorOffset = 2
       currentMockInput.pressArrow("right")
       expect(textarea.cursorOffset).toBe(3)
+      // The view's rules stop too: the setter leaves the cursor inside the mark.
+      textarea.cursorOffset = 4
+      expect(textarea.cursorOffset).toBe(4)
+    })
+
+    // A second controller of the same view going leaves the view's rules to the first.
+    it("should keep a view's rules while another controller of it lives", async () => {
+      await setup("123456789\na@file now\n123456789")
+      textarea.focus()
+      extmarks.create({ start: 11, end: 16, virtual: true })
+      createExtmarksController(textarea.editBuffer, textarea.editorView).destroy()
+      textarea.cursorOffset = 23
+      currentMockInput.pressArrow("up")
+      expect(textarea.cursorOffset).toBe(10)
     })
 
     it("should clear all extmarks on destroy", async () => {
@@ -1486,7 +1755,7 @@ Press ESC to return to main menu.`
 
   describe("deleteLine() Operations", () => {
     // Offsets count display cells. Wide text and controls take more cells than string units, and the last line goes
-    // with the line break before it.
+    // with the line break before it. A mark past the text ends at its end, so deleting all of it drops the mark.
     it.each<[string, number, number, number, [number, number] | null, string]>([
       ["Line1\nLine2\nLine3", 3, 12, 17, [6, 11], "Line2\nLine3"],
       ["Line1\nLine2\nLine3", 8, 6, 11, null, "Line1\nLine3"],
@@ -1494,7 +1763,7 @@ Press ESC to return to main menu.`
       ["日日日\nxyz", 0, 7, 10, [0, 3], "xyz"],
       ["\f\f\f\nxyz", 0, 7, 10, [0, 3], "xyz"],
       ["ab\ncd", 4, 0, 3, [0, 2], "ab"],
-      ["\f\f", 2, 0, 6, [0, 2], ""],
+      ["\f\f", 2, 0, 6, null, ""],
     ])("deletes the line of %j at %d and moves [%d, %d) to %j", async (text, cursor, start, end, expected, rest) => {
       await setup(text)
       const id = extmarks.create({ start, end })
@@ -1941,6 +2210,11 @@ Press ESC to return to main menu.`
       const extmark = extmarks.get(id)
       expect(extmark?.start).toBe(5)
       expect(extmark?.end).toBe(5)
+
+      // Decision (C5.2, Rust's rule before C5.1): text typed at an empty mark goes after it, so the mark stays.
+      textarea.editBuffer.setCursor(0, 5)
+      textarea.editBuffer.insertText("X")
+      expect(extmarks.get(id)).toMatchObject({ start: 5, end: 5 })
     })
 
     it("should handle overlapping extmarks", async () => {
@@ -1968,84 +2242,6 @@ Press ESC to return to main menu.`
   })
 
   describe("Virtual Extmark - Cursor Up/Down Movement", () => {
-    it("should not land inside virtual extmark when moving down", async () => {
-      await setup("abc\n[VIRTUAL]\ndef")
-
-      textarea.focus()
-      textarea.cursorOffset = 1
-
-      extmarks.create({
-        start: 4,
-        end: 13,
-        virtual: true,
-      })
-
-      expect(textarea.cursorOffset).toBe(1)
-
-      currentMockInput.pressArrow("down")
-      const cursorAfterDown = textarea.cursorOffset
-
-      const isInsideExtmark = cursorAfterDown >= 4 && cursorAfterDown < 13
-      expect(isInsideExtmark).toBe(false)
-    })
-
-    it("should not land inside virtual extmark when moving up", async () => {
-      await setup("abc\n[VIRTUAL]\ndef")
-
-      textarea.focus()
-      textarea.cursorOffset = 15
-
-      extmarks.create({
-        start: 4,
-        end: 13,
-        virtual: true,
-      })
-
-      expect(textarea.cursorOffset).toBe(15)
-
-      currentMockInput.pressArrow("up")
-      const cursorAfterUp = textarea.cursorOffset
-
-      const isInsideExtmark = cursorAfterUp >= 4 && cursorAfterUp < 13
-      expect(isInsideExtmark).toBe(false)
-    })
-
-    it("should jump to closest boundary when moving down into virtual extmark", async () => {
-      await setup("abc\n[VIRTUAL]\ndef")
-
-      textarea.focus()
-      textarea.cursorOffset = 1
-
-      extmarks.create({
-        start: 4,
-        end: 13,
-        virtual: true,
-      })
-
-      currentMockInput.pressArrow("down")
-      const cursorAfterDown = textarea.cursorOffset
-
-      expect(cursorAfterDown === 3 || cursorAfterDown === 13).toBe(true)
-    })
-
-    it("should jump to closest boundary when moving up into virtual extmark", async () => {
-      await setup("abc\n[VIRTUAL]\ndef")
-
-      textarea.focus()
-      textarea.cursorOffset = 15
-
-      extmarks.create({
-        start: 4,
-        end: 13,
-        virtual: true,
-      })
-
-      currentMockInput.pressArrow("up")
-      const cursorAfterUp = textarea.cursorOffset
-
-      expect(cursorAfterUp === 3 || cursorAfterUp === 13).toBe(true)
-    })
-
     it("should handle multiline virtual extmarks when moving up", async () => {
       await setup("line1\n[VIRTUAL\nMULTILINE]\nline4")
 

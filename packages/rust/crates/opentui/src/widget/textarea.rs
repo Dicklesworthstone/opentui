@@ -10,8 +10,10 @@ use std::rc::Rc;
 
 /// Multi-line text editing with Core's key bindings, undo, wrapping, mouse selection, and paste.
 ///
-/// The area grows with its content unless its height is set. Alt+Enter calls [`Self::on_submit`]. Change the keys
-/// with [`Self::bind`] and [`Self::unbind`]; [`EditorAction`] lists what they can do.
+/// The area grows with its content unless its height is set. Alt+Enter calls [`Self::on_submit`]. A paste loses its
+/// escape sequences as with [`strip_ansi_sequences`](crate::input::strip_ansi_sequences) and its control characters
+/// but tab and line breaks, as in Core. Change the keys with [`Self::bind`] and [`Self::unbind`]; [`EditorAction`]
+/// lists what they can do.
 ///
 /// With the `tree-sitter` feature, [`Self::filetype`] highlights the text as it is edited; see
 /// [`syntax`](crate::syntax).
@@ -24,7 +26,7 @@ use std::rc::Rc;
 /// # Ok::<(), opentui::Error>(())
 /// ```
 #[derive(Clone)]
-pub struct Textarea(Rc<EditorCore>);
+pub struct Textarea(pub(crate) Rc<EditorCore>);
 
 impl Widget for Textarea {
     fn element(&self) -> &Element {
@@ -60,17 +62,20 @@ impl Textarea {
         self.clone()
     }
 
+    /// The buffer text. Rust string indices count UTF-8 bytes, not cursor cells.
     pub fn text(&self) -> String {
         self.0.text()
     }
 
     /// Replaces the text, clears undo history, and moves the cursor to the end. Does not call change handlers.
+    /// Control characters and escape sequences stay, shown as notation such as `^G`, while a paste strips them.
     pub fn set_text(&self, text: impl AsRef<str>) -> Self {
         self.0.set_text(text.as_ref());
         self.clone()
     }
 
-    /// Inserts text at the cursor as an undoable edit, replacing any selection, and calls change handlers.
+    /// Inserts text at the cursor as an undoable edit, replacing any selection, and calls change handlers. Control
+    /// characters stay, as with [`Self::set_text`].
     pub fn insert(&self, text: impl AsRef<str>) -> Self {
         self.0.insert_notifying(text.as_ref());
         self.clone()
@@ -106,8 +111,10 @@ impl Textarea {
     /// [`SyntaxTheme::to_syntax_style`]. Without one, the textarea makes its own.
     ///
     /// The textarea registers the styles of [`Self::filetype`] highlighting and of extmarks in this table, under
-    /// names that start with `opentui.`, and adds their highlights under tags 65534 and 65535. Highlighting draws at
-    /// priority 0 and extmarks above it.
+    /// names that start with `opentui.`: each capture name as `opentui.<capture>`, with its [`Self::syntax_theme`]
+    /// style. Textareas that share a table share one syntax theme: the one set last on any of them, here or with
+    /// [`Self::syntax_theme`], restyles them all. Highlighting draws on layer 1 and extmarks above it, under tag 65535;
+    /// text the theme leaves plain lets your own priority-0 highlights show.
     pub fn syntax_style(&self, style: &SyntaxStyle) -> Self {
         self.0.set_syntax_style(style);
         self.clone()

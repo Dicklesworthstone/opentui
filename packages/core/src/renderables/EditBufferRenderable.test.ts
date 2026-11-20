@@ -7,6 +7,7 @@ import { createTestRenderer, type TestRenderer } from "../testing/test-renderer.
 import { StyledText } from "../lib/styled-text.js"
 import { RGBA } from "../lib/RGBA.js"
 import { RecordingWriteStream } from "../testing/test-streams.js"
+import controlConformance from "./editor-controls.conformance.json" with { type: "json" }
 
 describe("EditBufferRenderable", () => {
   let renderer: TestRenderer
@@ -67,6 +68,44 @@ describe("EditBufferRenderable", () => {
     expect(await frame()).toContain("p^@q")
     editor.undo()
     expect(editor.plainText).toBe("A\x07B\x1bC\fD")
+  })
+
+  // Controls take notation cells, so the cursor offset is a cell count, not the string length. The Rust crate runs
+  // the same rows.
+  test.each(controlConformance.rows)("%s: %s %s keeps them", (_name, widget, path, text, expected) => {
+    // The test above covers a Textarea's initialValue.
+    const editor =
+      widget === "input"
+        ? new InputRenderable(renderer, { width: 20, maxLength: 6, value: path === "constructor" ? text : "" })
+        : new TextareaRenderable(renderer, { width: 20, height: 2 })
+    if (path === "insert") editor.insertText(text)
+    if (editor instanceof InputRenderable) {
+      if (path === "value") editor.value = text
+    } else {
+      if (path === "value") editor.setText(text)
+      // A Textarea's setText leaves the cursor at the start; an Input puts it after the text.
+      editor.gotoBufferEnd()
+    }
+    editor.insertText("!")
+    expect(editor.plainText).toBe(expected)
+    editor.destroy()
+  })
+
+  test.each([
+    [0.4, 3],
+    [0, 0],
+    [undefined, 1],
+  ] as const)("scrollMargin = %s reaches the live viewport", async (margin, expected) => {
+    const editor = new TextareaRenderable(renderer, { height: 10, initialValue: "a\n".repeat(32), scrollMargin: 0.3 })
+    renderer.root.add(editor)
+    await renderOnce()
+    editor.scrollMargin = margin
+    editor.cursorOffset = 16
+    expect(editor.scrollY).toBe(expected)
+    expect(() => {
+      editor.scrollMargin = NaN
+    }).toThrow()
+    expect(editor.scrollMargin).toBe(margin ?? 0.2)
   })
 
   test("brands textarea and input instances", async () => {

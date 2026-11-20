@@ -15,7 +15,7 @@ import { TextNodeRenderable } from "../renderables/TextNode.js"
 import { TextRenderable } from "../renderables/Text.js"
 import { ScrollBoxRenderable } from "../renderables/ScrollBox.js"
 import { BoxRenderable, type BoxOptions } from "../renderables/Box.js"
-import { Align, Edge, FlexDirection, Gutter, Justify, PositionType, Unit, Wrap } from "../yoga.js"
+import { Align, BoxSizing, Edge, FlexDirection, Gutter, Justify, PositionType, Unit, Wrap } from "../yoga.js"
 import { InputRenderable } from "../renderables/Input.js"
 import { SliderRenderable } from "../renderables/Slider.js"
 import { ImageRenderable } from "../renderables/Image.js"
@@ -369,12 +369,16 @@ describe("Renderable - declared style getters", () => {
     ["getFlexDirection", (box) => box.getFlexDirection(), { flexDirection: "row-reverse" }, FlexDirection.RowReverse],
     ["getFlexWrap", (box) => box.getFlexWrap(), { flexWrap: "wrap-reverse" }, Wrap.WrapReverse],
     ["getAlignItems", (box) => box.getAlignItems(), { alignItems: "center" }, Align.Center],
+    ["getAlignContent", (box) => box.getAlignContent(), { alignContent: "space-around" }, Align.SpaceAround],
+    ["getAspectRatio", (box) => box.getAspectRatio(), { aspectRatio: 1.5 }, 1.5],
+    ["getBoxSizing", (box) => box.getBoxSizing(), { boxSizing: "content-box" }, BoxSizing.ContentBox],
     ["getJustifyContent", (box) => box.getJustifyContent(), { justifyContent: "space-between" }, Justify.SpaceBetween],
     ["getAlignSelf", (box) => box.getAlignSelf(), { alignSelf: "flex-end" }, Align.FlexEnd],
     ["getPositionType", (box) => box.getPositionType(), { position: "absolute" }, PositionType.Absolute],
     ["getFlexGrow", (box) => box.getFlexGrow(), { flexGrow: 2 }, 2],
     ["getFlexShrink", (box) => box.getFlexShrink(), { flexShrink: 3 }, 3],
     ["getFlexBasis", (box) => box.getFlexBasis(), { flexBasis: 7 }, point(7)],
+    ["getFlexBasis percent", (box) => box.getFlexBasis(), { flexBasis: "60%" }, percent(60)],
     ["getWidth", (box) => box.getWidth(), { width: "50%" }, percent(50)],
     ["getHeight", (box) => box.getHeight(), { height: "40%" }, percent(40)],
     ["getMinWidth", (box) => box.getMinWidth(), { minWidth: 4 }, point(4)],
@@ -462,6 +466,70 @@ test.each([
     expect([constructed.read(), assigned.read()]).toEqual([expected, expected])
   },
 )
+
+test.each(["box", "scroll content"])("%s lays out wrapped lines at the requested aspect ratio", async (kind) => {
+  const options: BoxOptions = {
+    width: 12,
+    minHeight: 6,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignContent: "space-between",
+    aspectRatio: 1.5,
+  }
+  const box =
+    kind === "box"
+      ? new BoxRenderable(testRenderer, options)
+      : new ScrollBoxRenderable(testRenderer, {
+          width: 12,
+          height: 4,
+          scrollbarOptions: { visible: false },
+          contentOptions: options,
+        })
+  const target = box instanceof ScrollBoxRenderable ? box.content : box
+  const first = new BoxRenderable(testRenderer, { width: 8, height: 2 })
+  const second = new BoxRenderable(testRenderer, { width: 8, height: 2 })
+  box.add(first)
+  box.add(second)
+  testRenderer.root.add(box)
+  const geometry = async () => {
+    await renderOnce()
+    return [target.height, first.y - target.y, second.y - target.y]
+  }
+  expect(await geometry()).toEqual([8, 0, 6])
+  target.alignContent = "center"
+  target.aspectRatio = 1
+  expect(await geometry()).toEqual([12, 4, 6])
+  target.alignContent = undefined
+  target.aspectRatio = null
+  expect(await geometry()).toEqual([6, 0, 2])
+})
+
+test("content-box adds padding to box and scroll content sizes, and a percentage basis sizes a child", async () => {
+  const contentBox = { minHeight: 3, padding: 1, boxSizing: "content-box" } as const
+  const box = new BoxRenderable(testRenderer, { ...contentBox, width: 10, flexDirection: "row" })
+  const scroll = new ScrollBoxRenderable(testRenderer, {
+    width: 10,
+    height: 8,
+    scrollbarOptions: { visible: false },
+    contentOptions: contentBox,
+  })
+  const child = new BoxRenderable(testRenderer, { height: 1, flexBasis: "50%" })
+  box.add(child)
+  testRenderer.root.add(box)
+  testRenderer.root.add(scroll)
+  const geometry = async () => {
+    await renderOnce()
+    return [box.width, box.height, scroll.content.height, child.width]
+  }
+  expect(await geometry()).toEqual([12, 5, 5, 5])
+  child.flexBasis = "30%"
+  scroll.content.boxSizing = "border-box"
+  expect(await geometry()).toEqual([12, 5, 3, 3])
+  box.boxSizing = null
+  child.flexBasis = undefined
+  // The width of the same child built without a basis.
+  expect(await geometry()).toEqual([10, 3, 3, 1])
+})
 
 describe("Renderable - Child Management", () => {
   test("can add and remove children", () => {
@@ -796,6 +864,49 @@ describe("Renderable - Child Management", () => {
     const result = parent.add(child)
     expect(result).toBe(-1)
     expect(parent.getChildrenCount()).toBe(0)
+  })
+
+  // Typed callers are rejected at compile time; the wide dynamic contract (BaseRenderable) used by reconcilers and
+  // plain JS callers validates at runtime: falsy input returns -1 silently, other non-renderables return -1 and warn.
+  test("add and insertBefore reject non-renderable input", () => {
+    const parent = new TestRenderable(testRenderer, { id: "parent" })
+    const anchor = new TestRenderable(testRenderer, { id: "anchor" })
+    const dynParent: BaseRenderable = parent
+    parent.add(anchor)
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {})
+    const rows: [unknown, number][] = [
+      [null, 0],
+      [undefined, 0],
+      [false, 0],
+      [0, 0],
+      ["", 0],
+      [{}, 1],
+      ["not a renderable", 1],
+      [42, 1],
+      [[anchor], 1],
+    ]
+    for (const [input, warnings] of rows) {
+      for (const call of [() => dynParent.add(input), () => dynParent.insertBefore(input, anchor)]) {
+        warnSpy.mockClear()
+        expect<unknown>(call()).toBe(-1)
+        expect(warnSpy).toHaveBeenCalledTimes(warnings)
+      }
+    }
+    warnSpy.mockRestore()
+    expect(parent.getChildren()).toEqual([anchor])
+
+    const child = new TestRenderable(testRenderer, { id: "child" })
+    expect(() => dynParent.insertBefore(child, {})).toThrow("Anchor must be a Renderable")
+    expect(parent.insertBefore(child)).toBe(1)
+
+    // TextRenderable takes text children only; tsconfig.node-test.json checks these rows.
+    const text = new TextRenderable(testRenderer, {})
+    // @ts-expect-error a layout renderable is not a text child
+    expect(() => text.add(anchor)).toThrow()
+    // @ts-expect-error a number is not a text child
+    expect(() => text.add(42)).toThrow()
+    // @ts-expect-error an anchor must be a TextNodeRenderable
+    expect(() => text.insertBefore("hi", {})).toThrow()
   })
 
   test("can change renderable id and updates parent mapping", () => {
@@ -1428,7 +1539,7 @@ describe("Renderable - Layout with Viewport Filtering", () => {
 describe("Renderable - tree model", () => {
   // Seeded add, insertBefore, remove, destroy, visibility, live, and focus sequences over a small column tree.
   // After each operation the tree, live counts, focus paths, lifecycle registrations, and native nodes match a
-  // model; after each frame every shown node sits right below its shown earlier siblings.
+  // model; after each frame every shown node sits right below its shown earlier siblings, and every hidden one is 0 × 0.
   const width = 40
 
   interface Entry {
@@ -1603,7 +1714,15 @@ describe("Renderable - tree model", () => {
     }
     const layout = (entry: Entry, y: number, actual: string[], expected: string[]): number => {
       let bottom = y + (entry.height ?? 0)
-      for (const child of entry.children) if (child.visible) bottom += layout(child, bottom, actual, expected)
+      for (const child of entry.children) {
+        if (child.visible) bottom += layout(child, bottom, actual, expected)
+        else
+          for (const { node } of subtree(child)) {
+            const { width, height } = node.getComputedLayout()
+            actual.push(`${node.id} hidden ${width}x${height}`)
+            expected.push(`${node.id} hidden 0x0`)
+          }
+      }
       const height = entry.height ?? bottom - y
       actual.push(`${entry.node.id} y=${entry.node.y} h=${entry.node.height} w=${entry.node.width}`)
       // Like `main`, public sizes are at least one cell, even for an empty container that takes no rows.

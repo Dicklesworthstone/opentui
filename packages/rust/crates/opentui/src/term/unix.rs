@@ -57,6 +57,9 @@ impl Terminal {
         }
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         check(unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) })?;
+        // PENDIN is not a mode: macOS sets it when a restore turns canonical mode back on, until input is flushed or
+        // read. Saved, every later restore would set it again.
+        saved.c_lflag &= !libc::PENDIN;
         let output_flags = check(unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL) })?;
         let mut terminal = Self { saved, output_flags, raw: false };
         terminal.enter_raw()?;
@@ -72,11 +75,10 @@ impl Terminal {
         Ok(())
     }
 
-    /// Restores the saved settings and file status flags.
+    /// Restores the saved settings and file status flags, even out of raw mode: a program the terminal was handed to
+    /// may have changed them.
     pub fn leave_raw(&mut self) -> io::Result<()> {
-        if !std::mem::replace(&mut self.raw, false) {
-            return Ok(());
-        }
+        self.raw = false;
         let restored = retry(|| unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) });
         let flags = check(unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, self.output_flags) });
         restored.and(flags).map(drop)
@@ -89,6 +91,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        #[expect(clippy::let_underscore_must_use, reason = "a drop has no caller to report to")]
         let _ = self.leave_raw();
     }
 }
@@ -396,6 +399,7 @@ impl Drop for Signals {
         for (signal, previous) in self.previous.drain(..).rev() {
             unsafe { libc::sigaction(signal, &previous, std::ptr::null_mut()) };
         }
+        #[expect(clippy::let_underscore_must_use, reason = "a newer handler's pipe stays installed")]
         let _ = SIGNAL_PIPE.compare_exchange(self.write.as_raw_fd(), -1, Ordering::AcqRel, Ordering::Acquire);
     }
 }

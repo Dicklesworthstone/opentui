@@ -55,19 +55,19 @@ Known terminal identities select these protocols:
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | OSC 99   | Kitty and foot                                                                                                                       |
 | OSC 777  | Ghostty, WezTerm, Warp, hterm, Blink, Contour, VTE, GNOME Terminal, Tilix, Terminator, Xfce, rxvt, Terminology, and Windows Terminal |
-| OSC 9    | iTerm, Apple Terminal, Terminal.app, and ConEmu                                                                                      |
+| OSC 9    | iTerm, Apple Terminal, and Terminal.app                                                                                              |
 
 Environment hints can select the same protocols. `TERM_FEATURES` with `No` selects OSC 9. `WT_SESSION` selects OSC 777. Detection is terminal-mediated and does not call `notify-send`, AppleScript, PowerShell, or another platform notification command.
 
 ## Protocol output
 
-| Protocol | Output behavior                                                                     |
-| -------- | ----------------------------------------------------------------------------------- |
-| OSC 99   | Sends base64 title and body payloads with one generated notification ID             |
-| OSC 777  | Sends `notify`, title, and body fields. Control bytes and semicolons become spaces  |
-| OSC 9    | Combines a nonempty title and body as `title: message`. Control bytes become spaces |
+| Protocol | Output behavior                                                                                                      |
+| -------- | -------------------------------------------------------------------------------------------------------------------- |
+| OSC 99   | Sends base64 title and body payloads with one generated notification ID                                              |
+| OSC 777  | Sends `notify`, title, and body fields. Control characters and semicolons become spaces                              |
+| OSC 9    | Combines a nonempty title and body as `title: message`. Control characters become spaces. Leading digits get a space |
 
-When no title is supplied, each protocol sends the message in its supported body form.
+When no title is supplied, each protocol sends the message in its supported body form. Control characters are C0 (U+0000–U+001F), DEL (U+007F), and C1 (U+0080–U+009F). OSC 9 puts a space before text that starts with a digit, because terminals read such text as a ConEmu command (progress, working directory, tab title) instead of a notification.
 
 ## Terminal behavior
 
@@ -87,7 +87,7 @@ Use `allow-passthrough all` if notifications need to work from panes that are no
 
 Zellij notification forwarding uses OSC 99. OpenTUI ignores inherited outer-terminal heuristics inside Zellij. It enables notifications only after a matching OSC 99 query reply or an explicit protocol override. Selected OSC 99 output remains raw instead of using tmux wrapping.
 
-For a local GNU Screen session with `STY` set, OpenTUI wraps a selected protocol in Screen DCS passthrough. Screen does not itself select a notification protocol, so detection or an override must still enable one.
+When `renderer.capabilities?.multiplexer === "screen"`, OpenTUI wraps a selected protocol in Screen DCS passthrough, as it does for OSC 52. Screen forwards only the low byte of each character, so inside Screen every non-ASCII character in OSC 777 and OSC 9 text becomes a space; OSC 99 payloads are base64 and keep their text. Screen does not itself select a notification protocol, so detection or an override must still enable one.
 
 In an [SSH session](/docs/reference/ssh), the renderer sends the sequence to the client terminal. The server desktop is not the notification destination.
 

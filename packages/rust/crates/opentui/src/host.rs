@@ -219,6 +219,7 @@ impl Restore {
     fn finish(&self) {
         self.done.set(true);
         if let Ok(mut terminal) = self.terminal.try_borrow_mut() {
+            #[expect(clippy::let_underscore_must_use, reason = "teardown goes on whatever the restore returns")]
             let _ = terminal.leave_raw();
         }
         // Drop queued mouse reports so the shell does not receive them.
@@ -454,11 +455,11 @@ impl Host {
         host.session.setup_terminal(options.terminal)?;
         let now = Instant::now();
         host.capability_until = now.checked_add(options.capability_window);
-        host.expect_replies(now)?;
         host.drive_until(TerminalState::Active)?;
         if let Some(split) = &host.split {
             split.setup_done(Instant::now());
         }
+        host.expect_replies(Instant::now())?;
         // Its reply is one of setup's: expected within the capability window.
         host.query_pixels(options.capability_window.min(PIXEL_REPLY_WINDOW))?;
         Ok(host)
@@ -509,7 +510,7 @@ impl Host {
     /// previous frame's output has been delivered.
     pub fn can_render(&self) -> Result<bool> {
         Ok(self.pending_resize.is_none()
-            && !self.split.as_ref().is_some_and(|split| split.blocked(Instant::now()))
+            && self.frame_deadline().is_none_or(|until| Instant::now() >= until)
             && self.session.terminal_state()? == TerminalState::Active
             && !self.session.renderer_state()?.frame_pending)
     }
@@ -600,6 +601,10 @@ impl Host {
         }
     }
 
+    pub(crate) fn frame_deadline(&self) -> Option<Instant> {
+        self.split.as_ref().and_then(SplitFooter::frame_deadline)
+    }
+
     /// Whether the terminal stopped taking output. [`Self::poll`] then also wakes once it takes more.
     pub(crate) fn output_blocked(&self) -> bool {
         self.output_blocked
@@ -619,8 +624,7 @@ impl Host {
         // The end of the capability window ends a partial reply that waits for it, even when it passed between polls.
         let window = self.capability_until.filter(|_| self.expecting_replies);
         let pixel = self.pixel_reply_until.filter(|_| self.expecting_pixel_reply);
-        let seed = self.split.as_ref().and_then(SplitFooter::seed_deadline);
-        [deadline, self.parser.deadline(), pump, window, pixel, seed].into_iter().flatten().min()
+        [deadline, self.parser.deadline(), pump, window, pixel, self.frame_deadline()].into_iter().flatten().min()
     }
 
     /// Tells the parser what the host waits for at `now`, then ends what may no longer wait, as Core does: during the
@@ -629,10 +633,8 @@ impl Host {
     fn expect_replies(&mut self, now: Instant) -> Result<()> {
         self.expecting_replies = self.capability_until.is_none_or(|until| now < until);
         self.expecting_pixel_reply = self.pixel_reply_until.is_some_and(|until| now < until);
-        if !self.expecting_replies
-            && let Some(split) = &self.split
-        {
-            split.replies_ended();
+        if let Some(split) = &self.split {
+            split.expire_seed(now, self.expecting_replies);
         }
         let expectations = if self.expecting_replies {
             Expectations::CURSOR_POSITION
@@ -657,6 +659,10 @@ impl Host {
             self.next_wakeup(deadline).map(|until| until.saturating_duration_since(Instant::now()))
         };
         let ready = self.wait(timeout)?;
+        // The terminal paces waits for room as it reads: a macOS pseudo-terminal holds about a kilobyte, a frame
+        // takes several. Tests count the other returns.
+        #[cfg(test)]
+        tests::POLL_RETURNS.set(tests::POLL_RETURNS.get() + u64::from(!self.output_blocked));
         if ready.wake && self.wake.drain() {
             events.push(Event::Wake);
         }
@@ -751,6 +757,7 @@ impl Host {
     fn route_reply(&mut self, reply: &[u8], events: &mut Vec<Event>) {
         // Native setup asks for the theme colors once; a color scheme change asks again.
         if is_color_scheme_notice(reply) {
+            #[expect(clippy::let_underscore_must_use, reason = "without an answer the app keeps its theme colors")]
             let _ = self.session.control(Control::QueryThemeColors);
             events.push(Event::ColorScheme);
             return;
@@ -798,6 +805,10 @@ impl Host {
                 if is_cursor_report(reply)
                     && let Some(split) = &self.split
                 {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "no failure found that a cursor report reaches: the session is open and between frames"
+                    )]
                     let _ = split.cursor_reported();
                 }
             }
@@ -882,13 +893,10 @@ impl Host {
     }
 
     /// Restores the terminal, runs `task` while another program owns it, and sets the terminal up again after it
-    /// returns. Reports [`Event::Resumed`]: paint a new frame. For a remote terminal, or on Windows, `task` runs with
-    /// the terminal untouched.
+    /// returns. Reports [`Event::Resumed`]: paint a new frame. For a remote terminal, `task` runs with the terminal
+    /// untouched.
     pub fn release<T>(&mut self, events: &mut Vec<Event>, task: impl FnOnce() -> T) -> Result<T> {
         let Connection::Local { restore, .. } = &self.connection else { return Ok(task()) };
-        if cfg!(windows) {
-            return Ok(task());
-        }
         let restore = Rc::clone(restore);
         let suspended = Instant::now();
         // Core's renderer stops expecting capability replies when it suspends.
@@ -900,12 +908,20 @@ impl Host {
         }
         self.session.suspend()?;
         self.drive_until(TerminalState::Suspended)?;
-        restore.terminal.borrow_mut().leave_raw()?;
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "as Core, restore errors don't stop the hand-over: conhost can apply a saved mode and still fail"
+        )]
+        let _ = restore.terminal.borrow_mut().leave_raw();
         // As Core does once a suspension settles: drop the input the terminal sent meanwhile, such as mouse reports from
         // before restoration turned them off, so the program that takes over does not read it.
         unsafe { sys::ot_terminal_flush_input() };
         let output = task();
         restore.terminal.borrow_mut().enter_raw()?;
+        // The terminal may have resized meanwhile, unseen by a stopped process. Native resume reserves main-screen rows
+        // for the renderer's height, so the size applies first.
+        self.check_size()?;
+        self.apply_resize(events)?;
         if let Some(split) = &self.split {
             split.before_resume()?;
         }
@@ -920,7 +936,6 @@ impl Host {
         self.parser.resume()?;
         self.route(events);
         self.force_next_frame = true;
-        self.check_size()?;
         events.push(Event::Resumed);
         Ok(output)
     }
@@ -1007,6 +1022,7 @@ impl Drop for Host {
         match &self.connection {
             Connection::Local { restore, .. } => {
                 restore.emergency();
+                #[expect(clippy::let_underscore_must_use, reason = "the thread-local is gone only at thread exit")]
                 let _ = ACTIVE.try_with(|active| active.borrow_mut().take());
             }
             Connection::Remote(terminal) => restore_remote(&self.session, terminal),
@@ -1067,6 +1083,124 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    thread_local! { pub(super) static POLL_RETURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+
+    #[test]
+    fn idle_apps_sleep_while_waiting_for_startup_replies() {
+        use crate::prelude::*;
+        use crate::pty::Pty;
+        use crate::split::SplitControl;
+        use crate::testing::TestApp;
+        use std::cell::RefCell;
+        use std::process::Command;
+        use std::rc::Rc;
+
+        const CHILD: &str = "OPENTUI_TEST_LOCAL_FOOTER";
+        const REPLY: &[u8] = b"\x1b[4;1R\x1b[4;480;800t";
+        let window = HostOptions::default().capability_window;
+        let run = |split: bool, answers: bool, remote, late: Option<RemoteLink>, window: Duration| {
+            let mut options = AppOptions::default().with_theme(Theme::dark());
+            options.host.split_footer = split.then_some(3);
+            options.host.capability_window = window;
+            let app = match remote {
+                Some(terminal) => App::remote(terminal, options),
+                None => App::new(options),
+            }
+            .unwrap();
+            if window.is_zero() {
+                app.animate(|_, _| {
+                    assert_eq!(POLL_RETURNS.get(), 0, "the first frame waited for a poll");
+                    false
+                });
+            }
+            if let Some(link) = late {
+                // The first frame's wait has expired; its reply still places the footer during the capability window.
+                app.animate(move |_, _| {
+                    link.send_input(REPLY);
+                    false
+                });
+            }
+            // Start the observation after host setup. The first frame must not need the quit timer to wake it.
+            app.defer(move |cx| {
+                cx.set_timeout(Duration::from_millis(350), move |cx| {
+                    if split {
+                        let offset =
+                            cx.session().split_control(SplitControl::OutputOffset { surface_offset: 21 }).unwrap();
+                        assert_eq!(offset, if answers { 4 } else { 0 }, "the report places the footer");
+                    }
+                    cx.quit();
+                });
+            });
+            POLL_RETURNS.set(0);
+            app.clone().run().unwrap();
+            assert!(app.frame_number() > 0, "slept through the first frame");
+            let polls = POLL_RETURNS.get();
+            assert!((1..=6).contains(&polls), "split={split} answers={answers}: {polls} poll returns");
+        };
+        if let Ok(row) = std::env::var(CHILD) {
+            let (split, answers) = row.split_once(',').unwrap();
+            run(split.parse().unwrap(), answers.parse().unwrap(), None, None, window);
+            return;
+        }
+        for split in [false, true] {
+            for answers in [false, true] {
+                let (terminal, link) = RemoteTerminal::new(RemoteOptions::default(), || {}).unwrap();
+                if answers {
+                    link.send_input(REPLY);
+                }
+                run(split, answers, Some(terminal), None, window);
+
+                // A Unix pty answers only when its driver does. ConPTY answers cursor queries itself.
+                if cfg!(unix) {
+                    let mut child = Command::new(std::env::current_exe().unwrap());
+                    child.args(["--exact", std::thread::current().name().unwrap(), "--nocapture"]);
+                    child.env(CHILD, format!("{split},{answers}"));
+                    let driver = TestApp::new(80, 24);
+                    let output = Rc::new(RefCell::new(Vec::new()));
+                    let bytes = output.clone();
+                    let pty = Pty::spawn(&driver, child, 80, 24)
+                        .unwrap()
+                        .on_output(move |_, chunk| bytes.borrow_mut().extend_from_slice(chunk));
+                    if answers {
+                        assert!(driver.wait_until(Duration::from_secs(10), || {
+                            output.borrow().windows(4).any(|w| w == b"\x1b[6n")
+                        }));
+                        pty.write(REPLY).unwrap();
+                    }
+                    assert!(driver.wait_until(Duration::from_secs(10), || !pty.is_running()));
+                    assert!(pty.exit_status().unwrap().success(), "{}", String::from_utf8_lossy(&output.borrow()));
+                }
+            }
+        }
+        let (terminal, link) = RemoteTerminal::new(RemoteOptions::default(), || {}).unwrap();
+        run(true, true, Some(terminal), Some(link), window);
+        // Even the explicit-width probe's cursor-shaped reply cannot place the footer after the window.
+        let (terminal, link) = RemoteTerminal::new(RemoteOptions::default(), || {}).unwrap();
+        link.send_input(b"\x1b[2;2R");
+        run(true, false, Some(terminal), None, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_host_loop_wakes_for_its_first_footer_frame() {
+        for leave in [false, true] {
+            let (terminal, _link) = RemoteTerminal::new(RemoteOptions::default(), || {}).unwrap();
+            let options = HostOptions { split_footer: Some(3), ..HostOptions::default() };
+            let mut host = Host::start_remote(terminal, options).unwrap();
+            if leave {
+                host.split_footer().unwrap().leave().unwrap();
+                assert!(host.can_render().unwrap(), "the main screen still waits for the footer");
+            } else {
+                // No App supplies a frame deadline. The host must wake before the caller's backstop.
+                let backstop = Instant::now() + Duration::from_secs(2);
+                let mut events = Vec::new();
+                while !host.can_render().unwrap() {
+                    host.poll(Some(backstop), &mut events).unwrap();
+                    assert!(Instant::now() < backstop, "poll slept through the first frame");
+                }
+            }
+        }
+    }
+
     #[test]
     fn sizes_fit_the_cell_limit() {
         assert_eq!(fit((80, 24), 512 * 512), (80, 24));
@@ -1111,10 +1245,10 @@ mod tests {
             assert_eq!(events, expected);
         }
         // In the window cursor reports reach native code, which takes the first as the cursor's position at setup and
-        // the second as the answer to its explicit-width probe.
+        // the next two as the answers to its explicit-width probes.
         let (terminal, link) = RemoteTerminal::new(RemoteOptions::default(), || {}).expect("create a terminal");
         let mut host = Host::start_remote(terminal, HostOptions::default()).expect("start the host");
-        link.send_input(b"\x1b[5;10R\x1b[1;2R");
+        link.send_input(b"\x1b[5;10R\x1b[2;2R\x1b[2;3R");
         host.poll(Some(Instant::now() + Duration::from_secs(1)), &mut Vec::new()).expect("read the replies");
         let flags = host.session().capabilities().expect("read the capabilities").flags;
         assert!(flags.contains(crate::native::CapabilityFlags::EXPLICIT_WIDTH), "{flags:?}");
@@ -1160,10 +1294,11 @@ mod tests {
         install_panic_hook();
         let (line_tx, line_rx) = mpsc::channel();
         let capture = StderrCapture::start(move |line| {
+            #[expect(clippy::let_underscore_must_use, reason = "lines after the test ends have no receiver")]
             let _ = line_tx.send(line);
         })
         .expect("start capturing stderr");
-        let _ = std::thread::spawn(|| panic!("a worker thread failed")).join();
+        std::thread::spawn(|| panic!("a worker thread failed")).join().expect_err("the worker panics");
         write_stderr(b"after-the-worker-panic\n");
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut captured = false;

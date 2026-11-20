@@ -114,8 +114,7 @@ const FrameSpec = struct {
     cancel_first: bool,
 };
 
-/// Reference tree: each node's children in Yoga order and its paint children in attachment
-/// order. Paint sorts a copy stably by z, so equal z paints in attachment order.
+/// Reference tree in child order. Paint sorts a copy stably by z.
 const Model = struct {
     handles: [node_count_max]?[2]context.Handle = @splat(null),
     /// Each editor node's edit buffer, per twin.
@@ -125,7 +124,6 @@ const Model = struct {
     kind: [node_count_max]Kind = @splat(.box),
     parent: [node_count_max]?usize = @splat(null),
     children: [node_count_max]std.ArrayListUnmanaged(usize) = @splat(.empty),
-    paint: [node_count_max]std.ArrayListUnmanaged(usize) = @splat(.empty),
     z: [node_count_max]i32 = @splat(0),
     hidden: [node_count_max]bool = @splat(false),
     hook_generation: [node_count_max]u64 = @splat(0),
@@ -138,19 +136,12 @@ const Model = struct {
     unmeasured: [node_count_max]bool = @splat(false),
 
     fn deinit(self: *Model) void {
-        for (&self.children, &self.paint) |*children, *paint| {
-            children.deinit(testing.allocator);
-            paint.deinit(testing.allocator);
-        }
+        for (&self.children) |*children| children.deinit(testing.allocator);
     }
 
     fn move(self: *Model, node: usize, parent: ?usize, index: usize) !void {
         const previous = self.parent[node];
         if (previous) |old| _ = self.children[old].orderedRemove(std.mem.indexOfScalar(usize, self.children[old].items, node).?);
-        if (previous != parent) {
-            if (previous) |old| _ = self.paint[old].orderedRemove(std.mem.indexOfScalar(usize, self.paint[old].items, node).?);
-            if (parent) |new| try self.paint[new].append(testing.allocator, node);
-        }
         if (parent) |new| try self.children[new].insert(testing.allocator, index, node);
         self.parent[node] = parent;
     }
@@ -159,7 +150,6 @@ const Model = struct {
         try self.move(node, null, 0);
         for (self.children[node].items) |child| self.parent[child] = null;
         self.children[node].clearRetainingCapacity();
-        self.paint[node].clearRetainingCapacity();
         self.handles[node] = null;
     }
 
@@ -178,8 +168,8 @@ const Model = struct {
     /// Writes the visible descendants of `node` in paint order and returns the new count.
     fn paintOrder(self: *const Model, out: []usize, count: usize, node: usize) usize {
         var sorted: [node_count_max]usize = undefined;
-        const children = sorted[0..self.paint[node].items.len];
-        @memcpy(children, self.paint[node].items);
+        const children = sorted[0..self.children[node].items.len];
+        @memcpy(children, self.children[node].items);
         std.mem.sort(usize, children, self, zLessThan);
         var next = count;
         for (children) |child| {
@@ -921,7 +911,7 @@ const Harness = struct {
                     }
                     const requester = self.model.slotOf(reference, first.node).?;
                     // The hook reads its request's paint geometry after its own changes.
-                    const asked = try self.twins[candidate].owner.sceneGetPaintLayout(second.node);
+                    const asked = try self.twins[candidate].owner.sceneGetPaintLayout(second.node, false);
                     // A scroll in the reply paints at the new offset in the same frame.
                     if (first.kind == c.OT_SCENE_FRAME_SCROLL and self.random.boolean()) try self.apply(self.generateScroll(requester));
                     // A LAYOUT request from a reply arrives in the next frame.
@@ -959,7 +949,7 @@ const Harness = struct {
                             self.stats.reply_hides += 1;
                         }
                     };
-                    if (self.twins[candidate].owner.sceneGetPaintLayout(second.node)) |after| {
+                    if (self.twins[candidate].owner.sceneGetPaintLayout(second.node, false)) |after| {
                         try testing.expectEqualSlices(u8, std.mem.asBytes(&asked), std.mem.asBytes(&after));
                     } else |_| {}
                 },
@@ -997,7 +987,7 @@ const Harness = struct {
     /// child, gets or loses UPDATE, or a text change, while their parent's batch runs.
     fn markSibling(self: *Harness, requester: usize) !void {
         const parent = self.model.parent[requester] orelse return;
-        const siblings = self.model.paint[parent].items;
+        const siblings = self.model.children[parent].items;
         var target = siblings[self.side.uintLessThan(usize, siblings.len)];
         if (target == requester) return;
         if (self.model.children[target].items.len != 0 and self.side.boolean()) target = self.model.children[target].items[0];
@@ -1026,7 +1016,7 @@ const Harness = struct {
         try testing.expectEqual(self.model.slotOf(reference, first.node), self.model.slotOf(candidate, second.node));
         if (first.kind == c.OT_SCENE_FRAME_DONE or first.kind == c.OT_SCENE_FRAME_RECORD) return;
         // The geometry the request carries, culled nodes' too (B5d).
-        const painted = .{ try self.twins[reference].owner.sceneGetPaintLayout(first.node), try self.twins[candidate].owner.sceneGetPaintLayout(second.node) };
+        const painted = .{ try self.twins[reference].owner.sceneGetPaintLayout(first.node, false), try self.twins[candidate].owner.sceneGetPaintLayout(second.node, false) };
         try testing.expectEqualSlices(u8, std.mem.asBytes(&painted[0]), std.mem.asBytes(&painted[1]));
     }
 
@@ -1201,7 +1191,7 @@ const Harness = struct {
         // A committed image also presents its placeholder cells.
         if (self.twins[candidate].cli.currentImages.items.len == 0) try testing.expectEqual(drafted, cellHash(self.twins[candidate].cli.currentRenderBuffer));
         for (drafted_hits[0..cells], 0..) |hit, index| {
-            try testing.expectEqual(hit, draft.state.hitToken(draft.cli, @intCast(index % draft.cli.width), @intCast(index / draft.cli.width)));
+            try testing.expectEqual(hit, draft.state.hitToken(draft.cli, @intCast(index % draft.cli.width), @intCast(index / draft.cli.width), 0));
         }
         try self.expectSamePresentation();
         if (spec.force) self.decoder_synced = true;
@@ -1342,7 +1332,7 @@ const Harness = struct {
                 };
                 try testing.expectEqualSlices(u8, std.mem.asBytes(&first), std.mem.asBytes(&try layouts[1]));
             }
-            const painted = .{ try owners[0].owner.sceneGetPaintLayout(pair[0]), try owners[1].owner.sceneGetPaintLayout(pair[1]) };
+            const painted = .{ try owners[0].owner.sceneGetPaintLayout(pair[0], false), try owners[1].owner.sceneGetPaintLayout(pair[1], false) };
             try testing.expectEqualSlices(u8, std.mem.asBytes(&painted[0]), std.mem.asBytes(&painted[1]));
             // Resize baselines and prepared text views, including culled children's (B2 invariant 3).
             const nodes = .{ (try owners[0].owner.raw().getRenderable(pair[0])).scene_node.?, (try owners[1].owner.raw().getRenderable(pair[1])).scene_node.? };
@@ -1432,11 +1422,11 @@ const Harness = struct {
                     try testing.expectEqual(actual.yoga_node, yoga_child);
                     try testing.expectEqual(self.handle(twin, child), actual.scene_node.?.handle);
                 }
-                try testing.expectEqual(self.model.paint[index].items.len, node.paint_children.items.len);
+                try testing.expectEqual(self.model.children[index].items.len, node.paint_children.items.len);
                 // A clear takes the candidate's counts where the reference's moves take them.
                 const other = (try self.twins[reference].owner.raw().getRenderable(pair[reference])).scene_node.?;
                 try testing.expectEqual(.{ other.skip.update_below, other.skip.filters_below, other.skip.scrolls_below, other.placement }, .{ node.skip.update_below, node.skip.filters_below, node.skip.scrolls_below, node.placement });
-                try testing.expectEqual(try self.twins[reference].owner.sceneGetPaintLayout(pair[reference]), try f.owner.sceneGetPaintLayout(pair[twin]));
+                try testing.expectEqual(try self.twins[reference].owner.sceneGetPaintLayout(pair[reference], false), try f.owner.sceneGetPaintLayout(pair[twin], false));
             }
             // The reader text is a scene node outside the tree.
             try testing.expectEqual(live + 1, f.state.count);
@@ -1510,6 +1500,8 @@ fn runParity(seed: u64, steps: usize) !Stats {
 }
 
 test "Scene twin Sessions match a forced full-frame reference on every frame" {
+    // Candidate preparation must not sort siblings inside a culled row that paint does not visit.
+    _ = try runParity(150, 256);
     var total: Stats = .{};
     for (0..64) |seed| {
         errdefer std.debug.print("seed {d}\n", .{seed});

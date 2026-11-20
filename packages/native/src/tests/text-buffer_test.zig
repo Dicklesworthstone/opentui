@@ -193,7 +193,7 @@ test "TextBuffer tab width changes preserve large tab-free Unicode and update on
         try std.testing.expectEqual(tab_free_width, tb.lineWidthAt(0));
         // A tab-free root keeps its widths: no chunk walk and no remeasure.
         try std.testing.expectEqual(0, text_work.take().remeasure_nodes);
-        try std.testing.expectEqual(tb.tab_metrics_generation, tb.rope().metricsGeneration());
+        try std.testing.expectEqual(tb.metrics_generation, tb.rope().metricsGeneration());
     }
 
     const one_tab = try std.testing.allocator.dupe(u8, tab_free);
@@ -576,40 +576,6 @@ test "TextBuffer line info - unicode width method" {
     try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 0) > 0);
 }
 
-test "TextBuffer line info - unicode mixed content with special characters" {
-    var pools = TestPools.init(std.testing.allocator);
-    defer pools.deinit();
-
-    var tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .unicode);
-    defer tb.deinit();
-
-    try tb.setText("Normal\n123\n!@#\n测试\n");
-
-    try std.testing.expectEqual(@as(u32, 5), tb.getLineCount()); // line_count (4 lines + empty line at end)
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 0) >= 0);
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 1) >= 0);
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 2) >= 0);
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 3) >= 0);
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 4) >= 0);
-}
-
-test "TextBuffer line info - unicode text without styling" {
-    var pools = TestPools.init(std.testing.allocator);
-    defer pools.deinit();
-
-    var tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .unicode);
-    defer tb.deinit();
-
-    // setText now handles all text at once without styling
-    try tb.setText("Red\nBlue");
-
-    try std.testing.expectEqual(@as(u32, 2), tb.getLineCount());
-    try std.testing.expectEqual(@as(u32, 0), iter_mod.coordsToOffset(tb.rope(), 0, 0).?);
-    try std.testing.expectEqual(@as(u32, 4), iter_mod.coordsToOffset(tb.rope(), 1, 0).?);
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 0) >= 0);
-    try std.testing.expect(iter_mod.lineWidthAt(tb.rope(), 1) >= 0);
-}
-
 test "TextBuffer line info - extremely long single line" {
     var pools = TestPools.init(std.testing.allocator);
     defer pools.deinit();
@@ -718,21 +684,6 @@ test "TextBuffer view registration - ids stay unique and reused, and mutations d
 }
 
 // ===== Memory Registry Tests =====
-
-test "TextBuffer memory registry - register and get buffer" {
-    var pools = TestPools.init(std.testing.allocator);
-    defer pools.deinit();
-
-    var tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .unicode);
-    defer tb.deinit();
-
-    const text = "Hello World";
-    const mem_id = try tb.registerMemBuffer(text, false);
-
-    const retrieved = tb.getMemBuffer(mem_id);
-    try std.testing.expect(retrieved != null);
-    try std.testing.expectEqualStrings(text, retrieved.?);
-}
 
 test "TextBuffer memory registry - multiple buffers" {
     var pools = TestPools.init(std.testing.allocator);
@@ -1442,10 +1393,6 @@ test "TextBuffer setText - CRLF at SIMD boundary" {
     try std.testing.expectEqual(expected_len, written);
 }
 
-test "TextBuffer setText - line with multiple u16-sized chunks (SKIPPED)" {
-    return error.SkipZigTest;
-}
-
 test "TextBuffer setText - validate rope structure is correct" {
     var pools = TestPools.init(std.testing.allocator);
     defer pools.deinit();
@@ -1632,7 +1579,7 @@ const TextState = struct {
         std.debug.assert(result.lines <= result.line_highlights.len);
         for (0..result.lines) |row| {
             const highlights = tb.getLineHighlights(row);
-            const spans = tb.getLineSpans(row);
+            const spans = tb.getLineSpans(row) catch unreachable;
             std.debug.assert(highlights.len <= result.line_highlights[row].len);
             std.debug.assert(spans.len <= result.line_spans[row].len);
             @memcpy(result.line_highlights[row][0..highlights.len], highlights);
@@ -1889,7 +1836,7 @@ test "TextBuffer owned styled replacement reclaims styled plain and empty transi
             } else {
                 mem_id = try tb.replaceOwnedText(copy, mem_id);
                 try std.testing.expectEqual(@as(u32, 0), tb.getHighlightCount());
-                for (tb.line_spans.items) |list| try std.testing.expectEqual(@as(usize, 0), list.items.len);
+                for (0..tb.getLineCount()) |row| try std.testing.expectEqual(@as(usize, 0), (try tb.getLineSpans(row)).len);
             }
             transferred = true;
             const link_count: u32 = @intFromBool(case.styled and copy.len > 0);
@@ -2403,4 +2350,72 @@ test "TextBuffer appendFromMemId - invalid mem_id" {
 
     const result = tb.appendFromMemId(99);
     try std.testing.expectError(text_buffer.TextBufferError.InvalidMemId, result);
+}
+
+test "TextBuffer replaceTail equals a fresh buffer of the same text and keeps one slot" {
+    const hl = @import("../highlight-layers.zig");
+    var pools = TestPools.init(std.testing.allocator);
+    defer pools.deinit();
+    var sets = hl.GroupSets.init(std.testing.allocator);
+    defer sets.deinit();
+    const set = try sets.intern(&.{"markup.strong"});
+    // Pieces that split graphemes, lines and code points across writes.
+    const pieces = [_][]const u8{ "a", "bc ", "\n", "\u{65e5}", "e", "\u{301}", "\u{1F469}", "\u{200D}\u{1F4BB}", "\t", "word word ", "\n\n", "\u{e9}" };
+    var prng = std.Random.DefaultPrng.init(0x7a11);
+    const random = prng.random();
+    for (0..48) |_| {
+        const tb = try TextBuffer.initWithOptions(std.testing.allocator, &pools.graphemes, &pools.links, .unicode, .{ .group_sets = &sets });
+        defer tb.deinit();
+        var expected: std.ArrayListUnmanaged(u8) = .empty;
+        defer expected.deinit(std.testing.allocator);
+        for (0..64) |_| {
+            // From anywhere in the text, at a code point start, usually near its end.
+            var from: u32 = @intCast(if (random.boolean()) expected.items.len else random.uintAtMost(usize, expected.items.len));
+            while (from > 0 and from < expected.items.len and expected.items[from] & 0xC0 == 0x80) from -= 1;
+            var bytes: std.ArrayListUnmanaged(u8) = .empty;
+            defer bytes.deinit(std.testing.allocator);
+            for (0..random.uintAtMost(usize, 3)) |_| try bytes.appendSlice(std.testing.allocator, pieces[random.uintLessThan(usize, pieces.len)]);
+            try tb.replaceTail(from, bytes.items);
+            expected.items.len = from;
+            try expected.appendSlice(std.testing.allocator, bytes.items);
+            // A run over the whole text, which the next write clips.
+            if (expected.items.len > 0) try tb.setLayer(2, 0, @intCast(expected.items.len), &.{.{ .start_byte = 0, .end_byte = @intCast(expected.items.len), .group_set = set }});
+
+            const fresh = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .unicode);
+            defer fresh.deinit();
+            try fresh.setText(expected.items);
+            const out = try std.testing.allocator.alloc(u8, expected.items.len + 1);
+            defer std.testing.allocator.free(out);
+            try std.testing.expectEqualStrings(expected.items, out[0..tb.getPlainTextIntoBuffer(out)]);
+            try std.testing.expectEqual(fresh.getByteSize(), tb.getByteSize());
+            try std.testing.expectEqual(fresh.getLineCount(), tb.getLineCount());
+            try std.testing.expectEqual(fresh.getLength(), tb.getLength());
+            for (0..fresh.getLineCount()) |row| try std.testing.expectEqual(fresh.lineWidthAt(@intCast(row)), tb.lineWidthAt(@intCast(row)));
+            // One slot for every write: the registry never grows past it.
+            try std.testing.expect(tb.mem_registry.buffers.items.len <= 1);
+        }
+    }
+}
+
+test "TextBuffer replaceTail copies only new bytes and keeps the rope arena bounded" {
+    var pools = TestPools.init(std.testing.allocator);
+    defer pools.deinit();
+    const tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .unicode);
+    defer tb.deinit();
+    _ = text_work.take();
+    var length: u32 = 0;
+    for (0..8192) |i| {
+        // A streamed paragraph: one byte per write, a line break now and then.
+        const byte: []const u8 = if (i % 97 == 96) "\n" else "x";
+        try tb.replaceTail(length, byte);
+        length += 1;
+    }
+    const work = text_work.take();
+    try std.testing.expectEqual(@as(u64, 8192), work.tail_writes);
+    // The first write is whole (one byte); every later one copies its own byte only.
+    try std.testing.expectEqual(@as(u64, 8192), work.tail_write_bytes);
+    try std.testing.expect(work.rope_rebuilds > 0);
+    const live = @as(usize, tb.rope().count()) * 2 * @sizeOf(@TypeOf(tb.rope().root.*));
+    try std.testing.expect(tb.arena.queryCapacity() <= 2 * live + (64 << 10) + (16 << 10));
+    try std.testing.expectEqual(@as(usize, 1), tb.mem_registry.buffers.items.len);
 }

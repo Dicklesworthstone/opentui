@@ -7,7 +7,7 @@ import { TextRenderable } from "../renderables/Text.js"
 import { Renderable } from "../Renderable.js"
 import type { OptimizedBuffer } from "../buffer.js"
 import { CliRenderer, CliRenderEvents, createCliRenderer, type CliRendererConfig } from "../renderer.js"
-import { settle, settleUntil } from "../testing/harness.js"
+import { serviceReadyFrames, settleUntil } from "../testing/harness.js"
 import { ManualClock } from "../testing/manual-clock.js"
 import { createTestStdin, RecordingWriteStream } from "../testing/test-streams.js"
 
@@ -36,7 +36,17 @@ function createAdmissionRenderer(width = 80, height = 24, config: CliRendererCon
     renderer.destroy()
     await renderer.closed.catch(() => {})
   })
-  return { renderer, stdout, clock, driver }
+  // Advance frame timers, then drain the Session before checking for another frame.
+  const renderToIdle = async () => {
+    for (let step = 0; step < 40; step++) {
+      clock.advance(100)
+      await driver.idle()
+      const { isRunning, isRendering, hasScheduledRender } = renderer.getSchedulerState()
+      if (!isRunning && !isRendering && !hasScheduledRender) return renderer.idle()
+    }
+    throw new Error("Renderer still has work after 40 clock steps")
+  }
+  return { renderer, stdout, clock, driver, renderToIdle }
 }
 
 test("frame admission bounds delayed output to one frame and coalesces callback work", async () => {
@@ -61,20 +71,20 @@ test("frame admission bounds delayed output to one frame and coalesces callback 
   expect(observed).toEqual(["A"])
 
   state = "B"
+  // The output cannot drain yet. A task on this Session runs after its already queued work.
   for (let attempt = 0; attempt < 32; attempt++) {
     renderer.requestRender()
     clock.advance(100)
-    await settle()
+    await new Promise<void>((resolve) => driver.scheduler.schedule(resolve))
   }
   expect(observed).toEqual(["A"])
 
   state = "C"
   stdout.release()
   await driver.idle()
-  for (let turn = 0; turn < 32 && observed.length < 2; turn++) {
-    clock.advance(100)
-    await settle()
-  }
+  await serviceReadyFrames(renderer)
+  clock.advance(100)
+  await serviceReadyFrames(renderer)
   renderer.pause()
   await renderer.idle()
 
@@ -87,21 +97,23 @@ test("frame admission bounds delayed output to one frame and coalesces callback 
 })
 
 test("animation requests wait for output credit and remain cancellable", async () => {
-  const { renderer, stdout, clock, driver } = createAdmissionRenderer()
+  const { renderer, stdout, clock, driver, renderToIdle } = createAdmissionRenderer()
   const observed: string[] = []
   renderer.addPostProcessFn((buffer) => buffer.drawText("held-animation", 0, 0, RGBA.fromInts(255, 255, 255)))
+  // Hold a real presentation before requesting the animation, not its own first write.
+  renderer.requestRender()
+  clock.advance(100)
+  await settleUntil(() => stdout.pendingWrite)
   const cancelled = renderer.requestAnimationFrame(() => observed.push("cancelled"))
   const resumed = renderer.requestAnimationFrame(() => observed.push("resumed"))
   renderer.cancelAnimationFrame(cancelled)
   renderer.cancelAnimationFrame(cancelled)
   clock.advance(100)
-  await settle()
+  await new Promise<void>((resolve) => driver.scheduler.schedule(resolve))
   expect(observed).toEqual([])
 
   stdout.release()
-  await driver.idle()
-  clock.advance(0)
-  await renderer.idle()
+  await renderToIdle()
   expect(renderer.liveRequestCount).toBe(0)
   expect(observed).toEqual(["resumed"])
 
@@ -124,12 +136,11 @@ for (const queuedWork of ["one-shot", "next-tick"] as const) {
     expect(renderer.getSchedulerState().hasScheduledRender).toBe(true)
     renderer.stop()
     clock.advance(100)
-    await settle()
-    expect(callbacks).toBe(0)
     await renderer.idle()
+    expect(callbacks).toBe(0)
     renderer.requestRender()
     clock.advance(100)
-    await settle()
+    await renderer.idle()
     expect(callbacks).toBe(1)
     expect(renderer.isRunning).toBe(false)
   })
@@ -197,13 +208,14 @@ const busyResizes: Record<string, () => Promise<BusyResize>> = {
     const target = createAdmissionRenderer(30, 12, { screenMode: "split-footer", footerHeight: 6 })
     target.stdout.release()
     await target.renderer.setupTerminal()
+    target.renderer.stdin.emit("data", Buffer.from("\x1b[1;1R"))
     return { ...target, sizes: [[20, 12]], inFrame: true }
   },
 }
 
 for (const [state, enter] of Object.entries(busyResizes)) {
   test(`resize() during ${state} applies once the Session is ready`, async () => {
-    const { renderer, stdout, clock, sizes, inFrame } = await enter()
+    const { renderer, stdout, renderToIdle, sizes, inFrame } = await enter()
     const initial = [renderer.terminalWidth, renderer.terminalHeight]
     const resizes: number[][] = []
     const errors: unknown[] = []
@@ -222,11 +234,7 @@ for (const [state, enter] of Object.entries(busyResizes)) {
       renderer.requestRender()
     } else resize()
     stdout.release()
-    for (let turn = 0; turn < 8; turn++) {
-      clock.advance(100)
-      await settle()
-    }
-    await renderer.idle()
+    await renderToIdle()
 
     const size = sizes.at(-1)!
     const reverted = size[0] === initial[0] && size[1] === initial[1]
@@ -281,7 +289,7 @@ function noise(seed: number, length: number): Uint8Array {
 // 413: three 12 KB Kitty uploads exceed one frame of this Session (28,672 bytes). The frame sends two and the
 // renderer asks for the next frame, which sends the third; no frame fails.
 test("Kitty uploads that do not fit one frame go out in the next frames", async () => {
-  const { renderer, stdout, clock } = createAdmissionRenderer()
+  const { renderer, stdout, renderToIdle } = createAdmissionRenderer()
   stdout.release()
   for (let index = 0; index < 3; index++) {
     const source = NativeImage.fromRgba(noise(index, 48 * 48 * 4), 48, 48)
@@ -297,11 +305,7 @@ test("Kitty uploads that do not fit one frame go out in the next frames", async 
       }),
     )
   }
-  for (let turn = 0; turn < 8; turn++) {
-    clock.advance(100)
-    await settle()
-  }
-  await renderer.idle()
+  await renderToIdle()
   expect(stdout.text().split("\x1b_Ga=t").length - 1).toBe(3)
 })
 
@@ -346,7 +350,7 @@ for (const mode of ["demand", "continuous"] as const) {
       for (let turn = 0; turn < 5; turn++) {
         if (mode === "demand") renderer.requestRender()
         clock.advance(100)
-        await settle()
+        await serviceReadyFrames(renderer)
       }
     }
     if (mode === "continuous") renderer.start()
@@ -369,7 +373,7 @@ for (const mode of ["demand", "continuous"] as const) {
 // full repaint and is drawn.
 for (const content of ["noise", "checkerboard"] as const) {
   test(`one oversize update in demand mode is retried as a full repaint (${content})`, async () => {
-    const { renderer, stdout, clock } = createAdmissionRenderer()
+    const { renderer, stdout, clock, renderToIdle } = createAdmissionRenderer()
     const dropped: unknown[] = []
     renderer.on(CliRenderEvents.FRAME_DROPPED, (event) => dropped.push(event))
     let update = false
@@ -391,11 +395,7 @@ for (const content of ["noise", "checkerboard"] as const) {
     const before = stdout.text().length
     update = true
     renderer.requestRender()
-    for (let turn = 0; turn < 8; turn++) {
-      clock.advance(100)
-      await settle()
-    }
-    await renderer.idle()
+    await renderToIdle()
     const drawn = stdout.text().slice(before)
     expect({ events: dropped.length, drawn: drawn.includes("oxox") }).toEqual(
       content === "noise" ? { events: 1, drawn: false } : { events: 0, drawn: true },
@@ -406,37 +406,35 @@ for (const content of ["noise", "checkerboard"] as const) {
 // 413: a scrollback commit larger than one frame goes again alone and is then dropped and reported; the commits
 // around it and the footer still draw, and closing restores the terminal.
 test("a scrollback commit too large for the output is dropped", async () => {
-  const { renderer, stdout, clock } = createAdmissionRenderer(80, 24, { screenMode: "split-footer", footerHeight: 4 })
+  const { renderer, stdout, renderToIdle } = createAdmissionRenderer(80, 24, {
+    screenMode: "split-footer",
+    footerHeight: 4,
+  })
   const dropped: unknown[] = []
   renderer.on(CliRenderEvents.FRAME_DROPPED, (event) => dropped.push(event))
   const footer = new TextRenderable(renderer, { content: "footer-a" })
   renderer.root.add(footer)
-  const writeNoise = (width = 80, trailingNewline = true) =>
+  const writeNoise = (width = 80, trailingNewline = true, height = 17) =>
     renderer.writeToScrollback((ctx) => ({
-      root: new Noise(ctx.renderContext, { position: "absolute", left: 0, top: 0, width, height: 17 }),
+      root: new Noise(ctx.renderContext, { position: "absolute", left: 0, top: 0, width, height }),
       width,
-      height: 17,
+      height,
       startOnNewLine: true,
       trailingNewline,
     }))
   stdout.release()
   await renderer.setupTerminal()
+  renderer.stdin.emit("data", Buffer.from("\x1b[1;1R"))
   stdout.write("before\n")
   // The dropped commit ends mid-row at column 70; the next line continues "ab", not that column.
   writeNoise(70, false)
   stdout.write("ab")
   renderer.once(CliRenderEvents.FRAME_DROPPED, () => stdout.write("1234567890\n"))
-  for (let turn = 0; turn < 40; turn++) {
-    clock.advance(100)
-    await settle()
-  }
+  await renderToIdle()
   footer.content = "ZZZZZZZZ"
   // Later commits batch again.
   for (const line of ["one", "two", "three"]) stdout.write(`${line}\n`)
-  for (let turn = 0; turn < 40; turn++) {
-    clock.advance(100)
-    await settle()
-  }
+  await renderToIdle()
   const output = stdout.text()
   expect({ events: dropped.length, before: output.includes("before"), after: output.includes("1234567890") }).toEqual({
     events: 1,
@@ -446,8 +444,15 @@ test("a scrollback commit too large for the output is dropped", async () => {
   expect(output).toContain("ZZZZZZZZ")
   expect(output).toContain("three")
   expect(output.slice(output.indexOf("one"), output.indexOf("three"))).not.toContain("\x1b[?2026l")
+  // Two 640-cell noise commits fit only one at a time; after them, captured rows batch 64 a frame again.
+  const renders = spyOn(renderer.nativeScene.driver, "renderSplit")
+  writeNoise(80, true, 8)
+  writeNoise(80, true, 8)
+  for (let row = 0; row < 70; row++) stdout.write(`T${row}\n`)
+  await renderToIdle()
+  expect(renders.mock.calls.map(([, commits]) => commits.length)).toEqual([33, 1, 64, 7])
   // The close flush drops a commit too large for one frame as well, then restores the terminal.
-  const closing = output.length
+  const closing = stdout.text().length
   writeNoise()
   renderer.destroy()
   await renderer.closed

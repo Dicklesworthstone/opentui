@@ -314,6 +314,8 @@ pub const Layout = struct {
     height: f32 = 0,
     screenX: f64 = 0,
     screenY: f64 = 0,
+    // A text node's view: its offset from the box (x, y) and its size (width, height).
+    content: [4]f32 = @splat(0),
 };
 
 pub const Paint = struct {
@@ -510,8 +512,6 @@ pub const Node = struct {
     paint_children: std.ArrayListUnmanaged(*native.NativeRenderable) = .empty,
     // Strictly increasing along paint_children, so a sorted batch of children is in paint order.
     paint_rank: u64 = 0,
-    // Scene.last_placement when the node joined its parent: equal z paints in attachment order.
-    attach_order: u64 = 0,
     sort_dirty: bool = false,
     layout_flags: packed struct {
         // Newly placed hidden children expose geometry once, without paint membership.
@@ -722,15 +722,21 @@ pub const PaintSlot = struct {
 };
 
 /// A painted member's rect within its clip, in screen cells.
-pub const Hit = struct { x: u32, y: u32, width: u32, height: u32, token: u32 };
+pub const Hit = struct { x: u32, y: u32, width: u32, height: u32, token: u32, num: u32 = 0 };
 
 /// The index of the last hit in paint order that covers a cell: what a grid that every
 /// member overwrote in paint order would hold there.
 pub fn topmostHit(hits: []const Hit, x: u32, y: u32) ?usize {
+    return topmostHitExcept(hits, x, y, 0);
+}
+
+/// The same, as if the node with public number `excluded` (zero: none) painted no hits.
+pub fn topmostHitExcept(hits: []const Hit, x: u32, y: u32, excluded: u32) ?usize {
     var index = hits.len;
     while (index != 0) {
         index -= 1;
         const hit = hits[index];
+        if (excluded != 0 and hit.num == excluded) continue;
         if (x >= hit.x and y >= hit.y and x - hit.x < hit.width and y - hit.y < hit.height) return index;
     }
     return null;
@@ -969,13 +975,16 @@ pub const Scene = struct {
             }
             try yoga.check(yoga.yogaNodeMoveChildChecked(target.childYoga(parent), value.yoga_node, index));
             const previous = node.parent;
-            if (previous) |old| removeChild(&old.scene_node.?.children, value);
+            if (previous) |old| {
+                const slot = removeChild(&old.scene_node.?.children, value);
+                if (old == parent and slot != index) target.sort_dirty = true;
+            }
             target.children.insertAssumeCapacity(index, value);
             staleCull(parent);
             if (previous != parent) {
                 if (previous) |old| self.detach(value, old);
                 const siblings = target.paint_children.items;
-                if (siblings.len != 0 and siblings[siblings.len - 1].scene_node.?.paint.zIndex > node.paint.zIndex) target.sort_dirty = true;
+                if (index != siblings.len or (siblings.len != 0 and siblings[siblings.len - 1].scene_node.?.paint.zIndex > node.paint.zIndex)) target.sort_dirty = true;
                 node.paint_rank = if (siblings.len == 0) 0 else siblings[siblings.len - 1].scene_node.?.paint_rank + 1;
                 target.paint_children.appendAssumeCapacity(value);
                 node.parent = parent;
@@ -1006,7 +1015,6 @@ pub const Scene = struct {
         if (new_placement) {
             self.last_placement += 1;
             node.placement = self.last_placement;
-            if (reparented) node.attach_order = self.last_placement;
         } else if (destination == null) node.placement = 0;
         node.layout_flags.needs_layout = true;
         self.visibility_epoch +%= 1;
@@ -1046,7 +1054,7 @@ pub const Scene = struct {
     /// Takes a node out of its parent's paint children, attention, and counts.
     fn detach(self: *Scene, value: *native.NativeRenderable, parent: *native.NativeRenderable) void {
         const node = value.scene_node.?;
-        removeChild(&parent.scene_node.?.paint_children, value);
+        _ = removeChild(&parent.scene_node.?.paint_children, value);
         if (node.skip.attention_index != no_slot) dropAttention(parent.scene_node.?, node.skip.attention_index);
         countBelow(parent, node.skip.update_below, node.skip.filters_below, node.skip.scrolls_below, false);
         node.parent = null;
@@ -1315,9 +1323,7 @@ pub const Scene = struct {
         try buffer.validateTextInput(options.bottom_title);
         if (options.custom_border_chars) |chars| {
             for (chars) |char| {
-                if (char < 0x20 or (char >= 0x7f and char <= 0x9f) or
-                    char > 0x10ffff or (char >= 0xd800 and char <= 0xdfff)) return error.InvalidUnicode;
-                if (utf8.eastAsianWidth(@intCast(char)) != 1) return error.InvalidUnicode;
+                if (utf8.isControl(char) or !utf8.isScalar(char) or utf8.eastAsianWidth(@intCast(char)) != 1) return error.InvalidUnicode;
             }
         }
         try checkWritable(value);
@@ -1377,7 +1383,7 @@ pub const Scene = struct {
         if (node.kind != api.OT_SCENE_BOX) return error.WrongKind;
         if (options.axes > api.OT_SCENE_SCROLL_X | api.OT_SCENE_SCROLL_Y or options.follow > api.OT_SCENE_SCROLL_FOLLOW_RIGHT) return error.InvalidOptions;
         for (options.padding) |padding| {
-            if (!(padding >= 0 and padding <= 65535) or @trunc(padding) != padding) return error.InvalidOptions;
+            if (!(padding >= 0 and padding <= @as(f32, api.OT_SCENE_SCROLL_PADDING_MAX)) or @trunc(padding) != padding) return error.InvalidOptions;
         }
         for (options.fills) |fill| if (fill) |rgba| try buffer.validateColor(rgba);
         for (options.bars) |bar| {
@@ -2007,11 +2013,8 @@ pub const Scene = struct {
                     continue;
                 }
                 if (filter) |bounds| {
-                    var layout = state.layout;
-                    layout.screenX = origin[0] + @as(f64, layout.left) + state.paint.translateX;
-                    layout.screenY = origin[1] + @as(f64, layout.top) + state.paint.translateY;
                     self.frame_work.overlap_tests += 1;
-                    if (!overlaps(bounds, publicLayout(layout))) {
+                    if (!takes(bounds, origin, state)) {
                         if (!full and state.skip.attention_index != no_slot and onlySubtreeListed(state)) dropAttention(node, state.skip.attention_index);
                         continue;
                     }
@@ -2231,6 +2234,21 @@ pub const Scene = struct {
         // Preparation enters only visible nodes, so its stamp answers until a display or ancestry change.
         if (node.prepared_gen == self.candidates_gen and active.visibility_epoch == self.visibility_epoch and
             !self.forcesFullFrame()) return node.layout_flags.prepared_visible;
+        return self.reaches(null, value);
+    }
+
+    /// Whether the last frame that finished paint recorded the node, or the presented frame once a
+    /// later finished frame was cancelled (the root has no record).
+    pub fn paintedLatest(self: *const Scene, value: *const native.NativeRenderable) bool {
+        const records = value.scene_node.?.records;
+        const frame = if (self.cancelled_paint) self.presented_records_frame else self.finished_frame;
+        return frame != 0 and (records[0].frame == frame or records[1].frame == frame);
+    }
+
+    /// Whether the hook walk reaches the node: it and its ancestors are shown up to the root and,
+    /// with `objects`, each culling parent selects the branch at its current offset and child
+    /// count, as selectChildren does. A child moved since its last layout has no position yet.
+    pub fn reaches(self: *Scene, objects: ?*const handles.Table, value: *native.NativeRenderable) !bool {
         var cursor: ?*native.NativeRenderable = value;
         var depth: u32 = 0;
         while (cursor) |current| : (cursor = current.scene_node.?.parent) {
@@ -2241,6 +2259,10 @@ pub const Scene = struct {
             try yoga.check(yoga.yogaNodeStyleGetEnumChecked(current.yoga_node, api.OT_STYLE_ENUM_DISPLAY, &display));
             if (display == api.OT_DISPLAY_NONE) return false;
             if (current == self.root) return true;
+            const parent = current.scene_node.?.parent orelse return false;
+            const bounds = (try self.childFilter(objects orelse continue, parent)) orelse continue;
+            const origin = childOrigin(parent.scene_node.?, try composedLayout(parent, .prepared));
+            if (current.scene_node.?.layout_flags.needs_layout or !takes(bounds, origin, current.scene_node.?)) return false;
         }
         return false;
     }
@@ -2511,12 +2533,12 @@ pub const Scene = struct {
     }
 
     /// The token of the topmost presented hit rectangle at a cell, or 0.
-    pub fn hitToken(self: *Scene, cli: *const renderer.CliRenderer, x: u32, y: u32) u32 {
+    pub fn hitToken(self: *Scene, cli: *const renderer.CliRenderer, x: u32, y: u32, excluded: u32) u32 {
         self.settleHits(cli);
         // Every hit lies inside the screen.
         if (x >= cli.width or y >= cli.height or self.presented_hits_frame != cli.presented_hits_frame) return 0;
         const hits = self.presented_hits.items;
-        const index = topmostHit(hits, x, y);
+        const index = topmostHitExcept(hits, x, y, excluded);
         if (builtin.is_test) self.test_hit_steps += hits.len - (index orelse 0);
         return if (index) |found| hits[found].token else 0;
     }
@@ -2525,7 +2547,7 @@ pub const Scene = struct {
     /// A node no frame has prepared has no cells and draws nothing.
     pub fn paintBody(self: *const Scene, objects: *const handles.Table, target: *buffer.OptimizedBuffer, value: *const native.NativeRenderable, x: i32, y: i32) !void {
         const node = value.scene_node.?;
-        var layout = try getPaintLayout(value);
+        var layout = try getPaintLayout(value, false);
         // At its own cell a body keeps the fractional position, so slider thumbs land where paintNode puts them.
         if (x != @as(i32, @intFromFloat(layout.screenX)) or y != @as(i32, @intFromFloat(layout.screenY))) {
             layout.screenX = @floatFromInt(x);
@@ -2658,6 +2680,21 @@ pub const Scene = struct {
         const handle = self.tokens.get(token) orelse return null;
         const value = objects.get(handle, .native_renderable, native.NativeRenderable) catch return null;
         return value.scene_node;
+    }
+
+    /// Where the latest finished frame painted a member: its content's top-left cell and the cells it could draw. Null when
+    /// that frame did not paint it.
+    pub fn paintedArea(self: *const Scene, node: *const Node) ?struct { x: i64, y: i64, clip: buffer.ClipRect, frame: u64 } {
+        if (self.finished_frame == 0) return null;
+        // A failed attempt leaves its own records, not the finished frame's, in `records`.
+        const found = (if (self.records_frame == self.finished_frame)
+            self.recordOf(node, self.records_frame, self.records.items)
+        else if (self.presented_records_frame == self.finished_frame)
+            self.recordOf(node, self.presented_records_frame, self.presented_records.items)
+        else
+            null) orelse return null;
+        const content = cellClip(contentLayout(found.inputs.layout));
+        return .{ .x = content.x, .y = content.y, .clip = intersection(content, found.inputs.clip), .frame = self.finished_frame };
     }
 
     fn recordOf(_: *const Scene, node: *const Node, frame: u64, records: []const Record) ?Record {
@@ -2948,7 +2985,7 @@ pub const Scene = struct {
         };
         if (!options.use_mouse or node.num == options.excluded_hit_num) return;
         // The clip lies inside the screen, so hit coordinates are never negative.
-        if (painted.width != 0 and painted.height != 0) self.hits.appendAssumeCapacity(.{ .x = @intCast(painted.x), .y = @intCast(painted.y), .width = painted.width, .height = painted.height, .token = node.token });
+        if (painted.width != 0 and painted.height != 0) self.hits.appendAssumeCapacity(.{ .x = @intCast(painted.x), .y = @intCast(painted.y), .width = painted.width, .height = painted.height, .token = node.token, .num = node.num });
     }
 
     /// One member's phases and body inside a scissor. A member on several bands prepares its
@@ -2963,6 +3000,8 @@ pub const Scene = struct {
         if (image_state) |state| try beginImagePaint(state, cells);
         try playPhase(owner, target, surface, scissor, entry.opacity, phases, api.OT_SCENE_RECORD_PHASE_BEFORE);
         if (phases.hooks & api.OT_SCENE_HOOK_RENDER_SELF != 0) {
+            // The hook replaces the body: the text's glyphs are not on screen.
+            if (node.text) |text| text.painted = null;
             try playPhase(owner, target, surface, scissor, entry.opacity, phases, api.OT_SCENE_RECORD_PHASE_SELF);
         } else try self.paintNode(owner, cli, entry, cells);
         try playPhase(owner, target, surface, scissor, entry.opacity, phases, api.OT_SCENE_RECORD_PHASE_AFTER);
@@ -3018,8 +3057,16 @@ pub const Scene = struct {
         const height: u32 = @intFromFloat(cells.height);
         try self.prepareMember(entry);
         if (node.text) |text| {
-            const hit = intersection(.{ .x = x, .y = y, .width = width, .height = height }, entry.clip);
-            if (hit.width != 0 and hit.height != 0) try target.drawTextBufferChecked(text.view, x, y);
+            const content = cellClip(contentLayout(entry.layout));
+            const hit = intersection(content, entry.clip);
+            if (hit.width != 0 and hit.height != 0) {
+                try target.drawTextBufferChecked(text.view, content.x, content.y);
+                // Fully transparent text draws no glyph. A redraw of the same mapping keeps the frame it was
+                // first drawn in, which a failed attempt's redraw must not move.
+                const painted = if (entry.opacity > 0) text.mapping() else null;
+                if (!std.meta.eql(text.painted, painted)) text.painted_frame = self.attempt.?.frame_id;
+                text.painted = painted;
+            }
         } else if (node.kind == api.OT_SCENE_TEXT_VIEW) {
             const view = node.control.text_view.view orelse return;
             if (!node.control.text_view.paint) return;
@@ -3085,7 +3132,7 @@ pub const Scene = struct {
         for (0..2) |axis| {
             if (!state.visible[axis]) continue;
             const hit = intersection(cellClip(state.barRects(axis, box, node.paint.borderSides).bar), entry.clip);
-            if (hit.width != 0 and hit.height != 0) self.hits.appendAssumeCapacity(.{ .x = @intCast(hit.x), .y = @intCast(hit.y), .width = hit.width, .height = hit.height, .token = node.token });
+            if (hit.width != 0 and hit.height != 0) self.hits.appendAssumeCapacity(.{ .x = @intCast(hit.x), .y = @intCast(hit.y), .width = hit.width, .height = hit.height, .token = node.token, .num = node.num });
         }
     }
 
@@ -3382,17 +3429,8 @@ pub const Scene = struct {
                 }
                 var layout = node.layout;
                 if (refresh_layout) {
-                    var computed: yoga.ExternalYogaLayout = undefined;
                     self.frame_work.geometry_reads += 1;
-                    try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(value.yoga_node, &computed));
-                    layout = .{
-                        .left = computed.left,
-                        .top = computed.top,
-                        .right = computed.right,
-                        .bottom = computed.bottom,
-                        .width = computed.width,
-                        .height = computed.height,
-                    };
+                    layout = try localLayout(value, .solved);
                 } else if (mode == .paint) {
                     // Final paint follows settled preparation, but transforms remain live.
                     std.debug.assert(node.prepared_gen == self.candidates_gen);
@@ -3456,8 +3494,10 @@ pub const Scene = struct {
                     });
                 }
                 if (mode == .paint) frame.filter = try self.childFilter(objects, value);
-                if (!dry and (mode == .paint or (self.hook_count == 0 and self.filter_count == 0))) {
-                    // The candidates walked the old order, so the next frame walks again.
+                if (!dry and (mode == .paint or (self.hook_count == 0 and !frame.filtered))) {
+                    // Without host hooks, candidates can sort before entering a filtering subtree.
+                    // Inside it, only paint knows which parents are visible.
+                    // If paint sorted after feedback instead, the candidates still hold the old order.
                     if (sortChildren(node) and mode == .paint) self.candidates.clearRetainingCapacity();
                 }
                 if (frame.filter) |filter| frame.culled = try self.cullCandidates(node, filter, .{ frame.parent.screenX, frame.parent.screenY });
@@ -3579,7 +3619,7 @@ fn sameBox(a: Layout, b: Layout) bool {
     inline for (.{ "left", "top", "right", "bottom", "width", "height" }) |name| {
         if (@as(u32, @bitCast(@field(a, name))) != @as(u32, @bitCast(@field(b, name)))) return false;
     }
-    return true;
+    return std.mem.eql(u8, std.mem.asBytes(&a.content), std.mem.asBytes(&b.content));
 }
 
 /// Public geometry keeps at least one cell per dimension; paint geometry keeps Yoga's zero. Culling
@@ -3630,23 +3670,26 @@ pub fn getLayout(value: *const native.NativeRenderable) !Layout {
 /// Where the latest paint list painted the node, or where this frame's preparation placed it.
 /// The walks prepare a culled subtree only where it shows, so a node the list did not paint
 /// reads its solved geometry again; while a host request is pending, the first read holds, so
-/// a hook reads its request's geometry after its own changes.
-pub fn getPaintLayout(value: *const native.NativeRenderable) !Layout {
+/// a hook reads its request's geometry after its own changes. `content` cuts a text's view
+/// out of the box before the box is clamped to cells, as paint does.
+pub fn getPaintLayout(value: *const native.NativeRenderable, content: bool) !Layout {
     const node = value.scene_node.?;
     const owner = node.owner;
-    if (node.painted_gen == owner.members_gen) return cellLayout(node.layout);
     const pending = if (owner.attempt) |active| active.pending != null else false;
-    if (pending and node.read_request == owner.last_request) return cellLayout(node.layout);
-    const layout = try composedLayout(value, .solved);
-    if (pending) {
-        node.layout = layout;
-        node.read_request = owner.last_request;
-    }
-    return cellLayout(layout);
+    const layout = if (node.painted_gen == owner.members_gen or (pending and node.read_request == owner.last_request)) node.layout else solved: {
+        const solved = try composedLayout(value, .solved);
+        if (pending) {
+            node.layout = solved;
+            node.read_request = owner.last_request;
+        }
+        break :solved solved;
+    };
+    return cellLayout(if (content and node.text != null) contentLayout(layout) else layout);
 }
 
 /// Composes a node's local geometry through its ancestors: the observed, prepared, or solved
-/// one. A solved node Yoga has not laid out since it was created or moved has no cells.
+/// one. A solved node Yoga has not laid out since it was created or moved has no cells. No pass
+/// observes the nodes below a child its parent's latest selection culled, so they read as solved.
 fn composedLayout(value: *const native.NativeRenderable, comptime source: enum { observed, prepared, solved }) !Layout {
     var ancestors: [yoga.depth_max]*const native.NativeRenderable = undefined;
     var count: usize = 0;
@@ -3656,25 +3699,34 @@ fn composedLayout(value: *const native.NativeRenderable, comptime source: enum {
         ancestors[count] = node;
         count += 1;
     }
-    var result = try localLayout(value, source);
-    if (source == .solved) {
-        if (std.math.isNan(result.width) or std.math.isNan(result.height)) return .{};
-    }
-    result.screenX = 0;
-    result.screenY = 0;
-    while (count != 0) {
+    const owner = value.scene_node.?.owner;
+    var omitted = false;
+    var screen: [2]f64 = .{ 0, 0 };
+    while (true) {
         count -= 1;
         const node = ancestors[count].scene_node.?;
-        const layout = try localLayout(ancestors[count], source);
-        result.screenX = result.screenX + @as(f64, layout.left) + node.paint.translateX;
-        result.screenY = result.screenY + @as(f64, layout.top) + node.paint.translateY;
-        if (count != 0) {
-            const origin = childOrigin(node, .{});
-            result.screenX += origin[0];
-            result.screenY += origin[1];
+        var layout = try localLayout(ancestors[count], source);
+        if (source == .observed and omitted) {
+            // Yoga has not laid out a node created or moved since the solve.
+            const solved = try localLayout(ancestors[count], .solved);
+            if (!std.math.isNan(solved.width) and !std.math.isNan(solved.height)) layout = publicLayout(solved);
         }
+        screen[0] = screen[0] + @as(f64, layout.left) + node.paint.translateX;
+        screen[1] = screen[1] + @as(f64, layout.top) + node.paint.translateY;
+        if (count == 0) {
+            if (source == .solved and (std.math.isNan(layout.width) or std.math.isNan(layout.height))) return .{};
+            layout.screenX = screen[0];
+            layout.screenY = screen[1];
+            return layout;
+        }
+        if (source == .observed and !omitted) if (node.parent) |parent| {
+            omitted = parent.scene_node.?.filtersChildren() and node.prepared_gen == owner.candidates_gen and
+                node.culling.selected_at != parent.scene_node.?.culling.selected_epoch;
+        };
+        const origin = childOrigin(node, .{});
+        screen[0] += origin[0];
+        screen[1] += origin[1];
     }
-    return result;
 }
 
 fn localLayout(value: *const native.NativeRenderable, comptime source: anytype) !Layout {
@@ -3682,8 +3734,30 @@ fn localLayout(value: *const native.NativeRenderable, comptime source: anytype) 
     if (source == .observed) return node.observed_layout;
     if (source == .prepared) return node.layout;
     var computed: yoga.ExternalYogaLayout = undefined;
-    try yoga.check(yoga.yogaNodeGetComputedLayoutChecked(value.yoga_node, &computed));
-    return .{ .left = computed.left, .top = computed.top, .right = computed.right, .bottom = computed.bottom, .width = computed.width, .height = computed.height };
+    // Only text nodes paint inside their padding; boxes place children there. Yoga rounds the
+    // content box's edges as it rounds the node's own, so without padding the view is the box.
+    var box: [4]f32 = undefined;
+    try yoga.check(yoga.yogaNodeGetLayoutChecked(value.yoga_node, &computed, if (node.text != null) &box else null));
+    var layout: Layout = .{ .left = computed.left, .top = computed.top, .right = computed.right, .bottom = computed.bottom, .width = computed.width, .height = computed.height };
+    if (node.text != null) layout.content = .{ box[0], box[1], @max(0, box[2]), @max(0, box[3]) };
+    return layout;
+}
+
+/// The rect a text node's view fills.
+pub fn contentLayout(layout: Layout) Layout {
+    var content = layout;
+    content.screenX += layout.content[0];
+    content.screenY += layout.content[1];
+    content.width = layout.content[2];
+    content.height = layout.content[3];
+    return content;
+}
+
+/// Where a text node's content starts, in cells from the node's own cell.
+pub fn contentOffset(layout: Layout) [2]i32 {
+    const box = cellClip(layout);
+    const content = cellClip(contentLayout(layout));
+    return .{ content.x - box.x, content.y - box.y };
 }
 
 /// Where a parent's children compose from: its screen position, plus a scroll node's viewport
@@ -3736,9 +3810,10 @@ fn prepareView(work: *renderer.FrameWork, node: *Node, layout: Layout) !void {
         return;
     }
     const text = node.text orelse return;
+    const content = contentLayout(layout);
     var viewport: text_buffer_view.Viewport = text.view.getViewport() orelse text.initial_viewport orelse .{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    viewport.width = cellSize(layout.width);
-    viewport.height = cellSize(layout.height);
+    viewport.width = cellSize(content.width);
+    viewport.height = cellSize(content.height);
     text.view.setViewport(viewport);
     try text.prepareView();
     text.initial_viewport = null;
@@ -3748,7 +3823,16 @@ fn prepareView(work: *renderer.FrameWork, node: *Node, layout: Layout) !void {
 fn viewNeedsPrepare(node: *const Node, layout: Layout) bool {
     const view = if (node.kind == api.OT_SCENE_TEXT_VIEW) (node.control.text_view.view orelse return false).view else (node.text orelse return false).view;
     const viewport = view.getViewport() orelse return true;
-    return viewport.width != cellSize(layout.width) or viewport.height != cellSize(layout.height) or view.needsPrepare();
+    const content = if (node.text != null) contentLayout(layout) else layout;
+    return viewport.width != cellSize(content.width) or viewport.height != cellSize(content.height) or view.needsPrepare();
+}
+
+/// Whether a culling parent whose children compose from `origin` selects the child.
+fn takes(filter: Filter, origin: [2]f64, state: *const Node) bool {
+    var layout = state.layout;
+    layout.screenX = origin[0] + @as(f64, layout.left) + state.paint.translateX;
+    layout.screenY = origin[1] + @as(f64, layout.top) + state.paint.translateY;
+    return overlaps(filter, publicLayout(layout));
 }
 
 fn overlaps(filter: Filter, layout: Layout) bool {
@@ -3762,8 +3846,10 @@ fn overlaps(filter: Filter, layout: Layout) bool {
         layout.screenX <= viewport.screenX + viewport.width and layout.screenX + layout.width >= viewport.screenX;
 }
 
-fn removeChild(children: *std.ArrayListUnmanaged(*native.NativeRenderable), value: *native.NativeRenderable) void {
-    _ = children.orderedRemove(childIndex(children.items, value));
+fn removeChild(children: *std.ArrayListUnmanaged(*native.NativeRenderable), value: *native.NativeRenderable) u32 {
+    const index = childIndex(children.items, value);
+    _ = children.orderedRemove(index);
+    return index;
 }
 
 /// Hosts remove children in order, from the first or from the last, so the search starts at both ends.
@@ -3783,7 +3869,7 @@ fn paintLessThan(_: void, left: *native.NativeRenderable, right: *native.NativeR
     const a = left.scene_node.?;
     const b = right.scene_node.?;
     if (builtin.is_test) a.owner.test_sort_steps += 1;
-    return if (a.paint.zIndex == b.paint.zIndex) a.attach_order < b.attach_order else a.paint.zIndex < b.paint.zIndex;
+    return a.paint.zIndex < b.paint.zIndex;
 }
 
 fn rankLessThan(_: void, left: *native.NativeRenderable, right: *native.NativeRenderable) bool {
@@ -3793,6 +3879,8 @@ fn rankLessThan(_: void, left: *native.NativeRenderable, right: *native.NativeRe
 /// Returns whether the order changed.
 fn sortChildren(node: *Node) bool {
     if (!node.sort_dirty) return false;
+    // Stable sort from child order, not from the result of the previous z sort.
+    @memcpy(node.paint_children.items, node.children.items);
     std.mem.sort(*native.NativeRenderable, node.paint_children.items, {}, paintLessThan);
     for (node.paint_children.items, 0..) |child, index| {
         if (builtin.is_test) node.owner.test_sort_steps += 1;
@@ -3806,7 +3894,7 @@ fn sortChildren(node: *Node) bool {
 /// culling node that moved left its own and its subtree's positions and clips behind, which only
 /// paint layout reads, again (getPaintLayout); a scroll node's stay exact for its report.
 fn sameEntries(first: []const Work, second: []const Work, comptime kept: bool) bool {
-    comptime std.debug.assert(@sizeOf(Layout) == 6 * @sizeOf(f32) + 2 * @sizeOf(f64));
+    comptime std.debug.assert(@sizeOf(Layout) == 10 * @sizeOf(f32) + 2 * @sizeOf(f64));
     if (first.len != second.len) return false;
     for (first, second) |a, b| {
         var rest = [2]Work{ a, b };

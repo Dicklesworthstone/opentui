@@ -576,28 +576,37 @@ test "video scene playback keeps its audio queue filled without paints" {
     try testing.expect(produced >= 20_000);
 }
 
-test "video scene playback ends and loops without paints" {
+// After one paint, the switch asset's worker decodes the 6000x5000 keyframe at 1 s; a state read
+// past the end, or past a loop's wrap, reports that failure instead of dropping it.
+test "video scene playback ends, loops and fails without paints" {
+    const rows = [_]struct { asset: []const u8, from_end_us: i64, loop: bool, failed: bool }{
+        .{ .asset = gop_asset, .from_end_us = 10_000, .loop = false, .failed = false },
+        .{ .asset = gop_asset, .from_end_us = 10_000, .loop = true, .failed = false },
+        .{ .asset = switch_asset, .from_end_us = 550_000, .loop = false, .failed = true },
+        .{ .asset = switch_asset, .from_end_us = 550_000, .loop = true, .failed = true },
+    };
     const f = try Fixture.init(testing.allocator, 8, 4, .{});
     defer f.deinit();
     const node = try videoNode(f);
-    _ = try f.owner.videoOpen(node, gop_asset, true);
-    const value = try playerOf(f, node);
-    const total = value.video.info.duration_us;
-    try f.owner.videoControl(node, video.Player.play, .{});
-    try f.owner.videoControl(node, video.Player.seek, .{total - 10_000});
-    sleepMs(30);
-    var state = try f.owner.videoGetState(node);
-    try testing.expect(state.ended);
-    try testing.expect(!state.playing);
-    try testing.expectEqual(total, state.current_time_us);
-
-    try f.owner.videoControl(node, video.Player.setLoop, .{true});
-    try f.owner.videoControl(node, video.Player.play, .{});
-    try f.owner.videoControl(node, video.Player.seek, .{total - 10_000});
-    sleepMs(30);
-    state = try f.owner.videoGetState(node);
-    try testing.expect(state.playing);
-    try testing.expect(state.current_time_us < 500_000);
+    var ended = false;
+    for (rows) |row| {
+        // The row after an end plays the ended video again.
+        if (!ended) _ = try f.owner.videoOpen(node, row.asset, true);
+        ended = !row.loop and !row.failed;
+        const value = try playerOf(f, node);
+        const total = value.video.info.duration_us;
+        try f.owner.videoControl(node, video.Player.setLoop, .{row.loop});
+        try f.owner.videoControl(node, video.Player.play, .{});
+        try f.owner.videoControl(node, video.Player.seek, .{total - row.from_end_us});
+        if (row.failed) try paint(f);
+        sleepMs(@divTrunc(row.from_end_us, 1000) + 20);
+        const state = try f.owner.videoGetState(node);
+        errdefer std.debug.print("{s} loop {}: read {any}\n", .{ row.asset, row.loop, state });
+        try testing.expectEqual(.{ ended, row.failed, row.loop and !row.failed }, .{ state.ended, state.failed, state.playing });
+        if (ended) try testing.expectEqual(total, state.current_time_us);
+        if (state.playing) try testing.expect(state.current_time_us < 500_000);
+        if (row.failed) try testing.expect(std.mem.indexOf(u8, value.lastError(), "6000x5000 exceeds the image limits") != null);
+    }
 }
 
 test "video scene loops a clip shorter than a paint without recursing" {
@@ -1139,22 +1148,17 @@ test "video scene playback ends or loops after the audio drains without paints" 
         for (0..@as(usize, if (loop) 2 else 1)) |pass| {
             try f.owner.videoControl(node, video.Player.seek, .{value.video.info.duration_us - 200_000});
             if (pass == 0) try f.owner.videoControl(node, video.Player.play, .{});
-            for (0..3000) |_| {
-                if (value.video.getState().audio_ended != 0) break;
-                sleepMs(1);
-            }
-            // A device pulls the whole queued tail; only the audio thread publishes what it played.
-            var output: [960 * 2]f32 = undefined;
+            // Keep pulling like a device until the audio thread publishes the drain.
+            var output: [9600 * 2]f32 = undefined;
             const mixed_at = std.Io.Clock.now(.awake, testing.io).toMicroseconds();
-            for (0..12) |_| {
-                value.video.engine_lock.lockUncancelable(testing.io);
-                _ = audio.mixToBuffer(value.video.audio_engine.?, &output, 960, 2);
-                value.video.engine_lock.unlock(testing.io);
-            }
             for (0..3000) |_| {
                 if (value.video.audioStats().?.state == audio.StreamState.ended) break;
+                value.video.engine_lock.lockUncancelable(testing.io);
+                const mixed = audio.mixToBuffer(value.video.audio_engine.?, &output, output.len / 2, 2);
+                value.video.engine_lock.unlock(testing.io);
+                try testing.expectEqual(audio.Status.ok, mixed);
                 sleepMs(1);
-            }
+            } else return error.AudioDrainTimeout;
             sleepMs(30);
             // A later publish of the drained stream keeps the drain time.
             try value.video.setVolume(0.5);

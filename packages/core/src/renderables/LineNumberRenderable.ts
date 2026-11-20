@@ -290,15 +290,22 @@ class GutterRenderable extends Renderable {
     const end = Math.min(this.height, buffer.height - y)
     if (end <= start || x >= buffer.width || x + this.width <= 0) return
 
+    // Rows of the target's padding get the background and no line.
+    const [top, rows] = textRows(this._ctx.nativeScene, this.target)
+    const from = Math.max(start, top)
+    const to = Math.max(from, Math.min(end, top + rows))
+    for (let row = start; row < end; row++)
+      if (row < from || row >= to) buffer.fillRect(x, y + row, this.width, 1, this._bg)
+
     // The source of the row above the window tells whether the first row continues a wrapped line.
-    const startLine = Math.trunc(this.target.scrollY) + start
+    const startLine = Math.trunc(this.target.scrollY) + from - top
     const sourceStart = Math.max(0, startLine - 1)
     const sourceOffset = startLine - sourceStart
-    const sources = getLineSources(this.target, sourceStart, end - start + sourceOffset)
+    const sources = getLineSources(this.target, sourceStart, to - from + sourceOffset)
     let lastSource = sourceOffset > 0 ? sources[0] : -1
 
-    for (let i = sourceOffset; i < end - start + sourceOffset; i++) {
-      const row = y + start + i - sourceOffset
+    for (let i = sourceOffset; i < to - from + sourceOffset; i++) {
+      const row = y + from + i - sourceOffset
       const logicalLine = sources[i]
       const lineBg = this._lineColorsGutter.get(logicalLine)
       if (!lineBg || lineBg.a < 1) buffer.fillRect(x, row, this.width, 1, this._bg)
@@ -334,6 +341,14 @@ class GutterRenderable extends Renderable {
       lastSource = logicalLine
     }
   }
+}
+
+/** The rows of the target its text fills, from the target's top cell: native text leaves its padding out. */
+function textRows(scene: RenderContext["nativeScene"], target: Renderable): [top: number, height: number] {
+  const box = scene.getLayout(target, "paint")
+  const content = scene.getLayout(target, "content")
+  // Paint truncates each origin to its cell on its own.
+  return [Math.trunc(content.screenY) - Math.trunc(box.screenY), content.height]
 }
 
 function getLineSources(target: LineInfoProvider, startLine: number, lineCount: number): number[] {
@@ -412,11 +427,7 @@ export class LineNumberRenderable extends Renderable {
 
       this._lineColorsGutter = new Map<number, RGBA>()
       this._lineColorsContent = new Map<number, RGBA>()
-      if (options.lineColors) {
-        for (const [line, color] of options.lineColors) {
-          this.parseLineColor(line, color)
-        }
-      }
+      if (options.lineColors) this.setLineColors(options.lineColors)
 
       this._lineSigns = new Map<number, LineSign>()
       if (options.lineSigns) {
@@ -568,7 +579,13 @@ export class LineNumberRenderable extends Renderable {
     const end = Math.min(this.height, buffer.height - y)
     if (end <= start || x >= buffer.width || x + this.width <= 0) return
 
-    const sources = getLineSources(this.target, Math.trunc(this.target.scrollY) + start, end - start)
+    const [top, rows] = textRows(this._ctx.nativeScene, this.target)
+    const from = Math.max(start, top)
+    const sources = getLineSources(
+      this.target,
+      Math.trunc(this.target.scrollY) + from - top,
+      Math.max(0, Math.min(end, top + rows) - from),
+    )
 
     // Calculate the area to fill: from after the gutter (if visible) to the end of our width
     const gutterWidth = this.gutter.visible ? this.gutter.width : 0
@@ -581,7 +598,7 @@ export class LineNumberRenderable extends Renderable {
 
       if (lineBg) {
         // Fill from after gutter to the end of the LineNumberRenderable
-        buffer.fillRect(x + gutterWidth, y + start + i, contentWidth, 1, lineBg)
+        buffer.fillRect(x + gutterWidth, y + from + i, contentWidth, 1, lineBg)
       }
     }
   }
@@ -640,6 +657,11 @@ export class LineNumberRenderable extends Renderable {
     }
   }
 
+  public set lineColors(value: LineNumberOptions["lineColors"]) {
+    if (value) this.setLineColors(value)
+    else this.clearAllLineColors()
+  }
+
   public setLineColors(lineColors: Map<number, string | RGBA | LineColorConfig>): void {
     this._lineColorsGutter.clear()
     this._lineColorsContent.clear()
@@ -692,6 +714,11 @@ export class LineNumberRenderable extends Renderable {
     }
   }
 
+  public set lineSigns(value: LineNumberOptions["lineSigns"]) {
+    if (value) this.setLineSigns(value)
+    else this.clearAllLineSigns()
+  }
+
   public getLineSigns(): Map<number, LineSign> {
     return new Map(Array.from(this._lineSigns, ([line, sign]) => [line, cloneLineSign(sign)]))
   }
@@ -739,6 +766,10 @@ export class LineNumberRenderable extends Renderable {
     return this._hideLineNumbers
   }
 
+  public set hideLineNumbers(value: LineNumberOptions["hideLineNumbers"]) {
+    this.setHideLineNumbers(value ?? new Set())
+  }
+
   public setLineNumbers(lineNumbers: Map<number, number>): void {
     this._lineNumbers = lineNumbers
     if (this.gutter) {
@@ -749,6 +780,10 @@ export class LineNumberRenderable extends Renderable {
 
   public getLineNumbers(): Map<number, number> {
     return this._lineNumbers
+  }
+
+  public set lineNumbers(value: LineNumberOptions["lineNumbers"]) {
+    this.setLineNumbers(value ?? new Map())
   }
 
   public highlightLines(startLine: number, endLine: number, color: string | RGBA | LineColorConfig): void {

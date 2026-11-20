@@ -7,7 +7,7 @@ use crate::input::KeyCode;
 use crate::widget::EditorAction;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Splits keys such as `"ctrl+c,ctrl+d"` into one binding per key.
 pub fn comma_bindings<T: Clone + PartialEq + 'static>(keymap: &Keymap<T>) -> Disposer {
@@ -124,19 +124,49 @@ pub fn leader<T: Clone + PartialEq + 'static>(keymap: &Keymap<T>, name: &str, tr
     keymap.register_token(name, trigger)
 }
 
-/// A leader token whose pending sequence clears when no key follows in time. The keymap has no clock: schedule a
-/// timer for [`deadline`](Self::deadline) and call [`expire`](Self::expire) when it fires. Dropping it removes the
+/// A leader token whose pending sequence clears when no key follows in time. The keymap has no clock: in a
+/// [`Keymap::on_pending_sequence`] listener, registered before or after the leader, while it is
+/// [`armed`](Self::armed), schedule [`timeout`](Self::timeout) on the app's timer and pass the generation to
+/// [`expire`](Self::expire) when it fires. A timer of an earlier generation does nothing. Dropping it removes the
 /// token, as [`dispose`](Self::dispose) does.
+///
+/// ```
+/// use opentui::keymap::{Binding, Command, Keymap, Layer, addons};
+/// use opentui::testing::TestApp;
+/// use std::{rc::Rc, time::Duration};
+///
+/// let app = TestApp::new(10, 2);
+/// let keymap = Keymap::<()>::new();
+/// let leader = Rc::new(addons::timed_leader(&keymap, "leader", "ctrl+x", Duration::from_secs(2)).unwrap());
+/// let layer = Layer::new().command(Command::new("new", |_| {})).binding(Binding::new("<leader>n").cmd("new"));
+/// keymap.register_layer(layer).forget();
+/// let timers = app.app().clone();
+/// keymap
+///     .on_pending_sequence(move |_| {
+///         if let Some(generation) = leader.armed() {
+///             let leader = leader.clone();
+///             timers.set_timeout(leader.timeout(), move |_| { leader.expire(generation); });
+///         }
+///     })
+///     .forget();
+/// let keys = keymap.clone();
+/// app.on_key_capture(move |_, key| { keys.handle_key(key); });
+/// app.press("ctrl+x");
+/// assert_eq!(keymap.pending_sequence().len(), 1);
+/// app.advance(Duration::from_secs(2));
+/// assert!(keymap.pending_sequence().is_empty());
+/// ```
 #[must_use = "dropping a TimedLeader removes its token"]
 pub struct TimedLeader<T> {
     keymap: WeakKeymap<T>,
-    deadline: Rc<Cell<Option<Instant>>>,
+    trigger: Stroke,
+    timeout: Cell<Duration>,
     disposer: Disposer,
 }
 
-/// Registers a leader token, as [`leader`] does, and arms a timeout whenever a pending sequence starts with the
-/// trigger. Each further stroke restarts the timeout. `@opentui/keymap` defaults the timeout to 1,500 ms; OpenCode
-/// uses 2,000 ms.
+/// Registers a leader token, as [`leader`] does, and arms the leader whenever a pending sequence starts with the
+/// trigger. Each further stroke arms it again, with a new generation. `@opentui/keymap` defaults the timeout to
+/// 1,500 ms; OpenCode uses 2,000 ms.
 pub fn timed_leader<T: Clone + PartialEq + 'static>(
     keymap: &Keymap<T>,
     name: &str,
@@ -144,33 +174,35 @@ pub fn timed_leader<T: Clone + PartialEq + 'static>(
     timeout: Duration,
 ) -> Result<TimedLeader<T>, String> {
     let trigger = trigger.into();
-    let trigger_stroke = keymap.parse_key(trigger.clone())?.stroke;
-    let deadline = Rc::new(Cell::new(None));
-    let sync = {
-        let deadline = deadline.clone();
-        move |sequence: &[super::KeySequencePart]| {
-            let armed = sequence.first().is_some_and(|part| part.stroke == trigger_stroke);
-            deadline.set(armed.then(|| Instant::now() + timeout));
-        }
-    };
-    let token = leader(keymap, name, trigger);
-    sync(&keymap.pending_sequence());
-    let listener = keymap.on_pending_sequence(sync);
-    Ok(TimedLeader { keymap: keymap.downgrade(), deadline, disposer: Disposer::all(vec![token, listener]) })
+    let stroke = keymap.parse_key(trigger.clone())?.stroke;
+    let disposer = leader(keymap, name, trigger);
+    Ok(TimedLeader { keymap: keymap.downgrade(), trigger: stroke, timeout: Cell::new(timeout), disposer })
 }
 
 impl<T: Clone + PartialEq + 'static> TimedLeader<T> {
-    /// When the leader sequence expires, while one is pending.
-    pub fn deadline(&self) -> Option<Instant> {
-        self.deadline.get()
+    /// The generation of the pending leader sequence, while one is pending: the keymap's count of pending-sequence
+    /// changes, which every listener sees already counted.
+    pub fn armed(&self) -> Option<u64> {
+        let (generation, first) = self.keymap.upgrade()?.pending_change();
+        (first.as_ref() == Some(&self.trigger)).then_some(generation)
     }
 
-    /// Clears the leader sequence if `now` is past its deadline. Returns whether it did.
-    pub fn expire(&self, now: Instant) -> bool {
-        if self.deadline.get().is_none_or(|deadline| now < deadline) {
+    /// How long a pending leader sequence waits for the next stroke.
+    pub fn timeout(&self) -> Duration {
+        self.timeout.get()
+    }
+
+    /// Changes the timeout, as a live setting does. A timer already set keeps its delay; the next arming waits
+    /// `timeout`.
+    pub fn set_timeout(&self, timeout: Duration) {
+        self.timeout.set(timeout);
+    }
+
+    /// Clears the leader sequence if it is still at `generation`: no stroke came since. Returns whether it did.
+    pub fn expire(&self, generation: u64) -> bool {
+        if self.armed() != Some(generation) {
             return false;
         }
-        self.deadline.set(None);
         if let Some(keymap) = self.keymap.upgrade() {
             keymap.clear_pending_sequence();
         }
@@ -178,118 +210,11 @@ impl<T: Clone + PartialEq + 'static> TimedLeader<T> {
     }
 
     pub fn dispose(self) {
-        self.deadline.set(None);
         self.disposer.dispose();
     }
 }
 
-/// The edit commands, their names, and their descriptions, as `@opentui/keymap`'s edit-buffer addon names them.
-pub const EDIT_COMMANDS: &[(EditorAction, &str, &str)] = &[
-    (EditorAction::MoveLeft, "input.move.left", "Cursor left"),
-    (EditorAction::MoveRight, "input.move.right", "Cursor right"),
-    (EditorAction::MoveUp, "input.move.up", "Cursor up"),
-    (EditorAction::MoveDown, "input.move.down", "Cursor down"),
-    (EditorAction::SelectLeft, "input.select.left", "Select left"),
-    (EditorAction::SelectRight, "input.select.right", "Select right"),
-    (EditorAction::SelectUp, "input.select.up", "Select up"),
-    (EditorAction::SelectDown, "input.select.down", "Select down"),
-    (EditorAction::LineHome, "input.line.home", "Line start"),
-    (EditorAction::LineEnd, "input.line.end", "Line end"),
-    (EditorAction::SelectLineHome, "input.select.line.home", "Select to line start"),
-    (EditorAction::SelectLineEnd, "input.select.line.end", "Select to line end"),
-    (EditorAction::VisualLineHome, "input.visual.line.home", "Visual line start"),
-    (EditorAction::VisualLineEnd, "input.visual.line.end", "Visual line end"),
-    (EditorAction::SelectVisualLineHome, "input.select.visual.line.home", "Select to visual line start"),
-    (EditorAction::SelectVisualLineEnd, "input.select.visual.line.end", "Select to visual line end"),
-    (EditorAction::BufferHome, "input.buffer.home", "Buffer start"),
-    (EditorAction::BufferEnd, "input.buffer.end", "Buffer end"),
-    (EditorAction::SelectBufferHome, "input.select.buffer.home", "Select to buffer start"),
-    (EditorAction::SelectBufferEnd, "input.select.buffer.end", "Select to buffer end"),
-    (EditorAction::DeleteLine, "input.delete.line", "Delete line"),
-    (EditorAction::DeleteToLineEnd, "input.delete.to.line.end", "Delete to line end"),
-    (EditorAction::DeleteToLineStart, "input.delete.to.line.start", "Delete to line start"),
-    (EditorAction::Backspace, "input.backspace", "Delete backward"),
-    (EditorAction::Delete, "input.delete", "Delete forward"),
-    (EditorAction::Newline, "input.newline", "New line"),
-    (EditorAction::Undo, "input.undo", "Undo"),
-    (EditorAction::Redo, "input.redo", "Redo"),
-    (EditorAction::WordForward, "input.word.forward", "Next word"),
-    (EditorAction::WordBackward, "input.word.backward", "Previous word"),
-    (EditorAction::SelectWordForward, "input.select.word.forward", "Select next word"),
-    (EditorAction::SelectWordBackward, "input.select.word.backward", "Select previous word"),
-    (EditorAction::DeleteWordForward, "input.delete.word.forward", "Delete next word"),
-    (EditorAction::DeleteWordBackward, "input.delete.word.backward", "Delete previous word"),
-    (EditorAction::SelectAll, "input.select.all", "Select all"),
-    (EditorAction::Submit, "input.submit", "Submit"),
-];
-
-/// Core's default textarea bindings (`defaultTextareaKeyBindings`), in binding syntax.
-pub const TEXTAREA_BINDINGS: &[(&str, EditorAction)] = &[
-    ("left", EditorAction::MoveLeft),
-    ("right", EditorAction::MoveRight),
-    ("up", EditorAction::MoveUp),
-    ("down", EditorAction::MoveDown),
-    ("shift+left", EditorAction::SelectLeft),
-    ("shift+right", EditorAction::SelectRight),
-    ("shift+up", EditorAction::SelectUp),
-    ("shift+down", EditorAction::SelectDown),
-    ("home", EditorAction::BufferHome),
-    ("end", EditorAction::BufferEnd),
-    ("shift+home", EditorAction::SelectBufferHome),
-    ("shift+end", EditorAction::SelectBufferEnd),
-    ("ctrl+a", EditorAction::LineHome),
-    ("ctrl+e", EditorAction::LineEnd),
-    ("ctrl+shift+a", EditorAction::SelectLineHome),
-    ("ctrl+shift+e", EditorAction::SelectLineEnd),
-    ("meta+a", EditorAction::VisualLineHome),
-    ("meta+e", EditorAction::VisualLineEnd),
-    ("shift+meta+a", EditorAction::SelectVisualLineHome),
-    ("shift+meta+e", EditorAction::SelectVisualLineEnd),
-    ("ctrl+f", EditorAction::MoveRight),
-    ("ctrl+b", EditorAction::MoveLeft),
-    ("ctrl+w", EditorAction::DeleteWordBackward),
-    ("ctrl+backspace", EditorAction::DeleteWordBackward),
-    ("meta+d", EditorAction::DeleteWordForward),
-    ("meta+delete", EditorAction::DeleteWordForward),
-    ("ctrl+delete", EditorAction::DeleteWordForward),
-    ("ctrl+shift+d", EditorAction::DeleteLine),
-    ("ctrl+k", EditorAction::DeleteToLineEnd),
-    ("ctrl+u", EditorAction::DeleteToLineStart),
-    ("backspace", EditorAction::Backspace),
-    ("shift+backspace", EditorAction::Backspace),
-    ("ctrl+d", EditorAction::Delete),
-    ("delete", EditorAction::Delete),
-    ("shift+delete", EditorAction::Delete),
-    ("return", EditorAction::Newline),
-    ("kpenter", EditorAction::Newline),
-    ("linefeed", EditorAction::Newline),
-    ("meta+return", EditorAction::Submit),
-    ("meta+kpenter", EditorAction::Submit),
-    ("ctrl+-", EditorAction::Undo),
-    ("ctrl+.", EditorAction::Redo),
-    ("super+z", EditorAction::Undo),
-    ("shift+super+z", EditorAction::Redo),
-    ("meta+f", EditorAction::WordForward),
-    ("meta+b", EditorAction::WordBackward),
-    ("meta+right", EditorAction::WordForward),
-    ("meta+left", EditorAction::WordBackward),
-    ("ctrl+right", EditorAction::WordForward),
-    ("ctrl+left", EditorAction::WordBackward),
-    ("shift+meta+f", EditorAction::SelectWordForward),
-    ("shift+meta+b", EditorAction::SelectWordBackward),
-    ("shift+meta+right", EditorAction::SelectWordForward),
-    ("shift+meta+left", EditorAction::SelectWordBackward),
-    ("meta+backspace", EditorAction::DeleteWordBackward),
-    ("super+left", EditorAction::VisualLineHome),
-    ("super+right", EditorAction::VisualLineEnd),
-    ("super+up", EditorAction::BufferHome),
-    ("super+down", EditorAction::BufferEnd),
-    ("shift+super+left", EditorAction::SelectVisualLineHome),
-    ("shift+super+right", EditorAction::SelectVisualLineEnd),
-    ("shift+super+up", EditorAction::SelectBufferHome),
-    ("shift+super+down", EditorAction::SelectBufferEnd),
-    ("super+a", EditorAction::SelectAll),
-];
+pub use crate::tables::{EDIT_COMMANDS, TEXTAREA_BINDINGS};
 
 const TEXT_EDITING: &str = "Text Editing";
 

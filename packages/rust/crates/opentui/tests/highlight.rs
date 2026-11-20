@@ -104,6 +104,15 @@ fn extmark_styles_draw_over_highlighting() {
     let area = rust_area(&app, "let a = 1;");
     area.add_extmark(0..3, ExtmarkOptions::default().style(Style::new().fg(Color::CYAN)));
     assert_eq!(fg(&app, 0, 0), Color::CYAN);
+    // A new style table keeps the mark's color, and so does the undo that brings back a deleted mark.
+    area.syntax_style(&opentui::native::SyntaxStyle::new(app.session().context()).unwrap());
+    assert_eq!(fg(&app, 0, 0), Color::CYAN);
+    area.focus();
+    area.set_cursor_offset(3);
+    (0..3).for_each(|_| app.press("backspace"));
+    assert_eq!((area.text().as_str(), area.extmarks().len()), (" a = 1;", 0));
+    (0..3).for_each(|_| app.press("ctrl+-"));
+    assert_eq!(fg(&app, 0, 0), Color::CYAN);
     area.clear_extmarks();
     assert_eq!(fg(&app, 0, 0), syntax_fg(&app, "keyword"));
 }
@@ -166,7 +175,10 @@ fn highlighting_registers_into_a_style_table_the_app_sets() {
     // Ids with the run flag name styled-text styles: a highlight with one fails and leaves the others.
     let flagged = opentui::native::Highlight { style_id: keyword | opentui::sys::OT_STYLE_RUN_FLAG, ..highlight };
     assert_eq!(area.buffer().highlight(flagged).unwrap_err().status(), Some(opentui::Status::InvalidArgument));
+    // At priority 0 it draws over text the syntax theme leaves plain, and under styled text.
+    area.buffer().highlight(opentui::native::Highlight { start: 0, end: 7, priority: 0, ..highlight }).unwrap();
     let capture = app.render();
     assert_eq!(capture.cell(8, 0).unwrap().fg, Color::RED);
+    assert_eq!(capture.cell(3, 0).unwrap().fg, Color::RED);
     assert_eq!(capture.cell(0, 0).unwrap().fg, syntax_fg(&app, "keyword"));
 }

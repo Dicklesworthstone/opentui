@@ -4,6 +4,7 @@ const api = @import("context_abi_c");
 const handles = @import("context-handles.zig");
 const grapheme = @import("grapheme.zig");
 const link = @import("link.zig");
+const highlight_layers = @import("highlight-layers.zig");
 const yoga = @import("yoga.zig");
 const renderer = @import("renderer.zig");
 const session = @import("session.zig");
@@ -28,6 +29,7 @@ const audio = @import("audio.zig");
 const video = @import("video.zig");
 const clipboard = @import("clipboard/host.zig");
 const encoded_unicode = @import("encoded-unicode.zig");
+const markdown = @import("markdown.zig");
 pub const embedded_terminal = if (@import("ghostty_vt_options").available)
     @import("embedded-terminal/main.zig")
 else
@@ -36,9 +38,25 @@ else
 pub const EncodedChar = encoded_unicode.EncodedChar;
 pub const EncodedUnicode = encoded_unicode.EncodedUnicode;
 
-pub const terminal_input_bytes_max: u32 = 1024 * 1024;
+pub const terminal_input_bytes_max: u32 = api.OT_EMBEDDED_TERMINAL_INPUT_BYTES_MAX;
+const terminal_mods: u32 = api.OT_EMBEDDED_TERMINAL_MOD_SHIFT | api.OT_EMBEDDED_TERMINAL_MOD_CTRL | api.OT_EMBEDDED_TERMINAL_MOD_ALT |
+    api.OT_EMBEDDED_TERMINAL_MOD_SUPER | api.OT_EMBEDDED_TERMINAL_MOD_CAPS_LOCK | api.OT_EMBEDDED_TERMINAL_MOD_NUM_LOCK;
+
+/// Encode calls bit-cast the header's modifier bits to Ghostty's KeyMods.
+fn assertTerminalMods(comptime Mods: type) void {
+    inline for (.{
+        .{ "shift", api.OT_EMBEDDED_TERMINAL_MOD_SHIFT },         .{ "ctrl", api.OT_EMBEDDED_TERMINAL_MOD_CTRL },
+        .{ "alt", api.OT_EMBEDDED_TERMINAL_MOD_ALT },             .{ "super", api.OT_EMBEDDED_TERMINAL_MOD_SUPER },
+        .{ "caps_lock", api.OT_EMBEDDED_TERMINAL_MOD_CAPS_LOCK }, .{ "num_lock", api.OT_EMBEDDED_TERMINAL_MOD_NUM_LOCK },
+    }) |pair| {
+        var mods: Mods = .{};
+        @field(mods, pair[0]) = true;
+        if (@as(u16, @bitCast(mods)) != pair[1]) @compileError("Embedded terminal modifier differs from Ghostty: " ++ pair[0]);
+    }
+}
+
 pub const EmbeddedTerminalKey = struct {
-    action: u32 = 1,
+    action: u32 = api.OT_EMBEDDED_TERMINAL_KEY_PRESS,
     composing: bool = false,
     mods: u32 = 0,
     consumed_mods: u32 = 0,
@@ -48,7 +66,7 @@ pub const EmbeddedTerminalKey = struct {
 };
 pub const EmbeddedTerminalMouse = struct {
     action: u32,
-    button: i32 = -1,
+    button: i32 = api.OT_EMBEDDED_TERMINAL_BUTTON_NONE,
     mods: u32 = 0,
     any_button_pressed: bool = false,
     x: f32,
@@ -196,6 +214,8 @@ pub const Edit = struct {
     views: ?*Editor = null,
     content_epoch: u64 = 0,
     input_mem_id: ?u8 = null,
+    /// Measures with the width method of the session whose scene shows it.
+    follow_width: bool = false,
 
     fn receive(data: *anyopaque, notification: edit_buffer.NativeEvent) void {
         const self: *Edit = @ptrCast(@alignCast(data));
@@ -227,6 +247,12 @@ pub const Edit = struct {
     pub fn invalidate(self: *Edit) void {
         var next = self.views;
         while (next) |view| : (next = view.next) view.invalidate();
+    }
+
+    /// For changes that cannot change a size, such as highlights: views repaint, Yoga keeps the measure.
+    pub fn invalidatePreparation(self: *Edit) void {
+        var next = self.views;
+        while (next) |view| : (next = view.next) view.invalidatePreparation();
     }
 };
 
@@ -278,6 +304,8 @@ pub const SharedText = struct {
     input_mem_id: u8,
     views: ?*TextView = null,
     pool_next: ?*SharedText = null,
+    /// Measures with the width method of the session whose scene shows it.
+    follow_width: bool = false,
 
     pub fn checkMutable(self: *SharedText) yoga.Error!void {
         var next = self.views;
@@ -288,6 +316,17 @@ pub const SharedText = struct {
     pub fn invalidate(self: *SharedText, measure: bool) void {
         var next = self.views;
         while (next) |view| : (next = view.next) if (measure) view.invalidate() else view.invalidatePreparation();
+    }
+
+    /// Measures with `method` from now on; each view keeps its selection on its text.
+    pub fn setWidthMethod(self: *SharedText, method: utf8.WidthMethod) yoga.Error!void {
+        const old = self.buffer.widthMethod();
+        if (old == method) return;
+        try self.checkMutable();
+        self.buffer.setWidthMethod(method);
+        var next = self.views;
+        while (next) |view| : (next = view.next) view.view.followWidthMethod(self.buffer, old);
+        self.invalidate(true);
     }
 
     fn reclaimAppendBuffers(self: *SharedText) void {
@@ -335,13 +374,326 @@ pub const TextView = struct {
     }
 };
 
+pub const MarkdownOptions = struct {
+    flags: u32 = api.OT_MD_CONCEAL | api.OT_MD_HYPERLINKS,
+    /// 0: the 64 MiB ceiling.
+    source_byte_limit: u32 = 0,
+    syntax_style: ?Handle = null,
+    hook_filter: []const u8 = "",
+
+    const flags_all = api.OT_MD_CONCEAL | api.OT_MD_HYPERLINKS | api.OT_MD_MATH | api.OT_MD_HOOK;
+
+    /// The engine's options; a flag outside OT_MD_* or a limit above the ceiling is rejected.
+    pub fn engine(self: MarkdownOptions) !markdown.Options {
+        if (self.flags & ~flags_all != 0 or self.source_byte_limit > markdown.source_byte_count_max) return error.InvalidOptions;
+        return .{
+            .math = self.flags & api.OT_MD_MATH != 0,
+            .hook = self.flags & api.OT_MD_HOOK != 0,
+            .conceal = self.flags & api.OT_MD_CONCEAL != 0,
+            .hyperlinks = self.flags & api.OT_MD_HYPERLINKS != 0,
+            .hook_filter = self.hook_filter,
+            .limits = .{ .source_byte_count = if (self.source_byte_limit == 0) markdown.source_byte_count_max else self.source_byte_limit },
+        };
+    }
+};
+
+pub const MarkdownResult = struct { changed_block_count: u32, committed_top_level_count: u32, removed_from_index: u32 };
+
+fn markdownError(err: markdown.Error) error{ OutOfMemory, TextLimit, ObjectLimit, InvalidOptions } {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SourceLimit => error.TextLimit,
+        error.BlockLimit => error.ObjectLimit,
+        error.InvalidOptions => error.InvalidOptions,
+    };
+}
+
+/// A Markdown document (`ot_markdown_*`): the engine, its options, and the scene text nodes of
+/// its bound leaves, which it writes while the live display is what read_leaf shows (conceal and
+/// hyperlinks on) and the leaf is not hooked; the host writes the others.
+pub const MarkdownDoc = struct {
+    owner: *Context,
+    doc: markdown.Doc,
+    writer: markdown.Writer,
+    syntax_style: ?Handle,
+    /// Bound leaves and their nodes, sorted by block index.
+    bindings: std.ArrayListUnmanaged(Binding) = .empty,
+    /// The group set of each scope combination written so far (Context ids, never freed).
+    scope_sets: std.AutoHashMapUnmanaged(u16, u32) = .empty,
+
+    /// Bindings whose node a failed write left behind.
+    stale_count: u32 = 0,
+    /// The writes of the call in progress (`writeNode`), in the Markdown scratch.
+    staged: std.ArrayListUnmanaged(markdown.NodeWrite) = .empty,
+
+    /// `skipped`: a write to the node was skipped (hooked, or not live), or its text changed
+    /// since the doc's last write (`epoch`, the buffer's content epoch then: the host wrote
+    /// it), so it does not hold the live display's earlier bytes and takes only resync writes.
+    /// `stale`: the node does not show the doc (a write failed); the next call writes it whole.
+    /// `handoff`: the host wrote the node and the call would make the doc write it: the node is
+    /// unbound and its leaf listed, so the host binds it again to hand it over (a doc never
+    /// writes over a host's text, which it could not rebuild).
+    pub const Binding = struct { block: u32, node: Handle, skipped: bool = false, epoch: u64 = 0, stale: bool = false, handoff: bool = false };
+    /// The Markdown layer of a bound node's buffer (its only layer).
+    pub const layer_id: u32 = 2;
+
+    fn deinit(self: *MarkdownDoc) void {
+        const allocator = self.owner.allocator;
+        self.doc.deinit();
+        self.bindings.deinit(allocator);
+        self.scope_sets.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// Where block `block`'s binding is or goes.
+    fn bindingIndex(self: *const MarkdownDoc, block: u32) usize {
+        var low: usize = 0;
+        var high: usize = self.bindings.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.bindings.items[middle].block < block) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+
+    /// After a call: the nodes of removed blocks are unbound (they keep their text).
+    fn unbindRemoved(self: *MarkdownDoc) void {
+        const from = self.writer.unbound_from;
+        self.writer.unbound_from = markdown.none;
+        if (from == markdown.none) return;
+        self.bindings.items.len = self.bindingIndex(from);
+    }
+
+    fn result(self: *const MarkdownDoc) MarkdownResult {
+        return .{
+            .changed_block_count = self.doc.changeCount(),
+            .committed_top_level_count = self.doc.committed_top_level_count,
+            .removed_from_index = self.doc.removed_from_index,
+        };
+    }
+
+    fn setOptions(self: *MarkdownDoc, options: MarkdownOptions) !void {
+        const engine = try options.engine();
+        const style = if (options.syntax_style) |handle| try self.owner.getSyntaxStyle(handle) else null;
+        const old = self.doc.options;
+        const same = engine.math == old.math and engine.hook == old.hook and engine.conceal == old.conceal and
+            engine.hyperlinks == old.hyperlinks and engine.limits.source_byte_count == old.limits.source_byte_count and
+            std.mem.eql(u8, engine.hook_filter, self.doc.filter());
+        if (!same) self.doc.setOptions(engine) catch |err| return markdownError(err);
+        if (!std.meta.eql(options.syntax_style, self.syntax_style)) {
+            // A style swap: the bound nodes draw with the new style, nothing is written again;
+            // the leaves a host writes from read_leaf are listed.
+            self.syntax_style = options.syntax_style;
+            self.doc.relistHostWritten();
+            for (self.bindings.items) |binding| {
+                const node = self.owner.sceneNode(binding.node) catch continue;
+                const text = node.scene_node.?.text orelse continue;
+                text.buffer.setSyntaxStyle(style);
+                node.scene_node.?.paint_epoch = nextPaintEpoch();
+            }
+        }
+    }
+
+    /// The group set of a scope combination: the names Core styles Markdown with, later names
+    /// winning (null: no style, or the Context's group sets are full and it draws plain).
+    fn scopeSet(self: *MarkdownDoc, scope: markdown.Scope) !?u32 {
+        const key: u16 = @bitCast(scope);
+        if (key == 0) return null;
+        if (self.scope_sets.get(key)) |id| return id;
+        var names: [highlight_layers.group_set_name_count_max][]const u8 = undefined;
+        var count: usize = 0;
+        const headings = [_][]const u8{ "markup.heading.1", "markup.heading.2", "markup.heading.3", "markup.heading.4", "markup.heading.5", "markup.heading.6" };
+        if (scope.heading_level != 0) {
+            names[count] = headings[@min(scope.heading_level, 6) - 1];
+            count += 1;
+        }
+        const label = scope.link and !scope.link_gap and !scope.link_url;
+        inline for (.{
+            .{ scope.strong, "markup.strong" },               .{ scope.italic, "markup.italic" },
+            .{ scope.strikethrough, "markup.strikethrough" }, .{ (scope.link or scope.link_gap) and !scope.link_url, "markup.link" },
+            .{ label, "markup.link.label" },                  .{ scope.link_url, "markup.link.url" },
+            .{ scope.raw, "markup.raw" },                     .{ scope.math, "markup.math" },
+            .{ scope.escape, "string.escape" },
+        }) |entry| {
+            if (entry[0]) {
+                names[count] = entry[1];
+                count += 1;
+            }
+        }
+        if (count == 0) return null;
+        const id = self.owner.group_sets.intern(names[0..count]) catch |err| switch (err) {
+            error.GroupSetLimit => return null,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+        try self.scope_sets.put(self.owner.allocator, key, id);
+        return id;
+    }
+
+    /// A chunk's style resolved through the doc's style (read_leaf).
+    pub fn resolve(self: *MarkdownDoc, scope: markdown.Scope) !syntax_style.StyleDefinition {
+        const none_style: syntax_style.StyleDefinition = .{ .fg = null, .bg = null, .attributes = 0, .supplied_attributes = 0 };
+        const handle = self.syntax_style orelse return none_style;
+        const style = self.owner.getSyntaxStyle(handle) catch return none_style;
+        const id = (try self.scopeSet(scope)) orelse return none_style;
+        return style.resolveGroupSet(&self.owner.group_sets, id);
+    }
+    /// The engine's write to a bound leaf, inside a call: kept (its slices are in the Markdown
+    /// scratch, which the call resets after) until the call is accepted (`applyStaged`), so a
+    /// rejected call writes no node.
+    fn writeNode(context: *anyopaque, _: *const markdown.Doc, w: markdown.NodeWrite) markdown.Error!void {
+        const self: *MarkdownDoc = @ptrCast(@alignCast(context));
+        try self.staged.append(self.owner.markdown_scratch.allocator(), w);
+    }
+
+    /// After an accepted call: its writes, in order. A write that fails leaves its node stale
+    /// (the next accepted call writes it whole).
+    fn applyStaged(self: *MarkdownDoc) void {
+        for (self.staged.items) |w| {
+            if (w.block < self.writer.unbound_from) self.write(w) catch {};
+        }
+        self.staged = .empty;
+    }
+
+    /// Writes a bound leaf's node: its text tail and its Markdown runs. Leaves the host writes
+    /// (hooked, or a doc whose read_leaf differs from the live display), unbound blocks and
+    /// destroyed nodes are skipped. A node the host wrote is never written: a whole write the
+    /// doc would make to it marks it `handoff` instead.
+    fn write(self: *MarkdownDoc, w: markdown.NodeWrite) markdown.Error!void {
+        const doc = &self.doc;
+        if (w.block >= doc.blocks.items.len) return;
+        const b = doc.blocks.items[w.block];
+        if (!markdown.Doc.isBound(b)) return;
+        const at = self.bindingIndex(w.block);
+        if (at == self.bindings.items.len or self.bindings.items[at].block != w.block) return;
+        const binding = &self.bindings.items[at];
+        const node = self.owner.sceneMutableNode(binding.node) catch return;
+        const text = node.scene_node.?.text orelse return;
+        // A text change since the doc's last write is the host's (a hooked leaf's flag is off
+        // while its pending line is parsed again, so a write may come for it).
+        if (text.buffer.getContentEpoch() != binding.epoch) binding.skipped = true;
+        const live = doc.options.liveShown() and !b.flags.hooked;
+        if (!live or binding.skipped) {
+            if (live and w.resync) binding.handoff = true;
+            binding.skipped = true;
+            self.clearStale(binding);
+            return;
+        }
+        // A node a failed write left behind takes only a whole write.
+        if (binding.stale and !w.resync) return;
+        self.writeText(node, text, w) catch |err| {
+            if (!binding.stale) self.stale_count += 1;
+            binding.stale = true;
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.TextLimit => error.SourceLimit,
+                error.LayerLimit => error.BlockLimit,
+                else => error.InvalidOptions,
+            };
+        };
+        binding.epoch = text.buffer.getContentEpoch();
+        self.clearStale(binding);
+    }
+
+    fn clearStale(self: *MarkdownDoc, binding: *Binding) void {
+        if (!binding.stale) return;
+        binding.stale = false;
+        self.stale_count -= 1;
+    }
+
+    /// After an accepted call: the nodes the doc would take over from the host are unbound and
+    /// their leaves listed, so the host binds them again to hand them over.
+    fn finishHandoff(self: *MarkdownDoc) void {
+        var kept: usize = 0;
+        for (self.bindings.items) |binding| {
+            if (binding.handoff) {
+                if (binding.block < self.doc.blocks.items.len) self.doc.blocks.items[binding.block].flags.unreported = true;
+                continue;
+            }
+            self.bindings.items[kept] = binding;
+            kept += 1;
+        }
+        self.bindings.items.len = kept;
+    }
+
+    /// After an accepted call: the nodes a failed write left behind, written whole from the doc;
+    /// one that fails again stays stale.
+    fn resyncNodes(self: *MarkdownDoc) void {
+        if (self.stale_count == 0) return;
+        for (self.bindings.items) |binding| {
+            if (!binding.stale or binding.block >= self.doc.blocks.items.len) continue;
+            var whole = self.doc.wholeWrite(binding.block) catch continue;
+            whole.resync = true;
+            self.write(whole) catch {};
+        }
+    }
+
+    fn writeText(self: *MarkdownDoc, node: *native_renderable.NativeRenderable, text: *Text, w: markdown.NodeWrite) !void {
+        const owner = self.owner;
+        const buffer = text.buffer;
+        try Context.validateTextBytes(buffer.tabWidth(), w.bytes, w.from);
+        const arena = owner.markdown_scratch.allocator();
+        // The ranges' runs, one after another (`ends`), then storage for the layer sets: once the
+        // text changes, nothing here may fail.
+        var chunk_total: usize = 0;
+        for (w.ranges) |range| chunk_total += range.chunks.len;
+        const runs = try arena.alloc(highlight_layers.LayerRun, chunk_total);
+        const ends = try arena.alloc(usize, w.ranges.len);
+        var count: usize = 0;
+        // Each run holds a link reference while it is set; the layer takes its own.
+        defer for (runs[0..count]) |run| if (run.link_id != 0) owner.links.decref(run.link_id) catch unreachable;
+        for (w.ranges, ends) |range, *range_end| {
+            var at = range.from;
+            for (range.chunks) |chunk| {
+                defer at += chunk.byte_count;
+                const url = range.urls[chunk.link_offset..][0..chunk.link_byte_count];
+                const link_id: u32 = if (url.len == 0 or !link.isWritableUrl(url)) 0 else owner.links.acquire(url) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => 0,
+                };
+                // A linked chunk has the link scope, so only a full group-set table drops its run.
+                const group_set = (try self.scopeSet(chunk.scope)) orelse {
+                    if (link_id != 0) owner.links.decref(link_id) catch unreachable;
+                    continue;
+                };
+                runs[count] = .{ .start_byte = at, .end_byte = at + chunk.byte_count, .group_set = group_set, .link_id = link_id };
+                count += 1;
+            }
+            range_end.* = count;
+        }
+        // Two spares in turn: a set takes one and gives the layer's old storage back in it, so
+        // after the first set the old storage is as large (each set may split one run).
+        var spares: [2]std.ArrayListUnmanaged(highlight_layers.LayerRun) = .{ .empty, .empty };
+        defer for (&spares) |*spare| buffer.freeLayerSpare(spare);
+        for (&spares) |*spare| spare.* = try buffer.reserveLayer(layer_id, count + 2 * w.ranges.len);
+        const room = @min(spares[0].capacity, spares[1].capacity);
+        const changed = w.bytes.len > 0 or w.from != buffer.getByteSize();
+        if (changed) try buffer.replaceTail(w.from, w.bytes);
+        node.scene_node.?.paint_epoch = nextPaintEpoch();
+        const end = buffer.getByteSize();
+        var start: usize = 0;
+        for (w.ranges, ends) |range, range_end| {
+            defer start = range_end;
+            const to = if (range.end == markdown.none) end else @min(range.end, end);
+            const spare = if (spares[0].capacity >= room) &spares[0] else &spares[1];
+            buffer.setLayerWithSpare(layer_id, @min(range.from, to), to, runs[start..range_end], spare) catch |err| switch (err) {
+                error.OutOfMemory => unreachable,
+                else => return err,
+            };
+        }
+        if (changed) Context.textResourceChanged(text) else Context.textResent(node);
+        node.scene_node.?.owner.clearPreparation();
+    }
+};
+
+/// A `bool` payload applies the cursor rules around atomic marks.
 pub const EditCommand = union(enum) {
-    delete_forward,
-    backspace,
+    delete_forward: bool,
+    backspace: bool,
     new_line,
     delete_line,
-    move_left,
-    move_right,
+    move_left: bool,
+    move_right: bool,
     move_up,
     move_down,
     goto_line: u32,
@@ -349,11 +701,13 @@ pub const EditCommand = union(enum) {
     clear,
     clear_history,
     debug_rope,
+    cursor_offset_atomic: u32,
+    keep_outside: edit_buffer.EditBuffer.Toward,
 };
 
 pub const EditorCommand = union(enum) {
-    move_up,
-    move_down,
+    move_up: bool,
+    move_down: bool,
     goto_line_end,
     delete_selection,
     cursor_offset: u32,
@@ -395,6 +749,19 @@ pub const TextHighlight = union(enum) {
     remove_ref: u16,
     clear_line: u32,
     clear_all,
+};
+
+pub const EditMark = union(enum) {
+    add: edit_buffer.EditBuffer.MarkOptions,
+    remove: u32,
+    clear,
+};
+
+pub const LayerReplacement = struct {
+    layer_id: u32,
+    start_byte: u32,
+    end_byte: u32,
+    runs: []const highlight_layers.LayerRun,
 };
 
 pub const TextSelection = struct {
@@ -443,7 +810,7 @@ pub const Options = struct {
     lease_bytes_max: u64 = buf.BufferLease.bytes_max_default,
     /// Each entry holds at most Diagnostic.message_bytes_max bytes. Zero keeps
     /// only the cumulative drop count. Diagnostics are drained by the idle owner.
-    diagnostic_capacity: u32 = 64,
+    diagnostic_capacity: u32 = api.OT_DIAGNOSTIC_QUEUE_MAX,
     yoga_callbacks: yoga.Callbacks = .{},
 };
 
@@ -458,6 +825,33 @@ pub const Text = struct {
     scroll_x: f64 = 0,
     scroll_y: f64 = 0,
     pool_next: ?*Text = null,
+    /// How the view mapped cells to text when paint last drew it, and the frame that drew it.
+    painted: ?Mapping = null,
+    painted_frame: u64 = 0,
+
+    /// What decides which grapheme a cell of the view shows, besides the node's place on screen.
+    pub const Mapping = struct {
+        content_epoch: u64,
+        viewport: ?text_buffer_view.Viewport,
+        wrap_width: ?u32,
+        wrap_mode: text_buffer_view.WrapMode,
+        text_align: text_buffer_view.TextAlign,
+        truncate: bool,
+        first_line_offset: u32,
+    };
+
+    pub fn mapping(self: *const Text) Mapping {
+        const view = self.view;
+        return .{
+            .content_epoch = self.buffer.getContentEpoch(),
+            .viewport = view.viewport,
+            .wrap_width = view.wrap_width,
+            .wrap_mode = view.wrap_mode,
+            .text_align = view.text_align,
+            .truncate = view.truncate,
+            .first_line_offset = view.first_line_offset,
+        };
+    }
 
     pub fn prepareView(self: *Text) !void {
         try self.view.prepare();
@@ -519,6 +913,10 @@ pub const Context = struct {
     last_image_id: u32 = 0,
     graphemes: grapheme.GraphemePool,
     links: link.LinkPool,
+    /// Group sets that highlight layer runs name; every buffer of this Context borrows it.
+    group_sets: highlight_layers.GroupSets,
+    /// Per-call temporary memory of Markdown calls (one per Context; reset after each call).
+    markdown_scratch: std.heap.ArenaAllocator,
     diagnostics: logger.Diagnostics,
     logger: logger.Logger,
     yoga_config: yoga.Config,
@@ -632,6 +1030,8 @@ pub const Context = struct {
             .objects = objects,
             .graphemes = grapheme.GraphemePool.init(allocator),
             .links = link.LinkPool.init(allocator),
+            .group_sets = highlight_layers.GroupSets.init(allocator),
+            .markdown_scratch = std.heap.ArenaAllocator.init(allocator),
             .diagnostics = diagnostics,
             .logger = .{ .diagnostics = &self.diagnostics },
             .yoga_config = undefined,
@@ -643,7 +1043,7 @@ pub const Context = struct {
         return self;
     }
 
-    const teardown_order = [_]handles.Kind{ .native_renderable, .text_buffer_view, .text_buffer, .editor_view, .edit_buffer, .syntax_style, .buffer, .session, .image, .encoded_unicode, .embedded_terminal, .audio_engine, .clipboard_service };
+    const teardown_order = [_]handles.Kind{ .markdown_doc, .native_renderable, .text_buffer_view, .text_buffer, .editor_view, .edit_buffer, .syntax_style, .buffer, .session, .image, .encoded_unicode, .embedded_terminal, .audio_engine, .clipboard_service };
 
     // A kind missing from teardown_order would trip Table.deinit's live_count assertion.
     // Leases cannot be live (deinit requires lease_count == 0), and services own their operations.
@@ -706,6 +1106,8 @@ pub const Context = struct {
         self.yoga_config.deinit();
         self.graphemes.deinit();
         self.links.deinit();
+        self.group_sets.deinit();
+        self.markdown_scratch.deinit();
         self.diagnostics.deinit();
         self.allocator.destroy(self);
     }
@@ -977,7 +1379,7 @@ pub const Context = struct {
         const writer = &file_writer.interface;
         for (0..attached.height) |y| {
             for (0..attached.width) |x| {
-                const token = if (value.scene) |owned| owned.hitToken(attached, @intCast(x), @intCast(y)) else 0;
+                const token = if (value.scene) |owned| owned.hitToken(attached, @intCast(x), @intCast(y), 0) else 0;
                 writer.writeByte(if (token == 0) '.' else '0' + @as(u8, @intCast(token % 10))) catch return;
             }
             writer.writeByte('\n') catch return;
@@ -1478,16 +1880,17 @@ pub const Context = struct {
         defer self.mutating = false;
         const value = try self.getEmbeddedTerminal(handle);
         if (comptime !@import("ghostty_vt_options").available) return error.Unsupported;
-        if (options.action > 2 or options.mods & ~@as(u32, 0x3f) != 0 or options.consumed_mods & ~@as(u32, 0x3f) != 0 or
-            options.unshifted_codepoint > 0x10ffff or (options.unshifted_codepoint >= 0xd800 and options.unshifted_codepoint <= 0xdfff)) return error.InvalidOptions;
+        if (options.action > api.OT_EMBEDDED_TERMINAL_KEY_REPEAT or options.mods & ~terminal_mods != 0 or options.consumed_mods & ~terminal_mods != 0 or
+            !utf8.isScalar(options.unshifted_codepoint)) return error.InvalidOptions;
         if (options.key.len > terminal_input_bytes_max or options.text.len > terminal_input_bytes_max) return error.TextLimit;
         if (!std.unicode.utf8ValidateSlice(options.text)) return error.InvalidUnicode;
         const vt = @import("ghostty-vt.zig").vt;
+        comptime assertTerminalMods(vt.input.KeyMods);
         const encoded = try value.encodeKey(.{
             .action = switch (options.action) {
-                0 => .release,
-                1 => .press,
-                2 => .repeat,
+                api.OT_EMBEDDED_TERMINAL_KEY_RELEASE => .release,
+                api.OT_EMBEDDED_TERMINAL_KEY_PRESS => .press,
+                api.OT_EMBEDDED_TERMINAL_KEY_REPEAT => .repeat,
                 else => unreachable,
             },
             .key = vt.input.Key.fromW3C(options.key) orelse .unidentified,
@@ -1506,26 +1909,27 @@ pub const Context = struct {
         defer self.mutating = false;
         const value = try self.getEmbeddedTerminal(handle);
         if (comptime !@import("ghostty_vt_options").available) return error.Unsupported;
-        if (options.action > 2 or options.button < -1 or options.button > 7 or options.mods & ~@as(u32, 0x3f) != 0) return error.InvalidOptions;
+        if (options.action > api.OT_EMBEDDED_TERMINAL_MOUSE_MOTION or options.button < api.OT_EMBEDDED_TERMINAL_BUTTON_NONE or
+            options.button > api.OT_EMBEDDED_TERMINAL_BUTTON_SEVEN or options.mods & ~terminal_mods != 0) return error.InvalidOptions;
         const previous = value.mouse_last_cell;
         errdefer value.mouse_last_cell = previous;
         const encoded = try value.encodeMouse(.{
             .action = switch (options.action) {
-                0 => .press,
-                1 => .release,
-                2 => .motion,
+                api.OT_EMBEDDED_TERMINAL_MOUSE_PRESS => .press,
+                api.OT_EMBEDDED_TERMINAL_MOUSE_RELEASE => .release,
+                api.OT_EMBEDDED_TERMINAL_MOUSE_MOTION => .motion,
                 else => unreachable,
             },
             .button = switch (options.button) {
-                -1 => null,
-                0 => .unknown,
-                1 => .left,
-                2 => .right,
-                3 => .middle,
-                4 => .four,
-                5 => .five,
-                6 => .six,
-                7 => .seven,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_NONE => null,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_UNKNOWN => .unknown,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_LEFT => .left,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_RIGHT => .right,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_MIDDLE => .middle,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_FOUR => .four,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_FIVE => .five,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_SIX => .six,
+                api.OT_EMBEDDED_TERMINAL_BUTTON_SEVEN => .seven,
                 else => unreachable,
             },
             .mods = @bitCast(@as(u16, @intCast(options.mods))),
@@ -1718,9 +2122,9 @@ pub const Context = struct {
                 if (options.packed_options & ~@as(u32, 0x1ff) != 0 or
                     (options.packed_options >> 5) & 3 > 2 or (options.packed_options >> 7) & 3 > 2) return error.InvalidOptions;
                 if (options.width == 0 or options.height == 0) return;
+                // Zero keeps the default border character.
                 for (options.border_chars) |char| {
-                    if (char > 0x10ffff or (char >= 0xd800 and char <= 0xdfff) or
-                        (char != 0 and (char < 32 or (char >= 127 and char <= 159)))) return error.InvalidOptions;
+                    if (!utf8.isScalar(char) or (char != 0 and utf8.isControl(char))) return error.InvalidOptions;
                 }
                 try buf.validateTextInput(text);
                 try buf.validateTextInput(bottom_title);
@@ -1735,8 +2139,8 @@ pub const Context = struct {
             .text => try target.drawTextFitted(text, options.x, options.y, options.foreground, options.background, options.attributes, options.fit),
             .fill => target.fillRectClipped(options.x, options.y, options.width, options.height, background),
             .cell, .cell_blend, .char => {
-                if (options.char > 0x10ffff or (options.char >= 0xd800 and options.char <= 0xdfff)) return error.InvalidOptions;
-                const char = if (buf.isControlCodepoint(options.char)) buf.DEFAULT_SPACE_CHAR else options.char;
+                if (!utf8.isScalar(options.char)) return error.InvalidOptions;
+                const char = if (utf8.isControl(options.char)) buf.DEFAULT_SPACE_CHAR else options.char;
                 if (options.x < 0 or options.y < 0) return;
                 const x: u32 = @intCast(options.x);
                 const y: u32 = @intCast(options.y);
@@ -1798,8 +2202,7 @@ pub const Context = struct {
         try buf.validateColor(options.foreground);
         try buf.validateColor(options.background);
         for (options.border_chars) |char| {
-            if (char > 0x10ffff or (char >= 0xd800 and char <= 0xdfff) or
-                (char != 0 and utf8.eastAsianWidth(@intCast(char)) != 1)) return error.InvalidOptions;
+            if (!utf8.isScalar(char) or (char != 0 and utf8.eastAsianWidth(@intCast(char)) != 1)) return error.InvalidOptions;
         }
         for ([_][]const i32{ columns, rows }) |offsets| {
             if (offsets.len > @as(u64, self.render_cells_max) + 1) return error.InvalidOptions;
@@ -1905,9 +2308,11 @@ pub const Context = struct {
         if (x >= target.width or y >= target.height) return;
         const text = owned.text orelse return owned.owner.paintBody(&self.objects, target, node, x, y);
         // A prepared text that Yoga sizes to zero paints nothing; an unprepared one draws its text.
-        if (owned.geometry_epoch != std.math.maxInt(u64) and (owned.layout.width == 0 or owned.layout.height == 0)) return;
+        const content = scene.contentLayout(owned.layout);
+        if (owned.geometry_epoch != std.math.maxInt(u64) and (content.width == 0 or content.height == 0)) return;
         try text.prepareView();
-        try target.drawTextBufferChecked(text.view, x, y);
+        const offset = scene.contentOffset(owned.layout);
+        try target.drawTextBufferChecked(text.view, x +| offset[0], y +| offset[1]);
     }
 
     pub fn acquireOwnedBufferLease(self: *Context, handle: Handle) Error!Handle {
@@ -2243,6 +2648,7 @@ pub const Context = struct {
         if (node.kind != api.OT_SCENE_EDITOR) return error.WrongKind;
         const editor = if (view_handle) |id| try self.getEditorView(id) else null;
         if (editor) |view| {
+            if (view.edit.follow_width) try checkFollowOwner(Editor, view.edit.views, node.owner);
             if (view.node != null and view.node != value) return error.ContextBusy;
         }
         try value.setMeasureTargetPreservingProvider(if (editor) |view| .{ .editor_view = view.view } else .none, node.measure_overridden);
@@ -2250,6 +2656,7 @@ pub const Context = struct {
         node.editor = editor;
         if (editor) |view| view.node = value;
         node.owner.invalidateObservation(value);
+        self.followSessionWidth(value);
     }
 
     pub fn sceneSetEditorOptions(self: *Context, handle: Handle, options: scene.EditorOptions) !void {
@@ -2258,7 +2665,7 @@ pub const Context = struct {
         const value = try self.scenePaintNode(handle);
         const node = value.scene_node.?;
         if (node.kind != api.OT_SCENE_EDITOR) return error.WrongKind;
-        if (options.style > 3 or (options.mouse_pointer > api.OT_MOUSE_POINTER_MAX and
+        if (options.style > api.OT_CURSOR_STYLE_DEFAULT or (options.mouse_pointer > api.OT_MOUSE_POINTER_MAX and
             options.mouse_pointer != api.OT_MOUSE_POINTER_UNCHANGED)) return error.InvalidOptions;
         try buf.validateColor(options.color);
         node.control = .{ .editor = options };
@@ -2272,6 +2679,7 @@ pub const Context = struct {
         if (node.kind != api.OT_SCENE_TEXT_VIEW) return error.WrongKind;
         const text_view = if (view_handle) |id| try self.getTextBufferView(id) else null;
         if (text_view) |view| {
+            if (view.text.follow_width) try checkFollowOwner(TextView, view.text.views, node.owner);
             if (view.node != null and view.node != value) return error.ContextBusy;
         }
         try value.setMeasureTargetPreservingProvider(if (text_view) |view| .{ .text_buffer_view = view.view } else .none, node.measure_overridden);
@@ -2279,6 +2687,7 @@ pub const Context = struct {
         node.control.text_view.view = text_view;
         if (text_view) |view| view.node = value;
         node.owner.invalidateObservation(value);
+        self.followSessionWidth(value);
     }
 
     pub fn sceneSetTextViewPaint(self: *Context, handle: Handle, enabled: bool) !void {
@@ -2293,6 +2702,18 @@ pub const Context = struct {
     pub fn sceneHasMeasure(self: *Context, handle: Handle) !bool {
         try self.checkSceneRead();
         return yoga.yogaNodeHasMeasureFunc((try self.sceneNode(handle)).yoga_node);
+    }
+
+    pub fn sceneReachesHooks(self: *Context, handle: Handle) !bool {
+        try self.checkSceneRead();
+        const node = try self.sceneNode(handle);
+        return node.scene_node.?.owner.reaches(&self.objects, node);
+    }
+
+    pub fn scenePainted(self: *Context, handle: Handle) !bool {
+        try self.checkSceneRead();
+        const node = try self.sceneNode(handle);
+        return node.scene_node.?.owner.paintedLatest(node);
     }
 
     pub fn sceneMarkDirty(self: *Context, handle: Handle) !void {
@@ -2702,10 +3123,7 @@ pub const Context = struct {
         try buf.validateColor(options.foreground);
         try buf.validateColor(options.background);
         if (options.tab_color) |rgba| try buf.validateColor(rgba);
-        if (options.tab_indicator) |indicator| {
-            if (indicator < 0x20 or (indicator >= 0x7f and indicator <= 0x9f) or
-                indicator > 0x10ffff or (indicator >= 0xd800 and indicator <= 0xdfff)) return error.InvalidOptions;
-        }
+        try validateTabIndicator(options.tab_indicator);
         var dirty: u32 = 0;
         try yoga.check(yoga.yogaNodeIsDirtyChecked(node.yoga_node, &dirty));
         const previous_viewport = text.view.getViewport();
@@ -2768,7 +3186,7 @@ pub const Context = struct {
     pub fn sceneSetTextSelection(self: *Context, handle: Handle, options: SceneTextSelectionOptions) !bool {
         try self.beginMutation();
         defer self.mutating = false;
-        if (options.operation > api.OT_SCENE_TEXT_SELECTION_UPDATE or options.behavior > api.OT_SCENE_TEXT_SELECTION_LINE) return error.InvalidOptions;
+        if (options.operation > api.OT_SCENE_TEXT_SELECTION_COLORS or options.behavior > api.OT_SCENE_TEXT_SELECTION_LINE) return error.InvalidOptions;
         for ([_]?buf.RGBA{ options.background, options.foreground }) |color| {
             if (color) |rgba| try buf.validateColor(rgba);
         }
@@ -2777,6 +3195,10 @@ pub const Context = struct {
         const node = if (options.operation == api.OT_SCENE_TEXT_SELECTION_RESET) try self.sceneNode(handle) else try self.sceneMutableNode(handle);
         node.scene_node.?.paint_epoch = nextPaintEpoch();
         const text = node.scene_node.?.text orelse return error.WrongKind;
+        if (options.operation == api.OT_SCENE_TEXT_SELECTION_COLORS) {
+            text.view.setSelectionColors(options.background, options.foreground);
+            return false;
+        }
         const changed = if (options.operation == api.OT_SCENE_TEXT_SELECTION_RESET) reset: {
             const had_selection = text.view.getSelection() != null;
             text.view.resetLocalSelection();
@@ -2784,13 +3206,17 @@ pub const Context = struct {
         } else selection: {
             var dirty: u32 = 0;
             try yoga.check(yoga.yogaNodeIsDirtyChecked(node.yoga_node, &dirty));
+            // Hosts pass cells local to the node; the view starts at its content and clamps cells off its edges.
+            const offset = scene.contentOffset(node.scene_node.?.layout);
+            var local = options;
+            for ([_]*i32{ &local.anchor_x, &local.anchor_y, &local.focus_x, &local.focus_y }, [_]i32{ offset[0], offset[1], offset[0], offset[1] }) |point, by| point.* -|= by;
             if (text.view.getViewport()) |viewport| {
                 const x_offset: i32 = if (text.view.wrap_mode == .none) @intCast(viewport.x) else 0;
                 const y_offset: i32 = @intCast(viewport.y);
-                _ = std.math.add(i32, options.anchor_x, x_offset) catch return error.InvalidOptions;
-                _ = std.math.add(i32, options.focus_x, x_offset) catch return error.InvalidOptions;
-                _ = std.math.add(i32, options.anchor_y, y_offset) catch return error.InvalidOptions;
-                _ = std.math.add(i32, options.focus_y, y_offset) catch return error.InvalidOptions;
+                _ = std.math.add(i32, local.anchor_x, x_offset) catch return error.InvalidOptions;
+                _ = std.math.add(i32, local.focus_x, x_offset) catch return error.InvalidOptions;
+                _ = std.math.add(i32, local.anchor_y, y_offset) catch return error.InvalidOptions;
+                _ = std.math.add(i32, local.focus_y, y_offset) catch return error.InvalidOptions;
             }
             if (text.buffer.lineWidthColsMax() > std.math.maxInt(i32)) return error.InvalidOptions;
             // The legacy view methods cannot report allocation failures. Prepare
@@ -2799,9 +3225,9 @@ pub const Context = struct {
             if (text.view.virtual_lines.items.len > std.math.maxInt(i32)) return error.InvalidOptions;
             const behavior: text_buffer_view.SelectionBehavior = @fromBackingInt(@intCast(options.behavior));
             break :selection if (options.operation == api.OT_SCENE_TEXT_SELECTION_SET)
-                text.view.setLocalSelectionBehavior(options.anchor_x, options.anchor_y, options.focus_x, options.focus_y, options.background, options.foreground, behavior)
+                text.view.setLocalSelectionBehavior(local.anchor_x, local.anchor_y, local.focus_x, local.focus_y, options.background, options.foreground, behavior)
             else
-                text.view.updateLocalSelectionBehavior(options.anchor_x, options.anchor_y, options.focus_x, options.focus_y, options.background, options.foreground, behavior);
+                text.view.updateLocalSelectionBehavior(local.anchor_x, local.anchor_y, local.focus_x, local.focus_y, options.background, options.foreground, behavior);
         };
         node.scene_node.?.owner.clearPreparation();
         return changed;
@@ -2949,6 +3375,23 @@ pub const Context = struct {
         return count;
     }
 
+    pub fn sceneGetTextByteAt(self: *Context, handle: Handle, x: i32, y: i32) !?u32 {
+        try self.checkSceneRead();
+        const node = (try self.sceneNode(handle)).scene_node.?;
+        const text = node.text orelse return error.WrongKind;
+        // Only what the latest frame painted: the node's cells in that frame, and its view as drawn then.
+        const area = node.owner.paintedArea(node) orelse return null;
+        // A stamp from an attempt that did not finish describes cells that frame never showed.
+        if (text.painted_frame > area.frame or !std.meta.eql(text.painted, text.mapping())) return null;
+        const clip = area.clip;
+        if (x < clip.x or y < clip.y or x - @as(i64, clip.x) >= clip.width or y - @as(i64, clip.y) >= clip.height) return null;
+        const hit = text.view.graphemeAtCell(@intCast(@as(i64, x) - area.x), @intCast(@as(i64, y) - area.y)) orelse return null;
+        // An edge that cuts a wide grapheme leaves its cells blank.
+        const left = area.x + hit.x;
+        if (left < clip.x or left + hit.width > @as(i64, clip.x) + clip.width) return null;
+        return hit.byte;
+    }
+
     pub fn sceneGetLayout(self: *Context, handle: Handle, raw_yoga: bool) !scene.Layout {
         try self.checkSceneRead();
         const node = try self.sceneNode(handle);
@@ -2965,11 +3408,11 @@ pub const Context = struct {
         };
     }
 
-    pub fn sceneGetPaintLayout(self: *Context, handle: Handle) !scene.Layout {
+    pub fn sceneGetPaintLayout(self: *Context, handle: Handle, content: bool) !scene.Layout {
         try self.checkSceneRead();
         const node = try self.sceneNode(handle);
         try node.scene_node.?.owner.prepareOmitted(&self.objects, node);
-        return scene.getPaintLayout(node);
+        return scene.getPaintLayout(node, content);
     }
 
     /// Solve the Session root without painting or publishing output. Measurement
@@ -3107,13 +3550,17 @@ pub const Context = struct {
     }
 
     pub fn sceneHitTest(self: *Context, session_handle: Handle, x: i32, y: i32) !u32 {
+        return self.sceneHitTestExcluding(session_handle, x, y, 0);
+    }
+
+    pub fn sceneHitTestExcluding(self: *Context, session_handle: Handle, x: i32, y: i32, excluded: u32) !u32 {
         try self.beginMutation();
         defer self.mutating = false;
         const value = try self.getSession(session_handle);
         const attached = value.renderer orelse return error.RendererNotAttached;
         const owned = value.scene orelse return error.SceneNotAttached;
         if (x < 0 or y < 0) return 0;
-        const token = owned.hitToken(attached, @intCast(x), @intCast(y));
+        const token = owned.hitToken(attached, @intCast(x), @intCast(y), excluded);
         const handle = owned.tokens.get(token) orelse return 0;
         const node = self.objects.get(handle, .native_renderable, native_renderable.NativeRenderable) catch return 0;
         const state = node.scene_node orelse return 0;
@@ -3182,6 +3629,7 @@ pub const Context = struct {
         const buffer = try text_buffer.UnifiedTextBuffer.initWithOptions(self.allocator, &self.graphemes, &self.links, width_method, .{
             .io = self.io,
             .logger = &self.logger,
+            .group_sets = &self.group_sets,
         });
         errdefer buffer.deinit();
         const view = try text_buffer_view.UnifiedTextBufferView.init(self.allocator, buffer);
@@ -3216,6 +3664,7 @@ pub const Context = struct {
         const buffer = try text_buffer.UnifiedTextBuffer.initWithOptions(self.allocator, &self.graphemes, &self.links, width_method, .{
             .io = self.io,
             .logger = &self.logger,
+            .group_sets = &self.group_sets,
         });
         value.* = .{ .handle = undefined, .buffer = buffer, .input_mem_id = 0 };
         return value;
@@ -3416,6 +3865,15 @@ pub const Context = struct {
         text.invalidate(true);
     }
 
+    pub fn textBufferSetWidthMethod(self: *Context, handle: Handle, method: utf8.WidthMethod) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const text = try self.getTextBuffer(handle);
+        // NO_ZWJ breaks graphemes at joiners: chunks made under it or for it can't be re-measured in place.
+        if (text.follow_width or method == .no_zwj or text.buffer.widthMethod() == .no_zwj) return error.InvalidOptions;
+        try text.setWidthMethod(method);
+    }
+
     pub fn textBufferHighlight(self: *Context, handle: Handle, operation: TextHighlight) !void {
         try self.beginMutation();
         defer self.mutating = false;
@@ -3423,6 +3881,22 @@ pub const Context = struct {
         try text.checkMutable();
         try highlightBuffer(text.buffer, operation);
         text.invalidate(false);
+    }
+
+    pub fn textBufferSetLayer(self: *Context, handle: Handle, layer: LayerReplacement) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const text = try self.getTextBuffer(handle);
+        try text.checkMutable();
+        try text.buffer.setLayer(layer.layer_id, layer.start_byte, layer.end_byte, layer.runs);
+        text.invalidate(false);
+    }
+
+    /// Group set ids are Context-wide: a buffer composes them against whatever style it binds.
+    pub fn groupSet(self: *Context, names: []const []const u8) !u32 {
+        try self.beginMutation();
+        defer self.mutating = false;
+        return self.group_sets.intern(names);
     }
 
     pub fn textViewSetViewport(self: *Context, handle: Handle, viewport: text_buffer_view.Viewport, size_only: bool) !void {
@@ -3507,6 +3981,7 @@ pub const Context = struct {
         }, .{
             .io = self.io,
             .logger = &self.logger,
+            .group_sets = &self.group_sets,
         });
         errdefer value.buffer.deinit();
         value.handle = try self.objects.insert(.edit_buffer, value);
@@ -3558,11 +4033,12 @@ pub const Context = struct {
         try self.beginMutation();
         defer self.mutating = false;
         if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUnicode;
-        if (definition.attributes & ~ansi.TextAttributes.ATTRIBUTE_BASE_MASK != 0) return error.InvalidOptions;
+        if (definition.attributes & ~@as(u32, definition.supplied_attributes) != 0) return error.InvalidOptions;
         if (definition.fg) |color| try buf.validateColor(color);
         if (definition.bg) |color| try buf.validateColor(color);
         const style = try self.getSyntaxStyle(handle);
-        // Paint resolves styles from the table every frame, so borrowers need no invalidation.
+        // Paint resolves styles from the table every frame, so borrowers need no invalidation;
+        // retained paint repaints them by their paint epochs.
         try checkStyleDependents(style);
         return style.registerStyleDefinition(name, definition);
     }
@@ -3575,8 +4051,154 @@ pub const Context = struct {
                 .none => {},
                 .text => |text| try @as(*SharedText, @ptrCast(@alignCast(text))).checkMutable(),
                 .edit => |edit| try @as(*Edit, @ptrCast(@alignCast(edit))).checkMutable(),
+                .scene_text => |node| {
+                    const value: *native_renderable.NativeRenderable = @ptrCast(@alignCast(node));
+                    try yoga.check(yoga.nodeTeardownStatus(value.yoga_node));
+                    value.scene_node.?.paint_epoch = nextPaintEpoch();
+                },
             }
         }
+    }
+
+    // ---- Markdown documents (ot_markdown_*) ----
+
+    pub fn createMarkdown(self: *Context, options: MarkdownOptions) !Handle {
+        try self.beginMutation();
+        defer self.mutating = false;
+        defer self.resetMarkdownScratch();
+        try self.objects.checkCapacity();
+        if (options.syntax_style) |handle| _ = try self.getSyntaxStyle(handle);
+        const value = try self.allocator.create(MarkdownDoc);
+        errdefer self.allocator.destroy(value);
+        value.* = .{
+            .owner = self,
+            .doc = markdown.Doc.init(self.allocator, &self.markdown_scratch, try options.engine()) catch |err| return markdownError(err),
+            .writer = .{ .context = value, .write_fn = MarkdownDoc.writeNode },
+            .syntax_style = options.syntax_style,
+        };
+        value.doc.writer = &value.writer;
+        errdefer value.doc.deinit();
+        return self.objects.insert(.markdown_doc, value);
+    }
+
+    fn getMarkdown(self: *Context, handle: Handle) Error!*MarkdownDoc {
+        if (self.closing) return error.ContextClosed;
+        return self.objects.get(handle, .markdown_doc, MarkdownDoc);
+    }
+
+    fn resetMarkdownScratch(self: *Context) void {
+        _ = self.markdown_scratch.reset(.{ .retain_with_limit = markdown.scratch_retained_byte_count_max });
+    }
+
+    pub const MarkdownCall = union(enum) { append: []const u8, set: []const u8, finish, options: MarkdownOptions };
+
+    /// One mutating call on a doc. A rejected call publishes nothing; a removal unbinds the
+    /// nodes of the removed blocks.
+    pub fn markdownCall(self: *Context, handle: Handle, call: MarkdownCall) !MarkdownResult {
+        try self.beginMutation();
+        defer self.mutating = false;
+        defer self.resetMarkdownScratch();
+        const value = try self.getMarkdown(handle);
+        switch (call) {
+            .append, .set => |bytes| if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUnicode,
+            else => {},
+        }
+        // The doc's writes wait for the call to be accepted: a rejected one writes no node.
+        errdefer value.writer.unbound_from = markdown.none;
+        errdefer value.staged = .empty;
+        switch (call) {
+            .append => |bytes| value.doc.append(bytes) catch |err| return markdownError(err),
+            .set => |bytes| value.doc.set(bytes) catch |err| return markdownError(err),
+            .finish => value.doc.finish() catch |err| return markdownError(err),
+            .options => |options| try value.setOptions(options),
+        }
+        value.applyStaged();
+        value.unbindRemoved();
+        value.resyncNodes();
+        value.finishHandoff();
+        return value.result();
+    }
+
+    pub fn markdownSource(self: *Context, handle: Handle) ![]const u8 {
+        if (self.mutating) return error.ContextBusy;
+        return (try self.getMarkdown(handle)).doc.source.items;
+    }
+
+    /// The changed blocks, in document order, when `capacity` holds them all (then
+    /// acknowledged); otherwise only their count.
+    pub fn markdownReadChanges(self: *Context, handle: Handle, capacity: u32) !struct { count: u32, changes: []const markdown.Doc.Change } {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const value = try self.getMarkdown(handle);
+        const count = value.doc.changeCount();
+        if (capacity == 0 or capacity < count) return .{ .count = count, .changes = &.{} };
+        _ = self.markdown_scratch.reset(.{ .retain_with_limit = markdown.scratch_retained_byte_count_max });
+        const changes = try self.markdown_scratch.allocator().alloc(markdown.Doc.Change, count);
+        _ = value.doc.readChanges(changes);
+        return .{ .count = count, .changes = changes };
+    }
+
+    /// Leaf `index`'s parser output (in the Markdown scratch, valid until the next Markdown
+    /// call), and the doc that resolves its styles.
+    pub fn markdownReadLeaf(self: *Context, handle: Handle, index: u32) !struct { leaf: markdown.Leaf, doc: *MarkdownDoc } {
+        if (self.mutating) return error.ContextBusy;
+        const value = try self.getMarkdown(handle);
+        if (index >= value.doc.blocks.items.len) return error.InvalidIndex;
+        switch (value.doc.blocks.items[index].kind) {
+            .paragraph, .heading, .code, .html, .table_cell => {},
+            else => return error.InvalidIndex,
+        }
+        self.resetMarkdownScratch();
+        const leaf = value.doc.readLeaf(self.markdown_scratch.allocator(), index) catch |err| return markdownError(err);
+        return .{ .leaf = leaf, .doc = value };
+    }
+
+    /// Inline leaf `index`'s source (in the Markdown scratch, valid until the next Markdown call).
+    pub fn markdownReadSource(self: *Context, handle: Handle, index: u32) ![]const u8 {
+        if (self.mutating) return error.ContextBusy;
+        const value = try self.getMarkdown(handle);
+        if (index >= value.doc.blocks.items.len or !markdown.Doc.isInlineLeaf(value.doc.blocks.items[index])) return error.InvalidIndex;
+        self.resetMarkdownScratch();
+        return value.doc.leafSubject(self.markdown_scratch.allocator(), index) catch |err| return markdownError(err);
+    }
+
+    pub fn markdownBind(self: *Context, handle: Handle, index: u32, node_handle: Handle) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        defer self.resetMarkdownScratch();
+        const value = try self.getMarkdown(handle);
+        if (index >= value.doc.blocks.items.len or !markdown.Doc.isBound(value.doc.blocks.items[index])) return error.InvalidIndex;
+        const node = try self.sceneMutableNode(node_handle);
+        const text = node.scene_node.?.text orelse return error.WrongKind;
+        const style = if (value.syntax_style) |id| try self.getSyntaxStyle(id) else null;
+        try value.bindings.ensureUnusedCapacity(self.allocator, 1);
+        const at = value.bindingIndex(index);
+        const rebind = at < value.bindings.items.len and value.bindings.items[at].block == index;
+        const previous = if (rebind) value.bindings.items[at] else undefined;
+        if (rebind and previous.stale) value.stale_count -= 1;
+        // The node's text as it is now is what the bind hands over.
+        const binding: MarkdownDoc.Binding = .{ .block = index, .node = node_handle, .epoch = text.buffer.getContentEpoch() };
+        if (rebind) {
+            value.bindings.items[at] = binding;
+        } else {
+            value.bindings.insertAssumeCapacity(at, binding);
+        }
+        // A rejected bind leaves the bindings as they were.
+        errdefer {
+            if (value.bindings.items[at].stale) value.stale_count -= 1;
+            if (rebind) {
+                value.bindings.items[at] = previous;
+                if (previous.stale) value.stale_count += 1;
+            } else _ = value.bindings.orderedRemove(at);
+        }
+        // The node shows the leaf now, if the doc writes it; then the doc's style (a rejected
+        // bind leaves both as they were).
+        var whole = value.doc.wholeWrite(index) catch |err| return markdownError(err);
+        whole.resync = true;
+        value.write(whole) catch |err| return markdownError(err);
+        text.buffer.style_binding.dependent = .{ .scene_text = node };
+        text.buffer.setSyntaxStyle(style);
+        node.scene_node.?.paint_epoch = nextPaintEpoch();
     }
 
     pub fn editSetSyntaxStyle(self: *Context, handle: Handle, style_handle: ?Handle) !void {
@@ -3643,15 +4265,15 @@ pub const Context = struct {
         const edit = try self.getEditBuffer(handle);
         try edit.checkMutable();
         switch (command) {
-            .delete_forward => try edit.buffer.deleteForward(),
-            .backspace => try edit.buffer.backspace(),
+            .delete_forward => |atomic| if (atomic) try edit.buffer.deleteAtomic(true) else try edit.buffer.deleteForward(),
+            .backspace => |atomic| if (atomic) try edit.buffer.deleteAtomic(false) else try edit.buffer.backspace(),
             .new_line => {
                 try validateTextBytes(edit.buffer.tb.tabWidth(), "\n", edit.buffer.tb.getByteSize());
                 try edit.buffer.insertText("\n");
             },
             .delete_line => try edit.buffer.deleteLine(),
-            .move_left => edit.buffer.moveLeft(),
-            .move_right => edit.buffer.moveRight(),
+            .move_left => |atomic| if (atomic) try edit.buffer.moveAtomic(false) else edit.buffer.moveLeft(),
+            .move_right => |atomic| if (atomic) try edit.buffer.moveAtomic(true) else edit.buffer.moveRight(),
             .move_up => edit.buffer.moveUp(),
             .move_down => edit.buffer.moveDown(),
             .goto_line => |line| try edit.buffer.gotoLine(line),
@@ -3659,6 +4281,8 @@ pub const Context = struct {
             .clear => try edit.buffer.clear(),
             .clear_history => edit.buffer.clearHistory(),
             .debug_rope => edit.buffer.debugLogRope(),
+            .cursor_offset_atomic => |offset| try edit.buffer.setCursorByOffsetAtomic(offset),
+            .keep_outside => |toward| try edit.buffer.keepOutside(toward),
         }
     }
 
@@ -3677,7 +4301,34 @@ pub const Context = struct {
         const edit = try self.getEditBuffer(handle);
         try edit.checkMutable();
         try highlightBuffer(edit.buffer.tb, operation);
-        edit.invalidate();
+        edit.invalidatePreparation();
+    }
+
+    pub fn editSetLayer(self: *Context, handle: Handle, layer: LayerReplacement) !void {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const edit = try self.getEditBuffer(handle);
+        try edit.checkMutable();
+        try edit.buffer.tb.setLayer(layer.layer_id, layer.start_byte, layer.end_byte, layer.runs);
+        edit.invalidatePreparation();
+    }
+
+    /// Returns the added id, the removed id or 0, or 0 for clear.
+    pub fn editMark(self: *Context, handle: Handle, operation: EditMark) !u32 {
+        try self.beginMutation();
+        defer self.mutating = false;
+        const edit = try self.getEditBuffer(handle);
+        try edit.checkMutable();
+        const result = switch (operation) {
+            .add => |options| try edit.buffer.addMark(options),
+            .remove => |id| if (try edit.buffer.removeMark(id)) id else 0,
+            .clear => clear: {
+                edit.buffer.clearMarks();
+                break :clear 0;
+            },
+        };
+        edit.invalidatePreparation();
+        return result;
     }
 
     pub fn editorSetViewport(self: *Context, handle: Handle, viewport: text_buffer_view.Viewport, size_only: bool, move_cursor: bool) !void {
@@ -3715,9 +4366,16 @@ pub const Context = struct {
             .wrap_mode => if (view.view.follow_pending) try view.prepareView(),
             .delete_selection, .cursor_offset, .tab_indicator => {},
         }
+        const from = view.edit.buffer.getPrimaryCursor().offset;
         switch (command) {
-            .move_up => view.view.moveUpVisual(),
-            .move_down => view.view.moveDownVisual(),
+            .move_up => |atomic| {
+                view.view.moveUpVisual();
+                if (atomic) try view.edit.buffer.leaveAtomic(from, false);
+            },
+            .move_down => |atomic| {
+                view.view.moveDownVisual();
+                if (atomic) try view.edit.buffer.leaveAtomic(from, true);
+            },
             .goto_line_end => view.view.gotoVisualLineEnd(),
             .delete_selection => try view.view.deleteSelectedText(),
             .cursor_offset => |offset| try view.view.setCursorByOffset(offset),
@@ -3829,8 +4487,7 @@ pub const Context = struct {
 
     fn validateTabIndicator(indicator: ?u32) !void {
         if (indicator) |value| {
-            if (value < 0x20 or (value >= 0x7f and value <= 0x9f) or
-                value > 0x10ffff or (value >= 0xd800 and value <= 0xdfff)) return error.InvalidOptions;
+            if (utf8.isControl(value) or !utf8.isScalar(value)) return error.InvalidOptions;
         }
     }
 
@@ -3919,6 +4576,55 @@ pub const Context = struct {
             scene.Scene.markObservationStale(dependent);
             next = dependent.measure_next;
         }
+    }
+
+    /// Brings what a session's scene shows to the session's new width method: its scene text and
+    /// the bound buffers created to follow their session. Other buffers keep their own method.
+    pub fn followWidthMethod(owned: *scene.Scene, method: utf8.WidthMethod) void {
+        var next = owned.head;
+        while (next) |node| : (next = node.scene_node.?.next) followNodeWidth(node, method);
+        owned.clearPreparation();
+    }
+
+    fn followNodeWidth(node: *native_renderable.NativeRenderable, method: utf8.WidthMethod) void {
+        const value = node.scene_node.?;
+        // Selections are cell offsets: each view moves its own back onto its text.
+        if (value.text) |text| {
+            const old = text.buffer.widthMethod();
+            if (old == method) return;
+            value.paint_epoch = nextPaintEpoch();
+            text.buffer.setWidthMethod(method);
+            text.view.followWidthMethod(text.buffer, old);
+            textResourceChanged(text);
+        } else if (value.kind == api.OT_SCENE_TEXT_VIEW) {
+            const text = (value.control.text_view.view orelse return).text;
+            if (text.follow_width) text.setWidthMethod(method) catch {};
+        } else if (value.kind == api.OT_SCENE_EDITOR) {
+            const edit = (value.editor orelse return).edit;
+            if (!edit.follow_width or edit.buffer.tb.widthMethod() == method) return;
+            edit.checkMutable() catch return;
+            // The cursor event invalidates the editors' measures (content epoch).
+            const old = edit.buffer.remeasure(method);
+            var next = edit.views;
+            while (next) |view| : (next = view.next) view.view.followWidthMethod(old.width_method);
+            edit.buffer.remapCursor(old);
+        }
+    }
+
+    /// A following buffer measures with one session's method, so only one session's scene may show its views,
+    /// the view being bound included.
+    fn checkFollowOwner(comptime View: type, first: ?*View, owner: *const scene.Scene) error{WrongSession}!void {
+        var next = first;
+        while (next) |view| : (next = view.next) {
+            const bound = view.node orelse continue;
+            if (bound.scene_node.?.owner != owner) return error.WrongSession;
+        }
+    }
+
+    /// A buffer made to follow its session takes the session's method when a scene node shows it.
+    fn followSessionWidth(self: *Context, node: *native_renderable.NativeRenderable) void {
+        const attached = (self.getSession(node.scene_node.?.owner.session) catch return).renderer orelse return;
+        followNodeWidth(node, attached.getNextBuffer().width_method);
     }
 
     /// Equal bytes still rebuild the rope, so the view prepares again; the size does not change.
@@ -4053,6 +4759,10 @@ pub const Context = struct {
             },
             .syntax_style => {
                 const value: *syntax_style.SyntaxStyle = @ptrCast(@alignCast(token.ptr));
+                value.deinit();
+            },
+            .markdown_doc => {
+                const value: *MarkdownDoc = @ptrCast(@alignCast(token.ptr));
                 value.deinit();
             },
             .session => {

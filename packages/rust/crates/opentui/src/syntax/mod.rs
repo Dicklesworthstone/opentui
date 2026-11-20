@@ -12,6 +12,8 @@
 //! register("python", Grammar::new(tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY))?;
 //! ```
 //!
+//! `prewarm` compiles a grammar before it is first shown, from any thread, so the frame that shows it does not compile it.
+//!
 //! Without the feature, widgets show plain text and the filetypes they are given have no effect.
 //!
 //! Capture names come from each grammar's own queries, so they follow tree-sitter's conventions. Core uses
@@ -26,15 +28,15 @@ mod highlight;
 pub use filetype::{filetype_for_extension, filetype_for_info_string, filetype_for_path};
 #[cfg(feature = "tree-sitter")]
 pub use highlight::{
-    Capture, CompiledGrammar, Grammar, GrammarError, filetypes, has_grammar, highlight, highlights, register,
+    Capture, CompiledGrammar, Grammar, GrammarError, filetypes, has_grammar, highlight, highlights, prewarm, register,
     register_alias, register_lazy, spans, tree_sitter,
 };
 
 use crate::error::Result;
-use crate::native::{Context, SyntaxStyle};
+use crate::native::{Context, LayerRun, SyntaxStyle};
 use crate::style::{Color, Style};
 use crate::theme::{Theme, ThemeMode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 /// Styles for capture names, kept in Rust. Core's TypeScript calls this a `SyntaxStyle`.
@@ -209,18 +211,97 @@ impl Palette {
     };
 }
 
-/// The styled byte ranges of `source` as `filetype` with `theme`, covering it in order as `highlight` styles it,
-/// or `None` without a grammar for it or without the `tree-sitter` feature.
-pub(crate) fn highlight_ranges(
-    source: &str,
-    filetype: &str,
-    theme: &SyntaxTheme,
-) -> Option<Vec<(Range<usize>, Style)>> {
-    #[cfg(feature = "tree-sitter")]
-    return Some(highlight::styled_ranges(source, &highlights(source, filetype)?, theme));
-    #[cfg(not(feature = "tree-sitter"))]
-    {
-        let _ = (source, filetype, theme);
+/// Group sets of capture-name lists, by list, as a widget's syntax layer names its pieces: each name is registered as
+/// `opentui.<name>` in the widget's style table, with the table's palette.
+#[derive(Default)]
+pub(crate) struct CaptureSets(HashMap<Vec<&'static str>, u32>);
+
+impl CaptureSets {
+    /// The lists seen.
+    pub(crate) fn lists(&self) -> Vec<Vec<&'static str>> {
+        self.0.keys().cloned().collect()
+    }
+
+    /// The layer runs of [`Incremental`]'s pieces, each edge mapped to the buffer's bytes by `edge`, and empty runs
+    /// left out. Past the Context's group-set bound a list has no set, and its pieces paint plain rather than ending
+    /// the app.
+    pub(crate) fn runs(
+        &mut self,
+        table: &SyntaxStyle,
+        context: &Context,
+        (lists, pieces): NamedRanges,
+        edge: impl Fn(usize) -> usize,
+    ) -> Result<Vec<LayerRun>> {
+        let mut sets = Vec::with_capacity(lists.len());
+        for names in lists {
+            if let Some(&id) = self.0.get(&names) {
+                sets.push(Some(id));
+                continue;
+            }
+            let group = table.capture_group(&names)?;
+            let id = context.group_set(&group.iter().map(String::as_str).collect::<Vec<_>>()).ok();
+            if let Some(id) = id {
+                self.0.insert(names, id);
+            }
+            sets.push(id);
+        }
+        Ok((pieces.into_iter())
+            .filter_map(|(range, list)| {
+                let (start_byte, end_byte) = (edge(range.start) as u32, edge(range.end) as u32);
+                (start_byte < end_byte).then_some(LayerRun { start_byte, end_byte, group_set: sets[list]? })
+            })
+            .collect())
+    }
+}
+
+#[cfg(feature = "tree-sitter")]
+type StyledRanges = Vec<(Range<usize>, Style)>;
+
+/// The pieces of named ranges with their lists' styles merged, neighbors of one style joined.
+#[cfg(feature = "tree-sitter")]
+fn styled_ranges((lists, named): NamedRanges, theme: &SyntaxTheme) -> StyledRanges {
+    let styles: Vec<Style> = lists.into_iter().map(|names| theme.merge(names)).collect();
+    let mut pieces: Vec<(Range<usize>, Style)> = Vec::new();
+    for (range, list) in named {
+        match pieces.last_mut() {
+            Some((last, style)) if *style == styles[list] => last.end = range.end,
+            _ => pieces.push((range, styles[list])),
+        }
+    }
+    pieces
+}
+
+/// The lists of capture names whose styles a theme merges, in order, and the byte ranges of the source with the index
+/// of their list.
+pub(crate) type NamedRanges = (Vec<Vec<&'static str>>, Vec<(Range<usize>, usize)>);
+
+#[cfg(feature = "tree-sitter")]
+pub(crate) use highlight::Incremental;
+#[cfg(all(test, feature = "tree-sitter"))]
+pub(crate) use highlight::{
+    FRESH_PARSES,
+    tests::{expected_ranges, injective_theme},
+};
+
+/// Without the `tree-sitter` feature nothing has a grammar.
+#[cfg(not(feature = "tree-sitter"))]
+pub(crate) struct Incremental;
+
+#[cfg(not(feature = "tree-sitter"))]
+impl Incremental {
+    pub(crate) fn new(_filetype: &str) -> Self {
+        Self
+    }
+
+    pub(crate) fn has_grammar(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        ""
+    }
+
+    pub(crate) fn update(&mut self, _text: String) -> Option<NamedRanges> {
         None
     }
 }

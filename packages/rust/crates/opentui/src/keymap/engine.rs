@@ -137,6 +137,8 @@ pub struct KeyContext<T> {
     pub stroke: Stroke,
     prevent_default: Cell<bool>,
     stop_propagation: Cell<bool>,
+    /// The active view built for this key, until a command or handler runs and may change what a new one shows.
+    view: Cell<Option<Rc<ActiveView<T>>>>,
 }
 
 impl<T> KeyContext<T> {
@@ -318,6 +320,8 @@ struct State<T> {
     data: HashMap<String, String>,
     focus: Vec<T>,
     pending: Option<Vec<Capture<T>>>,
+    /// How often `pending` has changed; it moves before any pending-sequence listener runs.
+    pending_changes: u64,
     expanders: Vec<(u64, Expander)>,
     resolvers: Vec<(u64, Resolver)>,
     intercepts: Vec<Intercept<T>>,
@@ -351,16 +355,20 @@ struct Capture<T> {
     layer: Rc<LayerState<T>>,
     binding: Rc<BindingState<T>>,
     index: usize,
-    parts: Vec<KeySequencePart>,
 }
 
 impl<T> Clone for Capture<T> {
     fn clone(&self) -> Self {
-        Self { layer: self.layer.clone(), binding: self.binding.clone(), index: self.index, parts: self.parts.clone() }
+        Self { layer: self.layer.clone(), binding: self.binding.clone(), index: self.index }
     }
 }
 
 impl<T> Capture<T> {
+    /// The parts matched so far.
+    fn parts(&self) -> &[KeySequencePart] {
+        &self.binding.sequence[..=self.index]
+    }
+
     fn continues(&self) -> bool {
         self.index + 1 < self.binding.sequence.len()
     }
@@ -370,13 +378,13 @@ impl<T> Capture<T> {
     }
 
     fn same_parts(&self, other: &Capture<T>) -> bool {
-        self.parts.len() == other.parts.len()
-            && self.parts.iter().zip(&other.parts).all(|(left, right)| left.stroke == right.stroke)
+        self.index == other.index
+            && self.parts().iter().zip(other.parts()).all(|(left, right)| left.stroke == right.stroke)
     }
 
     /// Where the capture's last stroke appears among the event's match keys; earlier is better.
     fn priority(&self, keys: &[Stroke]) -> usize {
-        let last = &self.parts.last().expect("captures have parts").stroke;
+        let last = &self.binding.sequence[self.index].stroke;
         keys.iter().position(|key| key == last).unwrap_or(keys.len())
     }
 }
@@ -396,22 +404,30 @@ impl<T> Clone for Entry<T> {
 struct ActiveView<T> {
     layers: Vec<Rc<LayerState<T>>>,
     entries: Vec<Entry<T>>,
-    reachable: Vec<Entry<T>>,
-    by_name: HashMap<String, usize>,
+    /// The index of the first entry of each name, sorted by name, so lookups borrow names instead of copying them.
+    by_name: Vec<usize>,
 }
 
 impl<T> ActiveView<T> {
     fn reachable(&self, name: &str) -> Option<&Entry<T>> {
-        self.by_name.get(name).map(|&index| &self.reachable[index])
+        let found = self.by_name.binary_search_by(|&index| self.entries[index].command.name.as_str().cmp(name));
+        found.ok().map(|found| &self.entries[self.by_name[found]])
     }
 
-    fn chain(&self, name: &str) -> Vec<Entry<T>> {
-        self.entries.iter().filter(|entry| entry.command.name == name).cloned().collect()
+    /// The first entry of each name, in layer order.
+    fn reachable_entries(&self) -> Vec<Entry<T>> {
+        let mut first = self.by_name.clone();
+        first.sort_unstable();
+        first.into_iter().map(|index| self.entries[index].clone()).collect()
+    }
+
+    fn chain<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Entry<T>> {
+        self.entries.iter().filter(move |entry| entry.command.name == name)
     }
 
     fn visible(&self, binding: &BindingState<T>) -> bool {
         match &binding.command {
-            Some(BindingCommand::Name(name)) => self.by_name.contains_key(name),
+            Some(BindingCommand::Name(name)) => self.reachable(name).is_some(),
             _ => true,
         }
     }
@@ -453,6 +469,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                 data: HashMap::new(),
                 focus: Vec::new(),
                 pending: None,
+                pending_changes: 0,
                 expanders: Vec::new(),
                 resolvers: Vec::new(),
                 intercepts: Vec::new(),
@@ -592,35 +609,19 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
     }
 
     fn compile_bindings(&self, bindings: &[Binding<T>]) -> (Vec<Rc<BindingState<T>>>, bool) {
-        let (tokens, expanders) = {
-            let state = self.state();
-            let tokens: HashMap<String, Stroke> =
-                state.tokens.iter().map(|(name, (_, stroke))| (name.clone(), stroke.clone())).collect();
-            (tokens, state.expanders.iter().map(|(_, expander)| expander.clone()).collect::<Vec<_>>())
-        };
+        let (tokens, expanders) = self.compile_inputs();
         let mut compiled: Vec<Rc<BindingState<T>>> = Vec::new();
         let mut has_token_bindings = false;
         for binding in bindings {
-            let expansions = match &binding.key {
-                Key::Stroke(stroke) => vec![(Key::Stroke(stroke.clone()), None)],
-                Key::Text(text) => match expand(text, &expanders) {
-                    Ok(expansions) => expansions,
-                    Err(message) => {
-                        self.error("binding-expand-error", message);
-                        continue;
-                    }
-                },
+            let keys = match expand_key(&binding.key, &tokens, &expanders) {
+                Ok(keys) => keys,
+                Err(message) => {
+                    self.error("binding-expand-error", message);
+                    continue;
+                }
             };
-            for (key, displays) in expansions {
-                let parsed = match &key {
-                    Key::Stroke(stroke) => stroke.normalized().map(|stroke| Parsed {
-                        parts: vec![KeySequencePart::from_stroke(stroke)],
-                        used_tokens: false,
-                        unknown_tokens: Vec::new(),
-                    }),
-                    Key::Text(text) => key::parse_sequence(text, &tokens),
-                };
-                let parsed = match parsed.and_then(|parsed| apply_displays(parsed, displays, &key)) {
+            for (key, parsed) in keys {
+                let parsed = match parsed {
                     Ok(parsed) => parsed,
                     Err(message) => {
                         self.error("binding-parse-error", message);
@@ -628,17 +629,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                     }
                 };
                 has_token_bindings |= parsed.used_tokens;
-                for token in &parsed.unknown_tokens {
-                    self.warn_once(
-                        format!("token:{token}"),
-                        "unknown-token",
-                        format!(
-                            "[Keymap] Unknown token \"{token}\" in key sequence \"{key}\"; binding was skipped until \
-                             the token is registered"
-                        ),
-                    );
-                }
-                if !parsed.unknown_tokens.is_empty() {
+                if !self.known_tokens(&parsed, &key) {
                     continue;
                 }
                 match compile_binding(binding, parsed.parts, &compiled) {
@@ -649,6 +640,26 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
             }
         }
         (compiled, has_token_bindings)
+    }
+
+    /// The tokens and binding expanders, copied so that an expander may use the keymap.
+    fn compile_inputs(&self) -> (HashMap<String, Stroke>, Vec<Expander>) {
+        (self.tokens(), self.state().expanders.iter().map(|(_, expander)| expander.clone()).collect())
+    }
+
+    /// Whether `parsed` names only registered tokens. Warns once per unknown token otherwise.
+    fn known_tokens(&self, parsed: &Parsed, key: &dyn fmt::Display) -> bool {
+        for token in &parsed.unknown_tokens {
+            self.warn_once(
+                format!("token:{token}"),
+                "unknown-token",
+                format!(
+                    "[Keymap] Unknown token \"{token}\" in key sequence \"{key}\"; binding was skipped until the \
+                     token is registered"
+                ),
+            );
+        }
+        parsed.unknown_tokens.is_empty()
     }
 
     /// Registers a token that bindings name as `<name>`, such as `leader`. Layers that used the name before it was
@@ -865,27 +876,28 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
         required && layer.source.enabled.check()
     }
 
-    fn active_view(&self) -> ActiveView<T> {
+    fn active_view(&self) -> Rc<ActiveView<T>> {
         let layers = self.active_layers();
-        let mut view =
-            ActiveView { layers: Vec::new(), entries: Vec::new(), reachable: Vec::new(), by_name: HashMap::new() };
+        let mut entries = Vec::with_capacity(layers.iter().map(|layer| layer.commands.len()).sum());
         for layer in &layers {
             if layer.commands.is_empty() || !self.layer_enabled(layer) {
                 continue;
             }
-            for command in &layer.commands {
-                if !command.enabled.check() {
-                    continue;
-                }
-                let entry = Entry { layer: layer.clone(), command: command.clone() };
-                if !view.by_name.contains_key(&command.name) {
-                    view.by_name.insert(command.name.clone(), view.reachable.len());
-                    view.reachable.push(entry.clone());
-                }
-                view.entries.push(entry);
+            for command in layer.commands.iter().filter(|command| command.enabled.check()) {
+                entries.push(Entry { layer: layer.clone(), command: command.clone() });
             }
         }
-        view.layers = layers;
+        // Ties sort by index, so the first entry of each name leads its run and survives `dedup_by`.
+        let mut by_name: Vec<usize> = (0..entries.len()).collect();
+        by_name.sort_unstable_by_key(|&index| (&entries[index].command.name, index));
+        by_name.dedup_by(|later, first| entries[*later].command.name == entries[*first].command.name);
+        Rc::new(ActiveView { layers, entries, by_name })
+    }
+
+    /// The view `context` holds for its key, or a new one that it then holds.
+    fn key_view(&self, context: &KeyContext<T>) -> Rc<ActiveView<T>> {
+        let view = context.view.take().unwrap_or_else(|| self.active_view());
+        context.view.set(Some(view.clone()));
         view
     }
 
@@ -901,6 +913,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                 stroke: Stroke::from_event(event),
                 prevent_default: Cell::new(false),
                 stop_propagation: Cell::new(false),
+                view: Cell::new(None),
             };
             let intercepts: Vec<_> = self
                 .state()
@@ -972,19 +985,14 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                 captures.clear();
             }
             if priority == best {
-                captures.push(Capture {
-                    layer: layer.clone(),
-                    binding: binding.clone(),
-                    index: 0,
-                    parts: vec![first.clone()],
-                });
+                captures.push(Capture { layer: layer.clone(), binding: binding.clone(), index: 0 });
             }
         }
         if captures.iter().any(|capture| view.visible(&capture.binding)) { captures } else { Vec::new() }
     }
 
     fn dispatch_from_root(&self, layers: &[Rc<LayerState<T>>], keys: &[Stroke], context: &KeyContext<T>) -> Dispatched {
-        let view = self.active_view();
+        let view = self.key_view(context);
         let mut outcome = NO_MATCH;
         for (index, layer) in layers.iter().enumerate() {
             if !self.layer_enabled(layer) {
@@ -1021,21 +1029,12 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
     }
 
     fn dispatch_pending(&self, pending: &[Capture<T>], keys: &[Stroke], context: &KeyContext<T>) -> Dispatched {
-        let view = self.active_view();
+        let view = self.key_view(context);
         let advanced: Vec<Capture<T>> = pending
             .iter()
             .filter_map(|capture| {
                 let next = capture.binding.sequence.get(capture.index + 1)?;
-                keys.contains(&next.stroke).then(|| {
-                    let mut parts = capture.parts.clone();
-                    parts.push(next.clone());
-                    Capture {
-                        layer: capture.layer.clone(),
-                        binding: capture.binding.clone(),
-                        index: capture.index + 1,
-                        parts,
-                    }
-                })
+                keys.contains(&next.stroke).then(|| Capture { index: capture.index + 1, ..capture.clone() })
             })
             .collect();
         let best = advanced.iter().map(|capture| capture.priority(keys)).min();
@@ -1139,7 +1138,9 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
         ran
     }
 
+    /// Takes the key's view: the binding may run code that changes what a new view shows.
     fn run_binding(&self, layer: &LayerState<T>, binding: &BindingState<T>, context: Option<&KeyContext<T>>) -> bool {
+        let view = context.and_then(|context| context.view.take());
         let focused = self.focused();
         let event = context.map(|context| context.event);
         let handled = match &binding.command {
@@ -1155,7 +1156,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                 };
                 run(&invocation) == Outcome::Handled
             }
-            Some(BindingCommand::Name(name)) => self.active_view().chain(name).into_iter().any(|entry| {
+            Some(BindingCommand::Name(name)) => view.unwrap_or_else(|| self.active_view()).chain(name).any(|entry| {
                 let invocation = CommandContext {
                     keymap: self.clone(),
                     event,
@@ -1210,6 +1211,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                 return;
             }
             state.pending = next;
+            state.pending_changes += 1;
             state.pending.as_deref().map(sequence_parts).unwrap_or_default()
         };
         let listeners: Vec<_> = self.state().pending_listeners.iter().map(|(_, listener)| listener.clone()).collect();
@@ -1220,6 +1222,13 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
     /// The strokes of the sequence in progress, empty when none is.
     pub fn pending_sequence(&self) -> Vec<KeySequencePart> {
         self.batch(|| self.ensure_valid_pending().as_deref().map(sequence_parts).unwrap_or_default())
+    }
+
+    /// How often the pending sequence has changed, and its first stroke, as stored: no pruning, so no change either.
+    pub(crate) fn pending_change(&self) -> (u64, Option<Stroke>) {
+        let state = self.state();
+        let first = state.pending.as_deref().and_then(<[_]>::first).map(|capture| capture.parts()[0].stroke.clone());
+        (state.pending_changes, first)
     }
 
     pub fn has_pending_sequence(&self) -> bool {
@@ -1234,19 +1243,14 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
     pub fn pop_pending_sequence(&self) -> bool {
         self.batch(|| {
             let Some(pending) = self.ensure_valid_pending() else { return false };
-            if pending[0].parts.len() <= 1 {
+            if pending[0].index == 0 {
                 self.set_pending(None);
                 return true;
             }
             let popped: Vec<_> = pending
                 .iter()
-                .filter(|capture| capture.parts.len() > 1)
-                .map(|capture| Capture {
-                    layer: capture.layer.clone(),
-                    binding: capture.binding.clone(),
-                    index: capture.index - 1,
-                    parts: capture.parts[..capture.parts.len() - 1].to_vec(),
-                })
+                .filter(|capture| capture.index > 0)
+                .map(|capture| Capture { index: capture.index - 1, ..capture.clone() })
                 .collect();
             self.set_pending(if popped.is_empty() { None } else { Some(popped) });
             true
@@ -1285,7 +1289,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
                     })
                     .collect()
             } else {
-                self.active_view().chain(name)
+                self.active_view().chain(name).cloned().collect()
             };
             let focused = self.focused();
             let mut rejected = false;
@@ -1345,7 +1349,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
     }
 
     /// The active view, which `Registered` queries do not read.
-    fn query_view(&self, visibility: Visibility) -> Option<ActiveView<T>> {
+    fn query_view(&self, visibility: Visibility) -> Option<Rc<ActiveView<T>>> {
         (visibility != Visibility::Registered).then(|| self.active_view())
     }
 
@@ -1353,7 +1357,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
         let entries = match view {
             None => self.registered_entries(),
             Some(view) if query.visibility == Visibility::Active => view.entries.clone(),
-            Some(view) => view.reachable.clone(),
+            Some(view) => view.reachable_entries(),
         };
         if query.limit == Some(0) {
             return Vec::new();
@@ -1399,14 +1403,14 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
 
     pub fn commands(&self, query: &CommandQuery<T>) -> Vec<Rc<Command<T>>> {
         let view = self.query_view(query.visibility);
-        self.query_entries(query, view.as_ref()).into_iter().map(|entry| entry.command).collect()
+        self.query_entries(query, view.as_deref()).into_iter().map(|entry| entry.command).collect()
     }
 
     /// Commands with the bindings that run them, as the query sees them.
     pub fn command_entries(&self, query: &CommandQuery<T>) -> Vec<CommandEntry<T>> {
         let view = self.query_view(query.visibility);
-        let entries = self.query_entries(query, view.as_ref());
-        let bindings = self.query_bindings(view.as_ref());
+        let entries = self.query_entries(query, view.as_deref());
+        let bindings = self.query_bindings(view.as_deref());
         entries
             .into_iter()
             .map(|entry| CommandEntry {
@@ -1423,7 +1427,7 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
     /// The bindings that run each of `names`.
     pub fn command_bindings(&self, visibility: Visibility, names: &[&str]) -> HashMap<String, Vec<ActiveBinding<T>>> {
         let view = self.query_view(visibility);
-        let bindings = self.query_bindings(view.as_ref());
+        let bindings = self.query_bindings(view.as_deref());
         names
             .iter()
             .map(|&name| {
@@ -1565,25 +1569,32 @@ impl<T: Clone + PartialEq + 'static> Keymap<T> {
         key::parse_single(&key.into(), &self.tokens())
     }
 
-    /// Parses a key sequence. A sequence with an unknown token is empty, with a warning.
+    /// Parses a key sequence. A sequence with an unknown token is empty, with a warning. Binding expanders do not
+    /// run; [`Self::parse_binding`] runs them.
     pub fn parse_key_sequence(&self, key: impl Into<Key>) -> Result<Vec<KeySequencePart>, String> {
         match key.into() {
             Key::Stroke(stroke) => Ok(vec![KeySequencePart::from_stroke(stroke.normalized()?)]),
             Key::Text(text) => {
                 let parsed = key::parse_sequence(&text, &self.tokens())?;
-                for token in &parsed.unknown_tokens {
-                    self.warn_once(
-                        format!("token:{token}"),
-                        "unknown-token",
-                        format!(
-                            "[Keymap] Unknown token \"{token}\" in key sequence \"{text}\"; binding was skipped until \
-                             the token is registered"
-                        ),
-                    );
-                }
-                Ok(if parsed.unknown_tokens.is_empty() { parsed.parts } else { Vec::new() })
+                Ok(if self.known_tokens(&parsed, &text) { parsed.parts } else { Vec::new() })
             }
         }
+    }
+
+    /// Parses a binding's key as layer registration does: the binding expanders run first, so with
+    /// [`comma_bindings`](super::addons::comma_bindings) and [`key_aliases`](super::addons::key_aliases) `"enter,esc"`
+    /// gives the sequences of `return` and `escape`. One sequence per expanded key, in order; a key with an unknown
+    /// token is left out, with a warning. Fails if any expanded key fails to parse, where a layer binds the others.
+    pub fn parse_binding(&self, key: impl Into<Key>) -> Result<Vec<Vec<KeySequencePart>>, String> {
+        let (tokens, expanders) = self.compile_inputs();
+        let mut sequences = Vec::new();
+        for (key, parsed) in expand_key(&key.into(), &tokens, &expanders)? {
+            let parsed = parsed?;
+            if self.known_tokens(&parsed, &key) {
+                sequences.push(parsed.parts);
+            }
+        }
+        Ok(sequences)
     }
 
     /// The canonical form of a key sequence, such as `ctrl+xn`.
@@ -1646,7 +1657,6 @@ fn same_pending<T>(current: Option<&[Capture<T>]>, next: Option<&[Capture<T>]>) 
                     Rc::ptr_eq(&left.layer, &right.layer)
                         && Rc::ptr_eq(&left.binding, &right.binding)
                         && left.index == right.index
-                        && left.same_parts(right)
                 })
         }
         _ => false,
@@ -1656,10 +1666,10 @@ fn same_pending<T>(current: Option<&[Capture<T>]>, next: Option<&[Capture<T>]>) 
 /// The pending sequence's strokes, with a display and token only where every capture agrees.
 fn sequence_parts<T>(captures: &[Capture<T>]) -> Vec<KeySequencePart> {
     let Some(first) = captures.first() else { return Vec::new() };
-    (0..first.parts.len())
+    (0..=first.index)
         .map(|index| {
-            let (display, token) = presentation(captures.iter().filter_map(|capture| capture.parts.get(index)));
-            KeySequencePart { stroke: first.parts[index].stroke.clone(), display, token }
+            let (display, token) = presentation(captures.iter().filter_map(|capture| capture.parts().get(index)));
+            KeySequencePart { stroke: first.parts()[index].stroke.clone(), display, token }
         })
         .collect()
 }
@@ -1851,6 +1861,33 @@ fn compile_binding<T>(
 /// Whether `prefix` is a strict prefix of `sequence`.
 fn is_prefix(prefix: &[KeySequencePart], sequence: &[KeySequencePart]) -> bool {
     prefix.len() < sequence.len() && prefix.iter().zip(sequence).all(|(left, right)| left.stroke == right.stroke)
+}
+
+/// Each key the expanders give, with its parse or a parse error.
+type ParsedKeys = Vec<(Key, Result<Parsed, String>)>;
+
+/// A binding's key as layers compile it: each key the expanders give, parsed with its displays. The outer error is
+/// the expanders', an inner one a key's.
+fn expand_key(key: &Key, tokens: &HashMap<String, Stroke>, expanders: &[Expander]) -> Result<ParsedKeys, String> {
+    let expansions = match key {
+        Key::Stroke(stroke) => vec![(Key::Stroke(stroke.clone()), None)],
+        Key::Text(text) => expand(text, expanders)?,
+    };
+    Ok(expansions
+        .into_iter()
+        .map(|(key, displays)| {
+            let parsed = match &key {
+                Key::Stroke(stroke) => stroke.normalized().map(|stroke| Parsed {
+                    parts: vec![KeySequencePart::from_stroke(stroke)],
+                    used_tokens: false,
+                    unknown_tokens: Vec::new(),
+                }),
+                Key::Text(text) => key::parse_sequence(text, tokens),
+            };
+            let parsed = parsed.and_then(|parsed| apply_displays(parsed, displays, &key));
+            (key, parsed)
+        })
+        .collect())
 }
 
 type Expanded = Vec<(Key, Option<Vec<String>>)>;

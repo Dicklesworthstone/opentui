@@ -12,6 +12,8 @@ const link = @import("link.zig");
 
 const utf8 = @import("utf8.zig");
 const text_work = @import("text-work.zig");
+const hl = @import("highlight-layers.zig");
+const edit_marks = @import("edit-marks.zig");
 
 const logger = @import("logger.zig");
 
@@ -52,6 +54,69 @@ pub const OwnedStyledChunk = struct {
 const empty_document_line: UnifiedRope.Node = .{ .leaf = .{ .data = .{ .linestart = {} } } };
 const empty_document_sentinel: UnifiedRope.Node = .{ .leaf = .{ .data = Segment.empty(), .is_sentinel = true } };
 
+pub const LayerRun = hl.LayerRun;
+
+pub const LineSpans = struct {
+    spans: std.ArrayListUnmanaged(StyleSpan) = .empty,
+    /// 0 never matches a buffer's `span_generation`, so a new entry is stale.
+    generation: u64 = 0,
+    /// The style binding's `changes` when the spans depend on definitions (a layer run over
+    /// another input, which shows if the run's set supplies nothing), else null.
+    style_changes: ?u32 = null,
+};
+
+/// One input of a line's span build: a legacy record or a layer run, in columns.
+const SpanInput = struct {
+    col_start: u32,
+    col_end: u32,
+    style_id: u32,
+    link_id_and_kind: u32,
+    priority: u8,
+    ended: bool = false,
+};
+
+const SpanEvent = struct {
+    col: u32,
+    is_start: bool,
+    input_index: u32,
+};
+
+/// A text chunk of the line being built, with its first byte and column in the line.
+const LineChunk = struct {
+    chunk: *const TextChunk,
+    start_byte: u32,
+    start_col: u32,
+};
+
+/// A styled edit mark's part on one line, in the line's columns.
+pub const LineMark = struct {
+    mark: edit_marks.Mark,
+    col_start: u32,
+    col_end: u32,
+
+    fn idLessThan(_: void, a: LineMark, b: LineMark) bool {
+        return a.mark.id < b.mark.id;
+    }
+};
+
+/// Build scratch, retained between builds so paint allocates only while it grows.
+const SpanScratch = struct {
+    inputs: std.ArrayListUnmanaged(SpanInput) = .empty,
+    events: std.ArrayListUnmanaged(SpanEvent) = .empty,
+    heap: std.ArrayListUnmanaged(u32) = .empty,
+    chunks: std.ArrayListUnmanaged(LineChunk) = .empty,
+    marks: std.ArrayListUnmanaged(LineMark) = .empty,
+
+    fn deinit(self: *SpanScratch, allocator: Allocator) void {
+        self.inputs.deinit(allocator);
+        self.events.deinit(allocator);
+        self.heap.deinit(allocator);
+        self.chunks.deinit(allocator);
+        self.marks.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 pub const UnifiedTextBuffer = struct {
     const Self = UnifiedTextBuffer;
 
@@ -86,22 +151,43 @@ pub const UnifiedTextBuffer = struct {
     /// to detect stale caches even after clearViewDirty() runs.
     content_epoch: u64,
 
-    // Per-line highlight cache (invalidated on edits)
-    // Maps line_idx to highlights for that line
+    /// Legacy highlight records per line, in display columns (overlapping, refs, ref 0 = styled
+    /// text), exactly as `ot_*_highlight` sets and `get_highlights` reports them.
     line_highlights: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Highlight)),
-    line_spans: std.ArrayListUnmanaged(std.ArrayListUnmanaged(StyleSpan)),
+    /// Derived paint cache: a line's spans and the `span_generation` they were built at.
+    line_spans: std.AutoHashMapUnmanaged(u32, LineSpans),
+    /// Increments on every highlight or text change; a line whose spans carry an older stamp is
+    /// rebuilt when a view reads it.
+    span_generation: u64,
+    span_scratch: SpanScratch,
     internal_highlight_count: usize,
+    /// Bytes walked while styled runs move to a new width method; tests check that a line is walked once per end.
+    run_bytes_measured: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     /// Styles of styled text, replaced with it; the attached SyntaxStyle is never written.
     run_styles: RunStyles,
     /// clear() released the run styles' link refs while their highlights stay.
     run_links_retired: bool,
-    highlight_batch_depth: u32,
-    dirty_span_lines: std.AutoHashMap(usize, void),
+    /// Styles of edit marks by value, never removed: undo can restore a mark that names any.
+    mark_styles: RunStyles,
+    /// Byte-addressed provider layers; their runs name group sets in `group_sets`.
+    layers: hl.Layers,
+    /// The owning Context's group sets; null until the Context attaches it, and then no layer
+    /// can be set.
+    group_sets: ?*const hl.GroupSets,
 
     tab_width: u8,
-    // Persistent roots carry the tab-width generation used for their cached
-    // chunk and branch metrics, so only stale history roots are rescanned.
-    tab_metrics_generation: u64,
+    // Persistent roots carry the tab-width and width-method generation used for
+    // their cached chunk and branch metrics, so only stale history roots are rescanned.
+    metrics_generation: u64,
+    /// The generation of the last width-method change: older roots have stale non-ASCII widths.
+    width_method_generation: u64,
+
+    /// The whole text after the last `replaceTail`, in one growable slot the buffer owns, valid
+    /// while `content_epoch` is still `tail_epoch`: a tail write copies only its new bytes and
+    /// takes no registry slot.
+    tail_slot: ?u8,
+    tail_bytes: std.ArrayListUnmanaged(u8),
+    tail_epoch: u64,
 
     pub const Defaults = struct {
         fg: ?RGBA,
@@ -151,17 +237,20 @@ pub const UnifiedTextBuffer = struct {
         return &self._rope;
     }
 
-    /// Restore an undo root with metrics valid for the current tab width.
+    /// Restore an undo root with metrics valid for the current tab width and width method.
     pub fn undo(self: *Self, meta: []const u8) ![]const u8 {
         const previous_meta = try self._rope.undo(meta);
-        self.refreshTabWidthMetrics();
+        self.refreshMetrics();
+        // History keeps roots, not byte splices, so layers cannot follow a restored root.
+        self.resetLayers();
         return previous_meta;
     }
 
-    /// Restore a redo root with metrics valid for the current tab width.
+    /// Restore a redo root with metrics valid for the current tab width and width method.
     pub fn redo(self: *Self) ![]const u8 {
         const next_meta = try self._rope.redo();
-        self.refreshTabWidthMetrics();
+        self.refreshMetrics();
+        self.resetLayers();
         return next_meta;
     }
 
@@ -241,6 +330,7 @@ pub const UnifiedTextBuffer = struct {
         io: std.Io = compatibility_io,
         logger: *const logger.Logger = logger.processLogger(),
         control_display: utf8.ControlDisplay = .hidden,
+        group_sets: ?*const hl.GroupSets = null,
     };
 
     pub fn init(
@@ -293,9 +383,6 @@ pub const UnifiedTextBuffer = struct {
         var mem_registry = MemRegistry.init(global_allocator);
         errdefer mem_registry.deinit();
 
-        var dirty_span_lines = std.AutoHashMap(usize, void).init(global_allocator);
-        errdefer dirty_span_lines.deinit();
-
         self.* = .{
             .mem_registry = mem_registry,
             .default_fg = null,
@@ -320,13 +407,20 @@ pub const UnifiedTextBuffer = struct {
             .content_epoch = 0,
             .line_highlights = .empty,
             .line_spans = .empty,
+            .span_generation = 1,
+            .span_scratch = .{},
             .internal_highlight_count = 0,
             .run_styles = .empty,
             .run_links_retired = false,
-            .highlight_batch_depth = 0,
-            .dirty_span_lines = dirty_span_lines,
+            .mark_styles = .empty,
+            .layers = .{},
+            .group_sets = options.group_sets,
             .tab_width = 2,
-            .tab_metrics_generation = 1,
+            .metrics_generation = 1,
+            .width_method_generation = 1,
+            .tail_slot = null,
+            .tail_bytes = .empty,
+            .tail_epoch = 0,
         };
     }
 
@@ -359,41 +453,47 @@ pub const UnifiedTextBuffer = struct {
         self.line_highlights.deinit(self.global_allocator);
         self.line_highlights = .empty;
 
-        for (self.line_spans.items) |*span_list| {
-            span_list.deinit(self.global_allocator);
-        }
-        self.line_spans.deinit(self.global_allocator);
-        self.line_spans = .empty;
-
-        // Free dirty span lines hashmap
-        self.dirty_span_lines.deinit();
-        self.dirty_span_lines = std.AutoHashMap(usize, void).init(self.global_allocator);
+        self.freeLineSpans();
+        self.span_scratch.deinit(self.global_allocator);
+        self.resetLayers();
 
         if (self.link_tracker) |*tracker| {
             tracker.deinit();
         }
         self.link_tracker = null;
         self.dropRunStyles();
+        self.mark_styles.deinit(self.global_allocator);
+        self.mark_styles = .empty;
 
         self.layout_cache.clear();
         self.mem_registry.clear();
+        self.dropTail();
         // The next owned replacement discards the empty rope, so do not consolidate its old backing.
         _ = self.arena.reset(.free_all);
+    }
+
+    /// Forgets the tail slot after the registry was cleared.
+    fn dropTail(self: *Self) void {
+        self.tail_bytes.deinit(self.global_allocator);
+        self.tail_bytes = .empty;
+        self.tail_slot = null;
     }
 
     pub fn reinitStorage(self: *Self, width_method: utf8.WidthMethod) TextBufferError!void {
         std.debug.assert(self.next_view_id == 0 and self.style_binding.style == null and self.link_tracker == null);
         // retireStorage left only capacity behind.
         std.debug.assert(self.mem_registry.buffers.items.len == 0 and self.view_dirty_flags.items.len == 0);
-        std.debug.assert(self.line_highlights.items.len == 0 and self.line_spans.items.len == 0);
+        std.debug.assert(self.line_highlights.items.len == 0 and self.line_spans.count() == 0);
         std.debug.assert(self.run_styles.count() == 0 and self.run_styles.capacity() == 0);
         const registry = self.mem_registry;
         const view_dirty_flags = self.view_dirty_flags;
         const free_view_ids = self.free_view_ids;
+        std.debug.assert(self.layers.isEmpty());
         try self.initStorage(self.global_allocator, self.pool, self.link_pool, width_method, .{
             .io = self.io,
             .logger = self.logger,
             .control_display = self.control_display,
+            .group_sets = self.group_sets,
         }, self.arena);
         self.mem_registry = registry;
         self.view_dirty_flags = view_dirty_flags;
@@ -460,10 +560,12 @@ pub const UnifiedTextBuffer = struct {
     }
 
     fn markAllViewsDirty(self: *Self) void {
-        self._rope.setMetricsGeneration(self.tab_metrics_generation);
+        self._rope.setMetricsGeneration(self.metrics_generation);
         // Increment epoch first so views see the new value when checking caches.
         // Use wrapping add for safety, though u64 won't overflow in practice.
         self.content_epoch +%= 1;
+        // Text changes move columns under layer runs, so painted lines rebuild their spans.
+        self.span_generation += 1;
         for (self.view_dirty_flags.items) |*flag| {
             flag.* = true;
         }
@@ -506,6 +608,7 @@ pub const UnifiedTextBuffer = struct {
     fn clearWithUndo(self: *Self, meta: ?[]const u8) TextBufferError!void {
         try self._rope.clearWithUndo(meta);
         self.clearLinkRefs();
+        self.resetLayers();
         self.layout_cache.clear();
         if (!self._rope.hasHistory()) {
             // Rope nodes are never freed one at a time, so resetting the arena is how
@@ -537,11 +640,7 @@ pub const UnifiedTextBuffer = struct {
         self.line_highlights.clearRetainingCapacity();
         self.internal_highlight_count = 0;
         self.dropRunStyles();
-
-        for (self.line_spans.items) |*span_list| {
-            span_list.deinit(self.global_allocator);
-        }
-        self.line_spans.clearRetainingCapacity();
+        self.resetLayers();
 
         self.layout_cache.clear();
         self.arena.deinit();
@@ -550,6 +649,7 @@ pub const UnifiedTextBuffer = struct {
         self._rope.allocator = self.allocator;
 
         self.mem_registry.clear();
+        self.dropTail();
 
         self.markAllViewsDirty();
     }
@@ -672,7 +772,6 @@ pub const UnifiedTextBuffer = struct {
         arena: std.heap.ArenaAllocator,
         rope: UnifiedRope = undefined,
         highlights: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Highlight)) = .empty,
-        spans: std.ArrayListUnmanaged(std.ArrayListUnmanaged(StyleSpan)) = .empty,
         internal_count: usize = 0,
         text: []const u8,
         mem_id: u8 = undefined,
@@ -689,8 +788,6 @@ pub const UnifiedTextBuffer = struct {
             }
             for (prepared.highlights.items) |*list| list.deinit(self.global_allocator);
             prepared.highlights.deinit(self.global_allocator);
-            for (prepared.spans.items) |*list| list.deinit(self.global_allocator);
-            prepared.spans.deinit(self.global_allocator);
             prepared.arena.deinit();
         }
 
@@ -703,9 +800,9 @@ pub const UnifiedTextBuffer = struct {
             self._rope = prepared.rope;
             self._rope.allocator = self.allocator;
             std.mem.swap(@TypeOf(self.line_highlights), &self.line_highlights, &prepared.highlights);
-            std.mem.swap(@TypeOf(self.line_spans), &self.line_spans, &prepared.spans);
             self.internal_highlight_count = prepared.internal_count;
-            self.dirty_span_lines.clearRetainingCapacity();
+            self.resetLayers();
+            self.trimLineSpans(self.line_highlights.items.len);
             self.markAllViewsDirty();
             var retired_links = self.link_tracker;
             self.link_tracker = null;
@@ -816,10 +913,8 @@ pub const UnifiedTextBuffer = struct {
         );
 
         const highlights = &prepared.highlights;
-        const spans = &prepared.spans;
         const line_count = prepared.rope.root.metrics().custom.linestart_count;
         try highlights.ensureTotalCapacity(self.global_allocator, line_count);
-        try spans.ensureTotalCapacity(self.global_allocator, line_count);
 
         // Concatenated widths include a split grapheme once, then intersect
         // whole-document lines without counting their separators. Both cursors
@@ -836,10 +931,7 @@ pub const UnifiedTextBuffer = struct {
         var style_id: u32 = 0;
         var internal_count: usize = 0;
         for (result.segments.items) |segment| {
-            if (segment.isLineStart()) {
-                highlights.appendAssumeCapacity(.empty);
-                spans.appendAssumeCapacity(.empty);
-            }
+            if (segment.isLineStart()) highlights.appendAssumeCapacity(.empty);
             const line = segment.asText() orelse continue;
             const line_index = highlights.items.len - 1;
             var col: u32 = 0;
@@ -863,21 +955,9 @@ pub const UnifiedTextBuffer = struct {
                     .hl_ref = 0,
                     .internal = true,
                 });
-                try spans.items[line_index].append(self.global_allocator, .{
-                    .col = col,
-                    .next_col = col + width,
-                    .style_id = style_id,
-                });
                 internal_count += 1;
                 remaining_cols -= width;
                 col += width;
-            }
-            if (col > 0) {
-                try spans.items[line_index].append(self.global_allocator, .{
-                    .col = col,
-                    .next_col = std.math.maxInt(u32),
-                    .style_id = 0,
-                });
             }
         }
 
@@ -920,25 +1000,19 @@ pub const UnifiedTextBuffer = struct {
             break :blk next;
         };
 
-        var spans: @TypeOf(self.line_spans) = .empty;
         var highlights: @TypeOf(self.line_highlights) = .empty;
         defer {
-            for (spans.items) |*list| list.deinit(self.global_allocator);
-            spans.deinit(self.global_allocator);
             for (highlights.items) |*list| list.deinit(self.global_allocator);
             highlights.deinit(self.global_allocator);
         }
         // User highlights stay only on lines that the new text still has.
         const line_count = if (self.getHighlightCount() == 0) 0 else @min(self.line_highlights.items.len, candidate.root.metrics().custom.linestart_count);
-        try spans.ensureTotalCapacity(self.global_allocator, line_count);
         try highlights.ensureTotalCapacity(self.global_allocator, line_count);
         for (self.line_highlights.items[0..line_count], 0..) |list, line_idx| {
             highlights.appendAssumeCapacity(.empty);
-            for (list.items) |hl| {
-                if (!hl.internal) try highlights.items[line_idx].append(self.global_allocator, hl);
+            for (list.items) |record| {
+                if (!record.internal) try highlights.items[line_idx].append(self.global_allocator, record);
             }
-            spans.appendAssumeCapacity(.empty);
-            try self.buildLineSpans(highlights.items[line_idx].items, &spans.items[line_idx]);
         }
 
         // History nodes are shared: publish undo on the live rope, after all preparation.
@@ -956,9 +1030,8 @@ pub const UnifiedTextBuffer = struct {
         self.internal_highlight_count = 0;
         self.dropRunStyles();
         std.mem.swap(@TypeOf(self.line_highlights), &self.line_highlights, &highlights);
-        std.mem.swap(@TypeOf(self.line_spans), &self.line_spans, &spans);
-        // Replacement flushes pending spans even inside a highlight transaction.
-        self.dirty_span_lines.clearRetainingCapacity();
+        self.resetLayers();
+        self.trimLineSpans(self._rope.root.metrics().custom.linestart_count);
         self.markAllViewsDirty();
         // Publish the slot last, before replace frees bytes and allocator callbacks run.
         if (replacement_owned) |owned| self.mem_registry.replace(mem_id, text, owned) catch unreachable;
@@ -1061,6 +1134,7 @@ pub const UnifiedTextBuffer = struct {
         self._rope = candidate;
         self._rope.allocator = self.allocator;
         self.mem_registry.clear();
+        self.dropTail();
         self.mem_registry.buffers.appendAssumeCapacity(.{ .data = bytes, .owned = true, .active = true });
         self.markAllViewsDirty();
     }
@@ -1069,6 +1143,143 @@ pub const UnifiedTextBuffer = struct {
     pub fn appendFromMemId(self: *Self, mem_id: u8) TextBufferError!void {
         const text = self.mem_registry.get(mem_id) orelse return TextBufferError.InvalidMemId;
         try self.appendBytes(text, .{ .slot = mem_id });
+    }
+
+    /// Replaces the text from byte `from` (bytes of the text as `getPlainText` returns it) to
+    /// the end with `bytes` (C4's internal tail primitive). The head's rope and bytes stay: the
+    /// buffer keeps the whole text in one growable slot it owns, so a tail write copies only its
+    /// new bytes, takes no registry slot, and drops only the rope leaves past `from`. Layers clip
+    /// at `from`. A write from 0, or after any other change to the text, replaces it whole (and
+    /// resets layers and styles). The rope's arena is rebuilt when it outgrows the live rope.
+    /// The caller validates UTF-8 and the text limit.
+    pub fn replaceTail(self: *Self, from: u32, bytes: []const u8) TextBufferError!void {
+        std.debug.assert(!self._rope.hasHistory());
+        const current = self.tail_slot != null and self.tail_epoch == self.content_epoch;
+        if (!current or from == 0) return self.replaceWhole(from, bytes);
+        std.debug.assert(from <= self.tail_bytes.items.len and self.tail_bytes.items.len == self.getByteSize());
+        if (std.mem.indexOfScalar(u8, bytes, '\r') != null) return self.replaceWhole(from, bytes);
+        // A write that starts inside a code point rewrites it whole.
+        var start = from;
+        while (start > 0 and start < self.tail_bytes.items.len and self.tail_bytes.items[start] & 0xC0 == 0x80) start -= 1;
+        const slot = self.tail_slot.?;
+        const end = from + @as(u32, @intCast(bytes.len));
+        // Grow first: the old rope reads its bytes through the registry, which follows the move.
+        if (end > self.tail_bytes.capacity) {
+            self.tail_bytes.ensureTotalCapacity(self.global_allocator, @max(end, self.tail_bytes.capacity * 2)) catch return TextBufferError.OutOfMemory;
+            self.mem_registry.buffers.items[slot].data = self.tail_bytes.items;
+        }
+        const head = self.tail_bytes.items;
+        var candidate = self._rope;
+        // Leaves past `start` go; a text leaf that crosses it keeps its head.
+        if (self._rope.seekKey(iter_mod.textBytes, start)) |found| {
+            var first = found.leaf_index;
+            if (found.leaf.asText()) |chunk| if (found.before < start) {
+                try candidate.replace(first, .{ .text = self.createChunkFromBytes(slot, head[chunk.byte_start .. chunk.byte_start + (start - found.before)], chunk.byte_start) });
+                first += 1;
+            };
+            if (first < candidate.count()) try candidate.delete_range(first, candidate.count());
+        }
+        // A grapheme the kept text and the new bytes share is laid out again from its start
+        // (its bytes are already in the slot, before `start`).
+        var joined = start;
+        const piece = if (from > start) try std.mem.concat(self.global_allocator, u8, &.{ head[start..from], bytes }) else bytes;
+        defer if (from > start) self.global_allocator.free(piece);
+        if (piece.len > 0) {
+            const last_index = candidate.count() -| 1;
+            if (candidate.get(last_index)) |last| if (last.asText()) |chunk| {
+                if (Segment.findJunction(head[chunk.byte_start..chunk.byte_end], piece, self.width_method)) |at| {
+                    joined = chunk.byte_start + at.tail;
+                    text_work.add(.grapheme_joins, 1);
+                    if (at.tail == 0) try candidate.delete(last_index) else try candidate.replace(last_index, .{ .text = self.createChunkFromBytes(slot, head[chunk.byte_start..joined], chunk.byte_start) });
+                }
+            };
+            const laid = if (joined < start) try std.mem.concat(self.global_allocator, u8, &.{ head[joined..start], piece }) else piece;
+            defer if (joined < start) self.global_allocator.free(laid);
+            var result = try self.textToSegments(self.global_allocator, laid, slot, joined, false);
+            defer result.segments.deinit(result.allocator);
+            try candidate.insert_slice(candidate.count(), result.segments.items);
+        }
+        // Publish: the rope, then the bytes it reads, then the layers and caches.
+        const old_len: u32 = @intCast(head.len);
+        self._rope.root = candidate.root;
+        self.tail_bytes.items.len = start;
+        self.tail_bytes.appendSliceAssumeCapacity(piece);
+        self.mem_registry.buffers.items[slot].data = self.tail_bytes.items;
+        self.layers.deleteBytes(self.global_allocator, self.link_pool, start, old_len);
+        self.dropLinesFrom(self._rope.root.metrics().custom.linestart_count);
+        self.markAllViewsDirty();
+        self.tail_epoch = self.content_epoch;
+        text_work.add(.tail_writes, 1);
+        text_work.add(.tail_write_bytes, piece.len);
+        self.reclaimRopeArena() catch {};
+    }
+
+    /// The whole text replaced by `head[0..from] ++ bytes` in a new tail slot.
+    fn replaceWhole(self: *Self, from: u32, bytes: []const u8) TextBufferError!void {
+        var next: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer next.deinit(self.global_allocator);
+        if (from > 0) {
+            // The head as the text holds it now (another write may have replaced the tail slot).
+            const size = self.getByteSize();
+            std.debug.assert(from <= size);
+            next.ensureTotalCapacity(self.global_allocator, @max(size, from + bytes.len)) catch return TextBufferError.OutOfMemory;
+            next.items.len = size;
+            _ = self.getPlainTextIntoBuffer(next.items);
+            next.items.len = from;
+        }
+        next.appendSlice(self.global_allocator, bytes) catch return TextBufferError.OutOfMemory;
+        const new_slot = self.tail_slot == null;
+        const previous_buffer_count = self.mem_registry.buffers.items.len;
+        const slot = self.tail_slot orelse try self.mem_registry.register(next.items, false);
+        errdefer if (new_slot) self.mem_registry.cancelLastRegistration(slot, previous_buffer_count);
+        var replacement_arena = std.heap.ArenaAllocator.init(self.global_allocator);
+        defer replacement_arena.deinit();
+        try self.setPlainText(slot, next.items, 0, null, false, &replacement_arena);
+        self.tail_bytes.deinit(self.global_allocator);
+        self.tail_bytes = next;
+        self.tail_slot = slot;
+        // Text with a carriage return counts a CRLF as one byte, so its slot offsets are not the
+        // text's: the next tail write replaces it whole.
+        self.tail_epoch = if (std.mem.indexOfScalar(u8, next.items, '\r') == null) self.content_epoch else self.content_epoch -% 1;
+        text_work.add(.tail_writes, 1);
+        text_work.add(.tail_write_bytes, next.items.len);
+    }
+
+    /// Legacy records and span caches of lines the text no longer has go.
+    fn dropLinesFrom(self: *Self, line_count: usize) void {
+        if (self.line_highlights.items.len > line_count) {
+            for (self.line_highlights.items[line_count..]) |*list| {
+                for (list.items) |record| self.internal_highlight_count -= @intFromBool(record.internal);
+                list.deinit(self.global_allocator);
+            }
+            self.line_highlights.items.len = line_count;
+        }
+        self.trimLineSpans(line_count);
+    }
+
+    /// Old rope paths stay in the arena until it resets. Past twice the live rope plus 64 KiB,
+    /// the rope is rebuilt from its leaves into a new arena and the old one is released.
+    fn reclaimRopeArena(self: *Self) TextBufferError!void {
+        const live = @as(usize, self._rope.count()) * 2 * @sizeOf(UnifiedRope.Node);
+        if (self.arena.queryCapacity() <= 2 * live + (64 << 10)) return;
+        const segments = self._rope.to_array(self.global_allocator) catch return TextBufferError.OutOfMemory;
+        defer self.global_allocator.free(segments);
+        // Cold layout state lives in the arena that goes.
+        for (segments) |*segment| switch (segment.*) {
+            .text => |*chunk| chunk.cold = null,
+            else => {},
+        };
+        var replacement_arena = std.heap.ArenaAllocator.init(self.global_allocator);
+        defer replacement_arena.deinit();
+        const candidate = UnifiedRope.from_sliceWithConfig(replacement_arena.allocator(), segments, self._rope.config) catch
+            return TextBufferError.OutOfMemory;
+        self.layout_cache.clear();
+        std.mem.swap(std.heap.ArenaAllocator, self.arena, &replacement_arena);
+        self._rope = candidate;
+        self._rope.allocator = self.allocator;
+        text_work.add(.rope_rebuilds, 1);
+        self.markAllViewsDirty();
+        self.tail_epoch = self.content_epoch;
     }
 
     /// Internal append that doesn't register memory
@@ -1201,12 +1412,16 @@ pub const UnifiedTextBuffer = struct {
         return self.mem_registry.register(data, owned);
     }
 
+    /// The text reading the slot changes under the layers, so they empty as on a whole-text change.
     pub fn replaceMemBuffer(self: *Self, mem_id: u8, data: []const u8, owned: bool) TextBufferError!void {
         try self.mem_registry.replace(mem_id, data, owned);
+        self.resetLayers();
+        self.span_generation += 1;
     }
 
     pub fn clearMemRegistry(self: *Self) void {
         self.mem_registry.clear();
+        self.dropTail();
     }
 
     pub fn getMemBuffer(self: *const Self, mem_id: u8) ?[]const u8 {
@@ -1287,82 +1502,34 @@ pub const UnifiedTextBuffer = struct {
         return out_index;
     }
 
-    pub fn startHighlightsTransaction(self: *Self) void {
-        self.highlight_batch_depth += 1;
-    }
+    const LineHighlight = struct { line_idx: usize, highlight: Highlight };
 
-    pub fn endHighlightsTransaction(self: *Self) void {
-        if (self.highlight_batch_depth == 0) return;
-
-        self.highlight_batch_depth -= 1;
-
-        if (self.highlight_batch_depth == 0) {
-            var it = self.dirty_span_lines.keyIterator();
-            while (it.next()) |line_idx| {
-                self.rebuildLineSpans(line_idx.*) catch {};
-            }
-            self.dirty_span_lines.clearRetainingCapacity();
-        }
-    }
-
-    const HighlightAddition = struct {
-        line_idx: usize,
-        highlight: Highlight,
-        highlights: std.ArrayListUnmanaged(Highlight) = .empty,
-        spans: std.ArrayListUnmanaged(StyleSpan) = .empty,
-
-        fn deinit(self: *HighlightAddition, allocator: Allocator) void {
-            self.highlights.deinit(allocator);
-            self.spans.deinit(allocator);
-        }
-    };
-
-    fn prepareHighlight(self: *Self, line_idx: usize, hl: Highlight) TextBufferError!HighlightAddition {
-        var addition: HighlightAddition = .{ .line_idx = line_idx, .highlight = hl };
-        errdefer addition.deinit(self.global_allocator);
-        const highlights = if (line_idx < self.line_highlights.items.len)
-            &self.line_highlights.items[line_idx]
-        else
-            &addition.highlights;
-        try highlights.ensureUnusedCapacity(self.global_allocator, 1);
-        // Stage in spare capacity without publishing the new length or copying accepted highlights.
-        highlights.unusedCapacitySlice()[0] = hl;
-        if (self.highlight_batch_depth == 0) {
-            try self.buildLineSpans(highlights.allocatedSlice()[0 .. highlights.items.len + 1], &addition.spans);
-        }
-        return addition;
-    }
-
-    fn commitHighlights(self: *Self, additions: []HighlightAddition) TextBufferError!void {
+    /// Publishes every record or none. `additions` are in ascending line order, one per line.
+    fn appendHighlights(self: *Self, additions: []const LineHighlight) TextBufferError!void {
         if (additions.len == 0) return;
-        const storage_len = additions[additions.len - 1].line_idx + 1;
-        try self.line_highlights.ensureTotalCapacity(self.global_allocator, storage_len);
-        try self.line_spans.ensureTotalCapacity(self.global_allocator, storage_len);
-        if (self.highlight_batch_depth > 0) {
-            try self.dirty_span_lines.ensureUnusedCapacity(@intCast(additions.len));
+        const allocator = self.global_allocator;
+        const old_len = self.line_highlights.items.len;
+        const storage_len = @max(old_len, additions[additions.len - 1].line_idx + 1);
+        try self.line_highlights.ensureTotalCapacity(allocator, storage_len);
+        // Lines past the end get their lists here, published only once every allocation succeeded.
+        var added_lists: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Highlight)) = .empty;
+        defer {
+            for (added_lists.items) |*list| list.deinit(allocator);
+            added_lists.deinit(allocator);
         }
-
-        for (additions, 0..) |*addition, index| {
-            const line_idx = addition.line_idx;
-            std.debug.assert(index == 0 or additions[index - 1].line_idx < line_idx);
-            while (self.line_highlights.items.len <= line_idx) {
-                self.line_highlights.appendAssumeCapacity(.empty);
-            }
-            while (self.line_spans.items.len <= line_idx) {
-                self.line_spans.appendAssumeCapacity(.empty);
-            }
-            if (addition.highlights.capacity > 0) {
-                std.mem.swap(@TypeOf(addition.highlights), &self.line_highlights.items[line_idx], &addition.highlights);
-            }
+        try added_lists.ensureTotalCapacity(allocator, storage_len - old_len);
+        for (old_len..storage_len) |_| added_lists.appendAssumeCapacity(.empty);
+        for (additions, 0..) |addition, index| {
+            std.debug.assert(index == 0 or additions[index - 1].line_idx < addition.line_idx);
             // Only styled text replacement creates internal highlights, and it builds them in one pass.
             std.debug.assert(!addition.highlight.internal);
-            self.line_highlights.items[line_idx].appendAssumeCapacity(addition.highlight);
-            if (self.highlight_batch_depth == 0) {
-                std.mem.swap(@TypeOf(addition.spans), &self.line_spans.items[line_idx], &addition.spans);
-            } else {
-                self.dirty_span_lines.putAssumeCapacity(line_idx, {});
-            }
+            const list = if (addition.line_idx < old_len) &self.line_highlights.items[addition.line_idx] else &added_lists.items[addition.line_idx - old_len];
+            try list.ensureUnusedCapacity(allocator, 1);
         }
+        self.line_highlights.appendSliceAssumeCapacity(added_lists.items);
+        added_lists.clearRetainingCapacity();
+        for (additions) |addition| self.line_highlights.items[addition.line_idx].appendAssumeCapacity(addition.highlight);
+        self.span_generation += 1;
     }
 
     pub fn addHighlight(
@@ -1383,18 +1550,14 @@ pub const UnifiedTextBuffer = struct {
             return; // Empty range
         }
 
-        const hl: Highlight = .{
+        try self.appendHighlights(&.{.{ .line_idx = line_idx, .highlight = .{
             .col_start = col_start,
             .col_end = col_end,
             .style_id = style_id,
             .priority = priority,
             .hl_ref = hl_ref,
             .internal = false,
-        };
-
-        var additions = [_]HighlightAddition{try self.prepareHighlight(line_idx, hl)};
-        defer additions[0].deinit(self.global_allocator);
-        try self.commitHighlights(&additions);
+        } }});
     }
 
     pub fn getLineHighlights(self: *const Self, line_idx: usize) []const Highlight {
@@ -1404,98 +1567,501 @@ pub const UnifiedTextBuffer = struct {
         return &[_]Highlight{};
     }
 
-    pub fn getLineSpans(self: *const Self, line_idx: usize) []const StyleSpan {
-        if (line_idx < self.line_spans.items.len) {
-            return self.line_spans.items[line_idx].items;
-        }
-        return &[_]StyleSpan{};
-    }
-
-    fn rebuildLineSpans(self: *Self, line_idx: usize) TextBufferError!void {
-        if (line_idx >= self.line_spans.items.len) {
-            return TextBufferError.InvalidIndex;
-        }
-
-        try self.buildLineSpans(self.getLineHighlights(line_idx), &self.line_spans.items[line_idx]);
-    }
-
-    fn buildLineSpans(self: *const Self, highlights: []const Highlight, spans: *std.ArrayListUnmanaged(StyleSpan)) TextBufferError!void {
-        text_work.add(.line_span_builds, 1);
-        text_work.add(.line_span_highlights, highlights.len);
-        spans.clearRetainingCapacity();
-        // Collect all boundary columns
-        const Event = struct {
-            col: u32,
-            is_start: bool,
-            hl_idx: usize,
+    /// The spans that paint `line_idx`, rebuilt from its legacy records and the layers when they
+    /// are older than the buffer's `span_generation`. Only lines read get an entry, and a line
+    /// without inputs gets none. Only a newly read line allocates, so warm paints do not.
+    pub fn getLineSpans(self: *Self, line_idx: usize) TextBufferError![]const StyleSpan {
+        const row: u32 = @intCast(line_idx);
+        const entry = self.line_spans.getPtr(row) orelse entry: {
+            const has_records = line_idx < self.line_highlights.items.len and self.line_highlights.items[line_idx].items.len > 0;
+            if (!has_records and self.layers.isEmpty() and self.marks().len == 0) return &.{};
+            try self.line_spans.ensureUnusedCapacity(self.global_allocator, 1);
+            const added = self.line_spans.getOrPutAssumeCapacity(row);
+            added.value_ptr.* = .{};
+            break :entry added.value_ptr;
         };
-
-        var events: std.ArrayListUnmanaged(Event) = .empty;
-        defer events.deinit(self.global_allocator);
-
-        for (highlights, 0..) |hl, idx| {
-            try events.append(self.global_allocator, .{ .col = hl.col_start, .is_start = true, .hl_idx = idx });
-            try events.append(self.global_allocator, .{ .col = hl.col_end, .is_start = false, .hl_idx = idx });
+        const restyled = if (entry.style_changes) |changes| changes != self.style_binding.changes else false;
+        if (entry.generation != self.span_generation or restyled) {
+            entry.style_changes = try self.buildLineSpans(line_idx, &entry.spans);
+            entry.generation = self.span_generation;
         }
+        return entry.spans.items;
+    }
 
-        // Sort by column, ends before starts at same position
-        const sortFn = struct {
-            fn lessThan(_: void, a: Event, b: Event) bool {
-                if (a.col != b.col) return a.col < b.col;
-                if (a.is_start != b.is_start) return !a.is_start; // ends before starts
-                // If both are same type at same column, use hl_idx for stable sort
-                return a.hl_idx < b.hl_idx;
-            }
-        }.lessThan;
-        std.mem.sort(Event, events.items, {}, sortFn);
-
-        // Build spans by tracking active highlights
-        var active = std.AutoHashMap(usize, void).init(self.global_allocator);
-        defer active.deinit();
-
-        var current_col: u32 = 0;
-
-        for (events.items) |event| {
-            // Find current highest priority style before processing event
-            var current_priority: i16 = -1;
-            var current_style: u32 = 0;
-            var it = active.keyIterator();
-            while (it.next()) |hl_idx| {
-                const hl = highlights[hl_idx.*];
-                if (hl.priority > current_priority) {
-                    current_priority = @intCast(hl.priority);
-                    current_style = hl.style_id;
-                }
-            }
-
-            // Emit span for the segment leading up to this event
-            if (event.col > current_col) {
-                try spans.append(self.global_allocator, .{
-                    .col = current_col,
-                    .style_id = current_style,
-                    .next_col = event.col,
-                });
-                current_col = event.col;
-            }
-
-            // Process event
-            if (event.is_start) {
-                try active.put(event.hl_idx, {});
-            } else {
-                _ = active.remove(event.hl_idx);
-            }
+    /// The style a span paints: legacy ids through `resolveStyle`, group sets composed against the
+    /// bound SyntaxStyle, with the span's link.
+    pub fn resolveSpan(self: *const Self, span: StyleSpan) ?StyleDefinition {
+        switch (span.kind()) {
+            .legacy => return self.resolveStyle(span.style_id),
+            .group_set => {
+                // Group-set spans come only from layers, which need the group sets.
+                var definition = no_style;
+                if (self.style_binding.style) |style| definition = style.resolveGroupSet(self.group_sets.?, span.style_id);
+                if (span.linkId() != 0) definition.attributes = ansi.TextAttributes.setLinkId(definition.attributes, span.linkId());
+                return definition;
+            },
+            .mark_style => return self.mark_styles.keys()[span.style_id],
         }
+    }
 
-        // The default style runs from the last highlight end to any later column, so text that
-        // grows the line without a rebuild (append, edits, undo) stays unstyled.
-        std.debug.assert(active.count() == 0);
-        if (events.items.len > 0) {
-            try spans.append(self.global_allocator, .{
-                .col = current_col,
-                .style_id = 0,
-                .next_col = std.math.maxInt(u32),
+    /// The edit marks of the live text, sorted by start byte and id.
+    pub fn marks(self: *const Self) []const edit_marks.Mark {
+        return edit_marks.live(self._rope.aux);
+    }
+
+    /// The mark style table index of `style`, added on first use; at most 4,096 styles.
+    pub fn internMarkStyle(self: *Self, style: StyleDefinition) error{ OutOfMemory, ObjectLimit }!u32 {
+        if (self.mark_styles.getIndex(style)) |index| return @intCast(index);
+        if (self.mark_styles.count() == mark_style_count_max) return error.ObjectLimit;
+        try self.mark_styles.put(self.global_allocator, style, {});
+        return @intCast(self.mark_styles.count() - 1);
+    }
+
+    pub const mark_style_count_max = 4096;
+
+    fn suppliesNothing(self: *Self, group_set: u32) bool {
+        const style = self.style_binding.style orelse return true;
+        return hl.suppliesNothing(style.resolveGroupSet(self.group_sets.?, group_set));
+    }
+
+    fn freeLineSpans(self: *Self) void {
+        var entries = self.line_spans.valueIterator();
+        while (entries.next()) |entry| entry.spans.deinit(self.global_allocator);
+        self.line_spans.deinit(self.global_allocator);
+        self.line_spans = .empty;
+    }
+
+    /// Releases the span storage of lines a replaced text no longer has.
+    fn trimLineSpans(self: *Self, line_count: usize) void {
+        var entries = self.line_spans.iterator();
+        while (entries.next()) |entry| {
+            if (entry.key_ptr.* < line_count) continue;
+            entry.value_ptr.spans.deinit(self.global_allocator);
+            self.line_spans.removeByPtr(entry.key_ptr);
+        }
+    }
+
+    /// One sweep over the line's inputs: the highest priority wins each column; on a tie the later
+    /// input wins (records in line order, styled marks in id order, then layers in `layer_id`
+    /// order). A layer run whose set
+    /// supplies nothing and has no link is left out when other inputs could show under it. Spans
+    /// start at column 0, include gaps, and end with a default tail that unstyles text added later.
+    /// Returns the binding's `changes` when the spans depend on definitions.
+    fn buildLineSpans(self: *Self, line_idx: usize, out: *std.ArrayListUnmanaged(StyleSpan)) TextBufferError!?u32 {
+        const allocator = self.global_allocator;
+        const scratch = &self.span_scratch;
+        scratch.inputs.clearRetainingCapacity();
+        const records = self.getLineHighlights(line_idx);
+        try scratch.inputs.ensureTotalCapacity(allocator, records.len);
+        for (records) |record| scratch.inputs.appendAssumeCapacity(.{
+            .col_start = record.col_start,
+            .col_end = record.col_end,
+            .style_id = record.style_id,
+            .link_id_and_kind = 0,
+            .priority = record.priority,
+        });
+        if (self.marks().len > 0) {
+            const mark_kind = @as(u32, @backingInt(StyleSpan.Kind.mark_style)) << 24;
+            for (try self.lineMarks(@intCast(line_idx))) |entry| try scratch.inputs.append(allocator, .{
+                .col_start = entry.col_start,
+                .col_end = entry.col_end,
+                .style_id = entry.mark.style,
+                .link_id_and_kind = if (entry.mark.style_value) mark_kind else 0,
+                .priority = @intCast(entry.mark.priority),
             });
         }
+        const restylable = !self.layers.isEmpty() and try self.appendLayerInputs(@intCast(line_idx));
+        text_work.add(.line_span_builds, 1);
+        text_work.add(.line_span_highlights, scratch.inputs.items.len);
+        try sweepSpans(allocator, scratch, out);
+        return if (restylable) self.style_binding.changes else null;
+    }
+
+    fn sweepSpans(allocator: Allocator, scratch: *SpanScratch, out: *std.ArrayListUnmanaged(StyleSpan)) TextBufferError!void {
+        out.clearRetainingCapacity();
+        const inputs = scratch.inputs.items;
+        if (inputs.len == 0) return;
+        const input_count: u32 = @intCast(inputs.len);
+        // k inputs give at most 2k events, 2k + 1 spans, and k heap entries.
+        try scratch.events.ensureTotalCapacity(allocator, 2 * inputs.len);
+        try scratch.heap.ensureTotalCapacity(allocator, inputs.len);
+        try out.ensureTotalCapacity(allocator, 2 * inputs.len + 1);
+        scratch.events.clearRetainingCapacity();
+        scratch.heap.clearRetainingCapacity();
+        var index: u32 = 0;
+        while (index < input_count) : (index += 1) {
+            std.debug.assert(inputs[index].col_start < inputs[index].col_end);
+            scratch.events.appendAssumeCapacity(.{ .col = inputs[index].col_start, .is_start = true, .input_index = index });
+            scratch.events.appendAssumeCapacity(.{ .col = inputs[index].col_end, .is_start = false, .input_index = index });
+        }
+        std.mem.sort(SpanEvent, scratch.events.items, {}, spanEventLessThan);
+
+        var current_col: u32 = 0;
+        for (scratch.events.items) |event| {
+            if (event.col > current_col) {
+                const winner = activeTop(scratch);
+                out.appendAssumeCapacity(if (winner) |top| .{
+                    .end_col_exclusive = event.col,
+                    .style_id = inputs[top].style_id,
+                    .link_id_and_kind = inputs[top].link_id_and_kind,
+                } else StyleSpan.legacy(event.col, 0));
+                current_col = event.col;
+            }
+            if (event.is_start) heapPush(scratch, event.input_index) else inputs[event.input_index].ended = true;
+        }
+        std.debug.assert(activeTop(scratch) == null);
+        std.debug.assert(out.items.len <= 2 * inputs.len);
+        out.appendAssumeCapacity(StyleSpan.legacy(std.math.maxInt(u32), 0));
+    }
+
+    /// Every input is nonempty and a span is emitted only when the column advances, so the order
+    /// of events at one column does not matter.
+    fn spanEventLessThan(_: void, a: SpanEvent, b: SpanEvent) bool {
+        return a.col < b.col;
+    }
+
+    fn spanInputWins(inputs: []const SpanInput, a: u32, b: u32) bool {
+        if (inputs[a].priority != inputs[b].priority) return inputs[a].priority > inputs[b].priority;
+        return a > b;
+    }
+
+    /// The winning live input; ended inputs leave the heap lazily, here.
+    fn activeTop(scratch: *SpanScratch) ?u32 {
+        const heap = &scratch.heap;
+        while (heap.items.len > 0 and scratch.inputs.items[heap.items[0]].ended) heapPopTop(scratch);
+        return if (heap.items.len > 0) heap.items[0] else null;
+    }
+
+    fn heapPush(scratch: *SpanScratch, input_index: u32) void {
+        const heap = &scratch.heap;
+        heap.appendAssumeCapacity(input_index);
+        var child = heap.items.len - 1;
+        while (child > 0) {
+            text_work.add(.span_heap_steps, 1);
+            const parent = (child - 1) / 2;
+            if (!spanInputWins(scratch.inputs.items, heap.items[child], heap.items[parent])) break;
+            std.mem.swap(u32, &heap.items[child], &heap.items[parent]);
+            child = parent;
+        }
+    }
+
+    fn heapPopTop(scratch: *SpanScratch) void {
+        const heap = &scratch.heap;
+        const inputs = scratch.inputs.items;
+        heap.items[0] = heap.items[heap.items.len - 1];
+        heap.items.len -= 1;
+        var parent: usize = 0;
+        while (true) {
+            text_work.add(.span_heap_steps, 1);
+            var best = parent;
+            for ([_]usize{ 2 * parent + 1, 2 * parent + 2 }) |child| {
+                if (child < heap.items.len and spanInputWins(inputs, heap.items[child], heap.items[best])) best = child;
+            }
+            if (best == parent) return;
+            std.mem.swap(u32, &heap.items[parent], &heap.items[best]);
+            parent = best;
+        }
+    }
+
+    /// Adds the layer runs that cover line `row`, converted from bytes to columns in one forward
+    /// walk of the line's chunks per layer. Over nothing, a run that supplies nothing paints as no
+    /// run, so it is left out only over earlier inputs of the line. Returns whether such a run could
+    /// be left out, so that the line's spans depend on definitions.
+    fn appendLayerInputs(self: *Self, row: u32) TextBufferError!bool {
+        const line_start_byte = iter_mod.lineStartByte(&self._rope, row) orelse return false;
+        try self.collectLineChunks(row);
+        const chunks = self.span_scratch.chunks.items;
+        const line_end_byte = line_start_byte + lineByteCount(chunks);
+        const group_set_kind = @as(u32, @backingInt(StyleSpan.Kind.group_set)) << 24;
+        var restylable = false;
+        for (self.layers.slice()) |layer| {
+            const lower = self.span_scratch.inputs.items.len != 0;
+            var cursor: ColumnCursor = .{ .buffer = self, .chunks = chunks };
+            const runs = layer.runs.items;
+            var index = hl.Layers.firstEndingAfter(runs, line_start_byte);
+            while (index < runs.len and runs[index].start_byte < line_end_byte) : (index += 1) {
+                const run = runs[index];
+                const col_start = cursor.colAt(@max(run.start_byte, line_start_byte) - line_start_byte);
+                // A run past the line ends at its last column.
+                const col_end = cursor.colAt(run.end_byte - line_start_byte);
+                if (col_start >= col_end) continue;
+                if (lower and run.link_id == 0) {
+                    restylable = true;
+                    if (self.suppliesNothing(run.group_set)) continue;
+                }
+                std.debug.assert(run.link_id & ~StyleSpan.link_id_mask == 0);
+                try self.span_scratch.inputs.append(self.global_allocator, .{
+                    .col_start = col_start,
+                    .col_end = col_end,
+                    .style_id = run.group_set,
+                    .link_id_and_kind = run.link_id | group_set_kind,
+                    .priority = 0,
+                });
+            }
+        }
+        return restylable;
+    }
+
+    fn lineByteCount(chunks: []const LineChunk) u32 {
+        if (chunks.len == 0) return 0;
+        const last = chunks[chunks.len - 1];
+        return last.start_byte + last.chunk.byte_end - last.chunk.byte_start;
+    }
+
+    /// The styled marks over line `row` in its columns, in id order: the records that one legacy
+    /// highlight per mark, added in id order, would give the line. Reuses the span scratch.
+    pub fn lineMarks(self: *Self, row: u32) TextBufferError![]const LineMark {
+        const out = &self.span_scratch.marks;
+        out.clearRetainingCapacity();
+        const line_start_byte = iter_mod.lineStartByte(&self._rope, row) orelse return out.items;
+        try self.collectLineChunks(row);
+        const chunks = self.span_scratch.chunks.items;
+        const line_end_byte = line_start_byte + lineByteCount(chunks);
+        const line_start_weight = iter_mod.lineStart(&self._rope, row).?.weight;
+        for (self.marks()) |mark| {
+            if (mark.start_byte >= line_end_byte) break;
+            if (!mark.styled() or mark.end_byte <= line_start_byte) continue;
+            // A start inside a grapheme (after a join) takes the grapheme, as `weightAtByte` reports it.
+            const col_start = if (mark.start_byte <= line_start_byte) 0 else self.weightAtByte(mark.start_byte, true) - line_start_weight;
+            var cursor: ColumnCursor = .{ .buffer = self, .chunks = chunks };
+            const col_end = cursor.colAt(@min(mark.end_byte, line_end_byte) - line_start_byte);
+            if (col_start >= col_end) continue;
+            try out.append(self.global_allocator, .{ .mark = mark, .col_start = col_start, .col_end = col_end });
+        }
+        std.mem.sort(LineMark, out.items, {}, LineMark.idLessThan);
+        return out.items;
+    }
+
+    /// Fills the scratch with the text chunks of line `row`, with line-relative bytes and columns.
+    fn collectLineChunks(self: *Self, row: u32) TextBufferError!void {
+        const chunks = &self.span_scratch.chunks;
+        chunks.clearRetainingCapacity();
+        const start = iter_mod.lineStart(&self._rope, row) orelse return;
+        const Walk = struct {
+            chunks: *std.ArrayListUnmanaged(LineChunk),
+            allocator: Allocator,
+            byte: u32 = 0,
+            col: u32 = 0,
+
+            fn visit(ctx: *anyopaque, segment: *const Segment, _: u32) UnifiedRope.Node.WalkerResult {
+                const walk: *@This() = @ptrCast(@alignCast(ctx));
+                if (segment.isBreak()) return .{ .keep_walking = false };
+                const chunk = segment.asText() orelse return .{};
+                walk.chunks.append(walk.allocator, .{ .chunk = chunk, .start_byte = walk.byte, .start_col = walk.col }) catch |err| return .{ .err = err };
+                walk.byte += chunk.byte_end - chunk.byte_start;
+                walk.col += chunk.width_cols;
+                return .{};
+            }
+        };
+        var walk: Walk = .{ .chunks = chunks, .allocator = self.global_allocator };
+        self._rope.walk_from(start.leaf_index + 1, &walk, Walk.visit) catch |err| return @as(TextBufferError, @errorCast(err));
+    }
+
+    /// Columns of rising line-relative bytes, within one line's chunks.
+    const ColumnCursor = struct {
+        buffer: *const Self,
+        chunks: []const LineChunk,
+        index: usize = 0,
+        width: ?utf8.TextWidthCursor = null,
+
+        fn colAt(self: *ColumnCursor, byte: u32) u32 {
+            while (self.index < self.chunks.len) {
+                const current = self.chunks[self.index];
+                if (byte < current.start_byte + current.chunk.byte_end - current.chunk.byte_start) break;
+                self.index += 1;
+                self.width = null;
+            }
+            if (self.index == self.chunks.len) {
+                if (self.chunks.len == 0) return 0;
+                const last = self.chunks[self.chunks.len - 1];
+                return last.start_col + last.chunk.width_cols;
+            }
+            const current = self.chunks[self.index];
+            if (byte <= current.start_byte) return current.start_col;
+            if (self.width == null) self.width = .{
+                .text = current.chunk.getBytes(&self.buffer.mem_registry),
+                .tab_width = self.buffer.tab_width,
+                .control_display = self.buffer.control_display,
+                .width_method = self.buffer.width_method,
+            };
+            return current.start_col + self.width.?.advanceTo(byte - current.start_byte);
+        }
+    };
+
+    /// Replaces layer `layer_id` inside `[start_byte, end_byte)` with `runs`, in bytes of the text
+    /// as `getPlainText` returns it. Runs must name live group sets and lie on UTF-8 boundaries
+    /// inside the text, and the range ends inside the text must too, since the runs it cuts keep
+    /// their outside parts; see `highlight-layers.zig` for the rest. Rejection changes nothing.
+    pub fn setLayer(self: *Self, layer_id: u32, start_byte: u32, end_byte: u32, runs: []const LayerRun) TextBufferError!void {
+        return self.setLayerWithSpare(layer_id, start_byte, end_byte, runs, null);
+    }
+
+    /// Storage for layer `layer_id` after a set of `run_count` runs: with it, `setLayerWithSpare`
+    /// needs no memory (Markdown writes reserve it before they change the text).
+    pub fn reserveLayer(self: *Self, layer_id: u32, run_count: usize) TextBufferError!std.ArrayListUnmanaged(LayerRun) {
+        var spare: std.ArrayListUnmanaged(LayerRun) = .empty;
+        spare.ensureTotalCapacity(self.global_allocator, run_count + self.layers.runsOf(layer_id).len + 2) catch return TextBufferError.OutOfMemory;
+        return spare;
+    }
+
+    pub fn freeLayerSpare(self: *Self, spare: *std.ArrayListUnmanaged(LayerRun)) void {
+        spare.deinit(self.global_allocator);
+    }
+
+    pub fn setLayerWithSpare(self: *Self, layer_id: u32, start_byte: u32, end_byte: u32, runs: []const LayerRun, spare: ?*std.ArrayListUnmanaged(LayerRun)) TextBufferError!void {
+        const sets = self.group_sets orelse return TextBufferError.InvalidId;
+        const byte_count = self.getByteSize();
+        for ([_]u32{ start_byte, end_byte }) |edge| {
+            if (edge < byte_count and !self.isCharBoundary(edge)) return TextBufferError.InvalidIndex;
+        }
+        // A run the layer already holds lies on boundaries, so setting a layer again seeks only
+        // the edges that changed.
+        const old = self.layers.runsOf(layer_id);
+        var held = hl.Layers.firstEndingAfter(old, start_byte);
+        for (runs) |run| {
+            if (run.group_set == 0 or run.group_set > sets.count()) return TextBufferError.InvalidId;
+            if (run.end_byte > byte_count) return TextBufferError.InvalidIndex;
+            while (held < old.len and old[held].end_byte <= run.start_byte) : (text_work.add(.layer_runs_walked, 1)) held += 1;
+            if (held < old.len and old[held].start_byte == run.start_byte and old[held].end_byte == run.end_byte) continue;
+            text_work.add(.layer_run_seeks, 1);
+            if (!self.isCharBoundary(run.start_byte) or !self.isCharBoundary(run.end_byte)) return TextBufferError.InvalidIndex;
+        }
+        const changed = self.layers.setWithSpare(self.global_allocator, self.link_pool, layer_id, start_byte, end_byte, runs, spare) catch |err| return switch (err) {
+            error.OutOfMemory => TextBufferError.OutOfMemory,
+            error.InvalidIndex => TextBufferError.InvalidIndex,
+            error.InvalidId => TextBufferError.InvalidId,
+            error.LayerLimit => TextBufferError.LayerLimit,
+            error.GroupSetLimit => unreachable,
+        };
+        self.assertLayerBoundaries();
+        if (changed) self.span_generation += 1;
+    }
+
+    /// Every layer run starts and ends on a code point boundary inside the text. Debug builds check
+    /// it after each layer change and edit.
+    pub fn assertLayerBoundaries(self: *const Self) void {
+        if (!std.debug.runtime_safety) return;
+        const byte_count = self.getByteSize();
+        for (self.layers.slice()) |layer| for (layer.runs.items) |run| {
+            std.debug.assert(run.end_byte <= byte_count);
+            std.debug.assert(self.isCharBoundary(run.start_byte) and self.isCharBoundary(run.end_byte));
+        };
+    }
+
+    /// Every edit mark lies inside the text, on code point boundaries, in order. Debug builds check
+    /// it after each mark change and edit.
+    pub fn assertMarks(self: *const Self) void {
+        if (!std.debug.runtime_safety) return;
+        edit_marks.assertValid(self._rope.aux, self.getByteSize());
+        for (self.marks()) |mark| std.debug.assert(self.isCharBoundary(mark.start_byte) and self.isCharBoundary(mark.end_byte));
+    }
+
+    /// Whether text byte `byte` starts a code point, a line break, or the end of the text.
+    fn isCharBoundary(self: *const Self, byte: u32) bool {
+        const found = self._rope.seekKey(iter_mod.textBytes, byte) orelse return byte == self.getByteSize();
+        const chunk = found.leaf.asText() orelse return true;
+        return chunk.getBytes(&self.mem_registry)[byte - found.before] & 0xC0 != 0x80;
+    }
+
+    /// Text bytes before rope weight `weight` (cells plus one per break), where an editor edit at
+    /// that weight away from a line start splits the text: after zero-width text, and after a
+    /// whole grapheme. Matches `EditBuffer.splitChunkAtWeight`.
+    pub fn byteOffsetAtWeight(self: *const Self, weight: u32) u32 {
+        return self.byteAtCell(weight, false);
+    }
+
+    /// Grapheme queries keep a wcwidth ZWJ cluster whole even when cursor motion steps through it.
+    pub fn byteAtCell(self: *const Self, weight: u32, comptime whole_grapheme: bool) u32 {
+        const found = self._rope.findByWeight(weight) orelse return self.getByteSize();
+        const before = (self._rope.seekCountSum(iter_mod.leafCount, iter_mod.textBytes, found.leaf_index) orelse unreachable).sum;
+        const chunk = found.leaf.asText() orelse return before;
+        const target_col = weight - found.start_weight;
+        if (!whole_grapheme and target_col == 0) return before;
+        const ascii_only = (chunk.flags & TextChunk.Flags.ASCII_ONLY) != 0;
+        const find = if (whole_grapheme) utf8.findGraphemePosByWidth else utf8.findPosByWidth;
+        const split = find(chunk.getBytes(&self.mem_registry), target_col, self.tab_width, self.control_display, ascii_only, false, self.width_method);
+        return before + split.byte_offset;
+    }
+
+    /// The rope indexes bytes and cells, not UTF-16. Scan just the requested prefix without
+    /// flattening the document. `to_byte` rounds a split surrogate pair down to its scalar.
+    pub fn convertUtf16(self: *const Self, index: u32, comptime to_byte: bool) u32 {
+        const Walk = struct {
+            buffer: *const Self,
+            remaining: u32,
+            result: u32 = 0,
+
+            fn visit(ctx: *anyopaque, segment: *const Segment, _: u32) UnifiedRope.Node.WalkerResult {
+                const walk: *@This() = @ptrCast(@alignCast(ctx));
+                if (segment.asText()) |chunk| {
+                    const bytes = chunk.getBytes(&walk.buffer.mem_registry);
+                    if (chunk.isAsciiOnly()) {
+                        const n = @min(bytes.len, walk.remaining);
+                        walk.remaining -= n;
+                        walk.result += n;
+                    } else {
+                        var i: usize = 0;
+                        while (i < bytes.len and walk.remaining > 0) {
+                            const scalar = utf8.decodeUtf8Unchecked(bytes, i);
+                            const units: u32 = if (scalar.len == 4) 2 else 1;
+                            const take = if (to_byte) units else scalar.len;
+                            if (walk.remaining < take) return .{ .keep_walking = false };
+                            walk.remaining -= take;
+                            walk.result += if (to_byte) scalar.len else units;
+                            i += scalar.len;
+                        }
+                    }
+                } else if (segment.isBreak() and walk.remaining != 0) {
+                    walk.remaining -= 1;
+                    walk.result += 1;
+                }
+                return .{ .keep_walking = walk.remaining != 0 };
+            }
+        };
+        var walk: Walk = .{ .buffer = self, .remaining = index };
+        self._rope.walk(&walk, Walk.visit) catch unreachable;
+        return walk.result;
+    }
+
+    /// The cursor offset at text byte `byte`: the weight before it, where a byte inside a grapheme
+    /// rounds to the grapheme's end, or its start with `round_down`. The inverse of
+    /// `byteOffsetAtWeight` on cursor stops.
+    pub fn weightAtByte(self: *const Self, byte: u32, round_down: bool) u32 {
+        const found = self._rope.seekKey(iter_mod.textBytes, byte) orelse return self._rope.totalWeight();
+        const before = (self._rope.seekCountSum(iter_mod.leafCount, iter_mod.weight, found.leaf_index) orelse unreachable).sum;
+        // A break's byte is the end of its line.
+        const chunk = found.leaf.asText() orelse return before;
+        const target = byte - found.before;
+        var cursor: utf8.TextWidthCursor = .{
+            .text = chunk.getBytes(&self.mem_registry),
+            .tab_width = self.tab_width,
+            .control_display = self.control_display,
+            .width_method = self.width_method,
+        };
+        // Each one-byte advance takes at least one whole grapheme.
+        var columns_before: u32 = 0;
+        while (cursor.byte_offset < target) {
+            columns_before = cursor.columns;
+            _ = cursor.advanceTo(cursor.byte_offset + 1);
+        }
+        return before + if (round_down and cursor.byte_offset > target) columns_before else cursor.columns;
+    }
+
+    /// The text byte where an edit at cursor offset `offset` starts: a line start's first byte, or
+    /// where `byteOffsetAtWeight` splits the text elsewhere.
+    pub fn byteAtOffset(self: *const Self, offset: u32) u32 {
+        const coords = iter_mod.offsetToCoords(&self._rope, @min(offset, self._rope.totalWeight())).?;
+        return if (coords.col == 0) self.lineStartByte(coords.row) else self.byteOffsetAtWeight(offset);
+    }
+
+    /// The text byte where line `row` starts.
+    pub fn lineStartByte(self: *const Self, row: u32) u32 {
+        return iter_mod.lineStartByte(&self._rope, row) orelse unreachable;
+    }
+
+    /// Empties the layers, as every whole-text change does. Its callers advance the span stamp.
+    fn resetLayers(self: *Self) void {
+        self.layers.reset(self.global_allocator, self.link_pool);
     }
 
     /// Add highlight by row/col coordinates
@@ -1529,11 +2095,8 @@ pub const UnifiedTextBuffer = struct {
             return;
         }
 
-        var additions: std.ArrayListUnmanaged(HighlightAddition) = .empty;
-        defer {
-            for (additions.items) |*addition| addition.deinit(self.global_allocator);
-            additions.deinit(self.global_allocator);
-        }
+        var additions: std.ArrayListUnmanaged(LineHighlight) = .empty;
+        defer additions.deinit(self.global_allocator);
         // Highlight offsets exclude newlines, unlike rope weights and offsetToCoords.
         // Seek by line end so empty lines at the starting boundary are skipped too.
         const first_row = iter_mod.firstLineEndingAfter(&self._rope, char_start);
@@ -1541,7 +2104,7 @@ pub const UnifiedTextBuffer = struct {
         // One walk over the covered leaves: each break ends a line.
         const Walk = struct {
             buffer: *Self,
-            additions: *std.ArrayListUnmanaged(HighlightAddition),
+            additions: *std.ArrayListUnmanaged(LineHighlight),
             highlight: Highlight,
             char_start: u32,
             char_end: u32,
@@ -1573,8 +2136,7 @@ pub const UnifiedTextBuffer = struct {
                 highlight.col_start = walk.char_start -| line_start;
                 highlight.col_end = @min(walk.char_end - line_start, width);
                 if (highlight.col_start >= highlight.col_end) return;
-                try walk.additions.ensureUnusedCapacity(walk.buffer.global_allocator, 1);
-                walk.additions.appendAssumeCapacity(try walk.buffer.prepareHighlight(walk.row, highlight));
+                try walk.additions.append(walk.buffer.global_allocator, .{ .line_idx = walk.row, .highlight = highlight });
             }
         };
         var walk: Walk = .{
@@ -1589,7 +2151,7 @@ pub const UnifiedTextBuffer = struct {
         };
         self._rope.walk_from(first.leaf_index, &walk, Walk.visit) catch |err| return @as(TextBufferError, @errorCast(err));
         if (!walk.done) try walk.endLine();
-        try self.commitHighlights(additions.items);
+        try self.appendHighlights(additions.items);
     }
 
     /// Remove all highlights with a specific reference ID
@@ -1597,84 +2159,48 @@ pub const UnifiedTextBuffer = struct {
         self.removeHighlightsByRefChecked(hl_ref) catch {};
     }
 
+    /// Filters in place, so it cannot fail; the error union keeps the checked call sites.
     pub fn removeHighlightsByRefChecked(self: *Self, hl_ref: u16) TextBufferError!void {
-        const Removal = struct {
-            line_idx: usize,
-            spans: std.ArrayListUnmanaged(StyleSpan) = .empty,
-        };
-        var removals: std.ArrayListUnmanaged(Removal) = .empty;
-        defer {
-            for (removals.items) |*removal| removal.spans.deinit(self.global_allocator);
-            removals.deinit(self.global_allocator);
-        }
-        var retained: std.ArrayListUnmanaged(Highlight) = .empty;
-        defer retained.deinit(self.global_allocator);
-
-        for (self.line_highlights.items, 0..) |hl_list, line_idx| {
-            for (hl_list.items) |hl| {
-                if (hl.hl_ref == hl_ref) break;
-            } else continue;
-
-            try removals.append(self.global_allocator, .{ .line_idx = line_idx });
-            if (self.highlight_batch_depth == 0) {
-                retained.clearRetainingCapacity();
-                for (hl_list.items) |hl| {
-                    if (hl.hl_ref != hl_ref) try retained.append(self.global_allocator, hl);
-                }
-                try self.buildLineSpans(retained.items, &removals.items[removals.items.len - 1].spans);
-            }
-        }
-        if (self.highlight_batch_depth > 0) {
-            try self.dirty_span_lines.ensureUnusedCapacity(@intCast(removals.items.len));
-        }
-
-        // All affected spans and dirty-line slots are ready before any highlight is removed.
-        for (removals.items) |*removal| {
-            const hl_list = &self.line_highlights.items[removal.line_idx];
+        var removed = false;
+        for (self.line_highlights.items) |*hl_list| {
             var kept: usize = 0;
-            for (hl_list.items) |hl| {
-                if (hl.hl_ref == hl_ref) {
-                    if (hl.internal and self.internal_highlight_count > 0) {
+            for (hl_list.items) |record| {
+                if (record.hl_ref == hl_ref) {
+                    if (record.internal and self.internal_highlight_count > 0) {
                         self.internal_highlight_count -= 1;
                     }
+                    removed = true;
                     continue;
                 }
-                hl_list.items[kept] = hl;
+                hl_list.items[kept] = record;
                 kept += 1;
             }
             hl_list.items.len = kept;
-            if (self.highlight_batch_depth == 0) {
-                std.mem.swap(@TypeOf(removal.spans), &self.line_spans.items[removal.line_idx], &removal.spans);
-            } else {
-                self.dirty_span_lines.putAssumeCapacity(removal.line_idx, {});
-            }
         }
+        if (removed) self.span_generation += 1;
     }
 
     /// Clear all highlights from a specific line
     pub fn clearLineHighlights(self: *Self, line_idx: usize) void {
         if (line_idx < self.line_highlights.items.len) {
-            for (self.line_highlights.items[line_idx].items) |hl| {
-                if (hl.internal and self.internal_highlight_count > 0) {
+            for (self.line_highlights.items[line_idx].items) |record| {
+                if (record.internal and self.internal_highlight_count > 0) {
                     self.internal_highlight_count -= 1;
                 }
             }
             self.line_highlights.items[line_idx].clearRetainingCapacity();
         }
-        if (line_idx < self.line_spans.items.len) {
-            self.line_spans.items[line_idx].clearRetainingCapacity();
-        }
+        self.span_generation += 1;
     }
 
-    /// Clear all highlights
+    /// Clear all highlights, the layers included (`CLEAR_ALL`).
     pub fn clearAllHighlights(self: *Self) void {
         for (self.line_highlights.items) |*hl_list| {
             hl_list.clearRetainingCapacity();
         }
         self.internal_highlight_count = 0;
-        for (self.line_spans.items) |*span_list| {
-            span_list.clearRetainingCapacity();
-        }
+        self.resetLayers();
+        self.span_generation += 1;
     }
 
     /// Get highlights for a specific line
@@ -1739,10 +2265,155 @@ pub const UnifiedTextBuffer = struct {
         const new_width = effectiveTabWidth(width);
         if (self.tab_width == new_width) return;
         self.tab_width = new_width;
-        self.tab_metrics_generation +%= 1;
+        self.metrics_generation +%= 1;
 
-        self.refreshTabWidthMetrics();
+        self.refreshMetrics();
         self.markAllViewsDirty();
+    }
+
+    /// Measure the text with another `method` from now on, like a tab-width change. Grapheme
+    /// breaks differ only under `no_zwj`, so the chunks' boundaries stay valid without it.
+    pub fn setWidthMethod(self: *Self, method: utf8.WidthMethod) void {
+        std.debug.assert(method != .no_zwj and self.width_method != method);
+        // NO_ZWJ breaks graphemes at every joiner, so its chunk boundaries may cut other methods' graphemes.
+        if (self.width_method == .no_zwj) return;
+        // Styled runs are columns: they pass through the bytes they cover, measured before and after.
+        self.moveStyledRuns(true);
+        self.width_method = method;
+        self.metrics_generation +%= 1;
+        self.width_method_generation = self.metrics_generation;
+
+        self.refreshMetrics();
+        self.moveStyledRuns(false);
+        self.markAllViewsDirty();
+    }
+
+    /// Turns the styled-text runs' line columns into line bytes, or back, as the line measures now. Legacy
+    /// highlight records stay in columns, as a tab-width change leaves them.
+    fn moveStyledRuns(self: *Self, comptime to_bytes: bool) void {
+        if (self.internal_highlight_count == 0) return;
+        for (self.line_highlights.items, 0..) |line, row| {
+            self.convertLineEnds(@intCast(row), line.items, .start, to_bytes);
+            self.convertLineEnds(@intCast(row), line.items, .end, to_bytes);
+        }
+    }
+
+    /// Converts one end of line `row`'s styled runs, in record order. Runs are made in order, so each walk measures
+    /// from the previous end and the line costs one pass; an end before the previous one starts a new walk.
+    fn convertLineEnds(self: *Self, row: u32, records: []Highlight, comptime end: enum { start, end }, comptime to_bytes: bool) void {
+        const start = iter_mod.lineStart(&self._rope, row) orelse return;
+        const Walk = struct {
+            buffer: *Self,
+            records: []Highlight,
+            next: usize,
+            last: u32 = 0,
+            // Where the line's measured prefix ends: chunk start, and the offset within the chunk.
+            byte: u32 = 0,
+            col: u32 = 0,
+            in_byte: u32 = 0,
+            in_col: u32 = 0,
+
+            fn field(record: *Highlight) *u32 {
+                return if (end == .start) &record.col_start else &record.col_end;
+            }
+
+            /// The next styled end to convert, or null once all are done. Stops at an end before the last.
+            fn pending(walk: *@This()) ?*u32 {
+                while (walk.next < walk.records.len and !walk.records[walk.next].internal) walk.next += 1;
+                if (walk.next == walk.records.len) return null;
+                const value = field(&walk.records[walk.next]);
+                return if (value.* < walk.last) null else value;
+            }
+
+            fn visit(ctx: *anyopaque, segment: *const Segment, _: u32) UnifiedRope.Node.WalkerResult {
+                const walk: *@This() = @ptrCast(@alignCast(ctx));
+                if (segment.isBreak()) return .{ .keep_walking = false };
+                const chunk = segment.asText() orelse return .{};
+                const text = walk.buffer;
+                const bytes = chunk.getBytes(&text.mem_registry);
+                const ascii = chunk.isAsciiOnly();
+                while (walk.pending()) |value| {
+                    walk.last = value.*;
+                    if (to_bytes) {
+                        if (value.* > walk.col + chunk.width_cols) break;
+                        const found = utf8.findPosByWidth(bytes[walk.in_byte..], value.* - walk.col - walk.in_col, text.tab_width, text.control_display, ascii, false, text.width_method);
+                        text.countRunBytes(found.byte_offset);
+                        walk.in_byte += found.byte_offset;
+                        walk.in_col += found.columns_used;
+                        value.* = walk.byte + walk.in_byte;
+                    } else {
+                        if (value.* > walk.byte + bytes.len) break;
+                        const part = bytes[walk.in_byte .. value.* - walk.byte];
+                        text.countRunBytes(part.len);
+                        walk.in_col += utf8.calculateTextWidth(part, text.tab_width, text.control_display, ascii, text.width_method);
+                        walk.in_byte = value.* - walk.byte;
+                        value.* = walk.col + walk.in_col;
+                    }
+                    walk.next += 1;
+                } else return .{ .keep_walking = false };
+                text.countRunBytes(bytes.len - walk.in_byte);
+                walk.byte += @intCast(bytes.len);
+                walk.col += chunk.width_cols;
+                walk.in_byte = 0;
+                walk.in_col = 0;
+                return .{};
+            }
+        };
+        var next: usize = 0;
+        while (true) {
+            var walk: Walk = .{ .buffer = self, .records = records, .next = next };
+            if (walk.pending() == null) break;
+            self._rope.walk_from(start.leaf_index + 1, &walk, Walk.visit) catch {};
+            // Ends past the line's last chunk name its end.
+            while (walk.pending()) |value| : (walk.next += 1) {
+                walk.last = value.*;
+                value.* = if (to_bytes) walk.byte else walk.col;
+            }
+            next = walk.next;
+        }
+    }
+
+    inline fn countRunBytes(self: *Self, count: usize) void {
+        if (builtin.is_test) self.run_bytes_measured += count;
+    }
+
+    /// The byte that cell `offset` named while the text measured with `method`, which it no longer does.
+    pub fn byteAtOffsetUnder(self: *const Self, offset: u32, method: utf8.WidthMethod) u32 {
+        const Find = struct {
+            buffer: *const Self,
+            method: utf8.WidthMethod,
+            offset: u32,
+            weight: u32 = 0,
+            byte: u32 = 0,
+            found: ?u32 = null,
+
+            fn visit(ctx_ptr: *anyopaque, segment: *const Segment, _: u32) UnifiedRope.Node.WalkerResult {
+                const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
+                const text = ctx.buffer;
+                if (segment.asText()) |chunk| {
+                    const bytes = chunk.getBytes(&text.mem_registry);
+                    const width = utf8.calculateTextWidth(bytes, text.tab_width, text.control_display, chunk.isAsciiOnly(), ctx.method);
+                    if (ctx.offset <= ctx.weight + width) {
+                        ctx.found = ctx.byte + @as(u32, @intCast(utf8.findPosByWidth(bytes, ctx.offset - ctx.weight, text.tab_width, text.control_display, chunk.isAsciiOnly(), false, ctx.method).byte_offset));
+                        return .{ .keep_walking = false };
+                    }
+                    ctx.weight += width;
+                    ctx.byte += @intCast(bytes.len);
+                } else if (segment.isBreak()) {
+                    // A break weighs one cell and one byte, as in `weightAtByte`.
+                    if (ctx.offset == ctx.weight) {
+                        ctx.found = ctx.byte;
+                        return .{ .keep_walking = false };
+                    }
+                    ctx.weight += 1;
+                    ctx.byte += 1;
+                }
+                return .{};
+            }
+        };
+        var find: Find = .{ .buffer = self, .method = method, .offset = offset };
+        self._rope.walk(&find, Find.visit) catch {};
+        return find.found orelse find.byte;
     }
 
     pub fn effectiveTabWidth(width: u8) u8 {
@@ -1756,26 +2427,30 @@ pub const UnifiedTextBuffer = struct {
         if (self.getByteSize() > (std.math.maxInt(u32) - 1) / @as(u32, effectiveTabWidth(width))) return error.TextLimit;
     }
 
-    /// Bring the active persistent root to the current tab-width generation.
+    /// Bring the active persistent root to the current metrics generation.
     /// Widths and branch aggregates are derived state, so this deliberately
     /// updates shared const nodes; stale history roots are repaired when restored.
-    fn refreshTabWidthMetrics(self: *Self) void {
-        if (self._rope.metricsGeneration() == self.tab_metrics_generation) return;
+    fn refreshMetrics(self: *Self) void {
+        const generation = self._rope.metricsGeneration();
+        if (generation == self.metrics_generation) return;
+        // ASCII widths are the same under every method; other text changes with it.
+        const method_stale = generation < self.width_method_generation;
 
         // Tab presence is content-derived, so even a stale persistent root can
         // use this aggregate to prove that its widths remain valid.
-        if (!self._rope.root.metrics().custom.has_tabs) {
-            self._rope.setMetricsGeneration(self.tab_metrics_generation);
+        if (!method_stale and !self._rope.root.metrics().custom.has_tabs) {
+            self._rope.setMetricsGeneration(self.metrics_generation);
             return;
         }
 
         const RefreshContext = struct {
             buffer: *Self,
+            method_stale: bool,
 
             fn refresh(ctx_ptr: *anyopaque, segment: *const Segment, _: u32) UnifiedRope.Node.WalkerResult {
                 const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
                 if (segment.asText()) |chunk| {
-                    if (!chunk.hasTab()) return .{};
+                    if (!chunk.hasTab() and !(ctx.method_stale and !chunk.isAsciiOnly())) return .{};
                     const mutable = @constCast(chunk);
                     const bytes = chunk.getBytes(&ctx.buffer.mem_registry);
                     mutable.width_cols = utf8.calculateTextWidth(
@@ -1789,10 +2464,10 @@ pub const UnifiedTextBuffer = struct {
                 return .{};
             }
         };
-        var refresh_ctx: RefreshContext = .{ .buffer = self };
+        var refresh_ctx: RefreshContext = .{ .buffer = self, .method_stale = method_stale };
         self._rope.walk(&refresh_ctx, RefreshContext.refresh) catch {};
         self._rope.remeasure();
-        self._rope.setMetricsGeneration(self.tab_metrics_generation);
+        self._rope.setMetricsGeneration(self.metrics_generation);
     }
 
     /// Debug log the rope structure using rope.toText

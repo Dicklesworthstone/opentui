@@ -7,15 +7,16 @@
 <div align="center">
     <a href="https://www.npmjs.com/package/@opentui/core"><img alt="npm version" src="https://img.shields.io/npm/v/@opentui/core?style=flat-square" /></a>
     <a href="https://github.com/anomalyco/opentui/actions/workflows/build-core.yml"><img alt="Core build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opentui/build-core.yml?style=flat-square&branch=main" /></a>
+    <a href="https://opencode.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="https://opencode.ai/brand/badges/opencode-built-with-g-dark-20.svg"><img alt="Built with OpenCode" src="https://opencode.ai/brand/badges/opencode-built-with-g-light-20.svg" height="20" /></picture></a>
 </div>
 
 OpenTUI is a library to build terminal user interfaces.
 
-- It is written in Zig.
-- You write TypeScript directly or through React and Solid.
+- It is written in Zig, with a C API.
+- You write Rust, TypeScript, React, or Solid.
 - You arrange boxes and text with flexbox.
 - You add selects, inputs, and scroll boxes with keyboard and mouse controls.
-- You can play sounds, show images, play videos, and render 3D graphics.
+- You can play videos and sounds, show images, and render 3D graphics.
 
 OpenCode uses OpenTUI in production for millions of users.
 
@@ -30,13 +31,15 @@ OpenCode uses OpenTUI in production for millions of users.
 - [`@opentui/qrcode`](packages/qrcode) - QR code encoder and renderable with React and Solid surfaces.
 - [`@opentui/three`](packages/three) - Three.js WebGPU renderer for OpenTUI.
 - [`@opentui/ssh`](packages/ssh) - SSH server integration for OpenTUI applications.
+- [`packages/rust`](packages/rust) - Rust crates: a terminal UI framework on the native renderer, its C ABI bindings,
+  and SSH serving. Depend on them through Git at a release tag and link that release's native archive; see the
+  [Rust guide](https://opentui.com/docs/bindings/rust).
 
 **Private packages**
 
 - [`@opentui/native`](packages/native) - Private workspace with the Zig implementation, native tests, and benchmarks.
 - [`@opentui/examples`](packages/examples) - Private workspace with example applications and a standalone examples executable.
 - [`@opentui/web`](packages/web) - Private workspace with the documentation website and the AI agent skill.
-- [`packages/rust`](packages/rust) - Unpublished Rust bindings for the native C ABI and a framework built on them.
 
 ## AI agent skill
 
@@ -52,7 +55,7 @@ new release. Install from `https://opentui.com/docs/next` to follow the main bra
 
 ## Development
 
-Development requires Bun 1.4.1 or later and Zig 0.17.0.
+Development requires Bun 1.4.1 or later and Zig 0.17.1.
 
 See [AGENTS.md](AGENTS.md) for engineering, tooling, and verification conventions.
 

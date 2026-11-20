@@ -9,12 +9,17 @@ import {
 } from "../renderer.js"
 import { NativeSession } from "../NativeSession.js"
 import { BoxRenderable } from "../renderables/Box.js"
+import { CodeRenderable } from "../renderables/Code.js"
 import { ImageRenderable } from "../renderables/Image.js"
 import { MarkdownRenderable } from "../renderables/Markdown.js"
 import { TextRenderable } from "../renderables/Text.js"
-import { link, t } from "../lib/styled-text.js"
+import { TextareaRenderable } from "../renderables/Textarea.js"
+import { TextTableRenderable } from "../renderables/TextTable.js"
+import { fg, link, t } from "../lib/styled-text.js"
+import { RGBA } from "../lib/RGBA.js"
+import { Selection } from "../lib/selection.js"
 import { SyntaxStyle } from "../syntax-style.js"
-import { forceRenderStatus, holdOutputIdle, settle, settleUntil } from "../testing/harness.js"
+import { forceRenderStatus, holdOutputIdle, serviceReadyFrames, settleUntil } from "../testing/harness.js"
 import { ManualClock } from "../testing/manual-clock.js"
 import { createTestStdin, RecordingWriteStream } from "../testing/test-streams.js"
 import { NativeSessionRenderStatus } from "../zig.js"
@@ -192,12 +197,17 @@ test("late Ghostty capability detection emits OSC 8 for compact Markdown links",
 })
 
 // OSC 8 carries a target as is, so a control character in it could end the sequence and run another one, here an
-// OSC 52 clipboard write. Such a target gets no hyperlink and its text still draws (Markdown shows the URL, as for
-// other targets native code rejects); UTF-8 targets keep theirs.
+// OSC 52 clipboard write. Such a target gets no hyperlink and its text still draws (a Markdown destination with a
+// control character is no link at all, as CommonMark says, so its source shows); UTF-8 targets keep theirs.
 const injected = "https://example.com/a\x1b]52;c;cHduZWQ=\x07"
 const [euro, city] = ["https://example.com/€", "https://pl.wikipedia.org/wiki/Łódź"]
 for (const [name, markdown, shown, kept] of [
-  ["Markdown link", `[docs](${injected}) [euro](${euro}) [city](${city})`, "docs (https://example.com/a", [euro, city]],
+  [
+    "Markdown link",
+    `[docs](${injected}) [euro](${euro}) [city](${city})`,
+    "[docs](https://example.com/a",
+    [euro, city],
+  ],
   ["bare URL", `see ${injected} or ${euro}`, "see https://example.com/a", [euro]],
   ["link()", null, "docs euro city", [euro, city]],
 ] as const) {
@@ -1514,6 +1524,329 @@ test("Ghostty width profile reaches renderer-owned buffers", async () => {
   }
 })
 
+test("text made before a width-changing reply measures like text made after it", async () => {
+  const rows = [
+    {
+      environment: { TERM: "xterm-256color" },
+      reply: "\x1b[?2027;0$y",
+      from: "unicode",
+      to: "wcwidth",
+      before: 2,
+      cells: 4,
+    },
+    {
+      environment: { TERM: "screen-256color", SSH_CONNECTION: "1 2 3 4" },
+      reply: "\x1bP>|tmux 3.8\x1b\\",
+      from: "wcwidth",
+      to: "unicode",
+      before: 4,
+      cells: 2,
+    },
+  ] as const
+  for (const row of rows) {
+    const stdin = createTestStdin()
+    const renderer = await createCliRenderer({
+      stdin,
+      stdout: createCollectingStdout(80, 60),
+      environment: row.environment,
+    })
+    destroyFns.push(() => renderer.destroy())
+    const make = (content?: string) => {
+      const textarea = new TextareaRenderable(renderer, { width: 10, height: 2 })
+      renderer.root.add(textarea)
+      if (content) textarea.insertText(content)
+      return textarea
+    }
+    const typed = make("\u{1f44d}\u{1f3fd}")
+    const empty = make()
+    // A selection and a mark over "A" stay on it; the selection's line follows a wide one.
+    const selected = make("\u{1f44d}\u{1f3fd}\nABCD")
+    selected.setSelection(row.before + 1, row.before + 2)
+    const marked = make("\u{1f44d}\u{1f3fd}ABCD")
+    const mark = marked.extmarks.create({ start: row.before, end: row.before + 1 })
+    const placeholder = () => {
+      const textarea = new TextareaRenderable(renderer, {
+        width: 3,
+        height: 3,
+        wrapMode: "char",
+        placeholder: "\u{1f44d}\u{1f3fd}x",
+      })
+      renderer.root.add(textarea)
+      return textarea
+    }
+    const hint = placeholder()
+    // Text paints native scene text, Code a shared text buffer.
+    const shrink = new BoxRenderable(renderer, { alignItems: "flex-start" })
+    renderer.root.add(shrink)
+    const text = new TextRenderable(renderer, { content: "\u{1f44d}\u{1f3fd}x", width: "auto" })
+    const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg: "#ffffff" } }, renderer.nativeScene)
+    const code = new CodeRenderable(renderer, { content: "\u{1f44d}\u{1f3fd}x", syntaxStyle, width: "auto" })
+    // Styled runs stay on their characters.
+    const styled = new TextRenderable(renderer, {
+      content: t`${fg("#ff0000")("\u{1f44d}\u{1f3fd}")}${fg("#00ff00")("AB")}${fg("#0000ff")("CD")}`,
+      width: "auto",
+    })
+    // Finished drags over "AB" in Text and Code: a colour change restyles them on screen, on the same text.
+    const recolored = [
+      new TextRenderable(renderer, { content: "\u{1f44d}\u{1f3fd}ABCD", width: "auto", selectionBg: "#0000ff" }),
+      new CodeRenderable(renderer, {
+        content: "\u{1f44d}\u{1f3fd}ABCD",
+        syntaxStyle,
+        width: "auto",
+        selectionBg: "#0000ff",
+      }),
+    ]
+    for (const widget of [text, code, styled, ...recolored]) shrink.add(widget)
+    // A press between the emoji's code points under wcwidth, without a drag, selects nothing.
+    const pressed = make("\u{1f44d}\u{1f3fd}ABCD")
+    await renderer.idle()
+    for (const widget of recolored) {
+      const selection = new Selection(
+        widget,
+        { x: widget.x + row.before, y: widget.y },
+        { x: widget.x + row.before, y: widget.y },
+      )
+      selection.isStart = true
+      widget.onSelectionChanged(selection)
+      selection.isStart = false
+      selection.focus = { x: widget.x + row.before + 1, y: widget.y }
+      selection.isDragging = false
+      widget.onSelectionChanged(selection)
+    }
+    renderer.startSelection(pressed, pressed.x + 2, pressed.y)
+    const selections = () => [
+      selected.getSelectedText(),
+      ...recolored.map((widget) => widget.getSelectedText()),
+      pressed.getSelectedText(),
+      renderer.getSelection()?.getSelectedText() ?? "",
+    ]
+    // The text of a widget's row painted with a colour, as a foreground or a background.
+    const painted = (widget: { y: number }, color: string, layer: "fg" | "bg") =>
+      renderer.currentRenderBuffer
+        .getSpanLines()
+        [widget.y].spans.filter((span) => span[layer].equals(RGBA.fromHex(color)))
+        .map((span) => span.text)
+        .join("")
+    // Tables draw their cells outside the scene: they re-measure them in place, styled runs and selections included.
+    const tables = new BoxRenderable(renderer, { alignItems: "flex-start" })
+    renderer.root.add(tables)
+    const cell = (...chunks: [string, string?][]) => [
+      [
+        chunks.map(([text, color]) => ({
+          __isChunk: true as const,
+          text,
+          fg: color ? RGBA.fromHex(color) : undefined,
+        })),
+      ],
+    ]
+    const table = (content = cell(["\u{1f44d}\u{1f3fd}x"])) => {
+      const value = new TextTableRenderable(renderer, {
+        content,
+        border: false,
+        outerBorder: false,
+        columnWidthMode: "content",
+      })
+      tables.add(value)
+      return value
+    }
+    const early = table()
+    // Updated while the reply is handled; its lifecycle pass saved and decorated; one adopted with defineProperty.
+    const [updated, saved, adopted, cleared] = [table(), table(), table(), table()]
+    renderer.once(CliRenderEvents.CAPABILITIES, () => {
+      updated.content = cell(["\u{1f44d}\u{1f3fd}y"])
+    })
+    const calls = { saved: 0, adopted: 0 }
+    const previous = saved.onLifecyclePass
+    saved.onLifecyclePass = function () {
+      calls.saved++
+      previous?.call(this)
+    }
+    // Defined on the mounted table, it runs only once refreshHooks() adopts it.
+    await renderer.idle()
+    Object.defineProperty(adopted, "onLifecyclePass", {
+      value: () => calls.adopted++,
+      writable: true,
+      configurable: true,
+    })
+    adopted.requestRender()
+    await renderer.idle()
+    expect(calls.adopted).toBe(0)
+    adopted.refreshHooks()
+    // A caller's hook set and cleared again leaves the table's own pass in place.
+    cleared.onLifecyclePass = () => {}
+    cleared.onLifecyclePass = null
+    const colored = table(cell(["\u{1f44d}\u{1f3fd}", "#ff0000"], ["AB", "#00ff00"], ["CD", "#0000ff"]))
+    // A finished drag over "AB", and a press on "A" held across the reply.
+    // The held table's second cell starts where its first ends: narrowing moves the press's old column into it.
+    const dragged = table(cell(["\u{1f44d}\u{1f3fd}ABCD"]))
+    const firstSeen: unknown[] = []
+    dragged.onLifecyclePass = () => {
+      if (renderer.widthMethod === row.to && firstSeen.length === 0) firstSeen.push(dragged.getSelection())
+    }
+    const restyled = table(cell(["\u{1f44d}\u{1f3fd}", "#ff0000"], ["AB", "#00ff00"], ["CD", "#0000ff"]))
+    // Restyled while the reply is handled, before the table follows the new method.
+    const restyledInReply = table(cell(["\u{1f44d}\u{1f3fd}", "#ff0000"], ["AB", "#00ff00"], ["CD", "#0000ff"]))
+    renderer.once(CliRenderEvents.CAPABILITIES, () => {
+      restyledInReply.content = cell(["\u{1f44d}\u{1f3fd}", "#0000ff"], ["AB", "#ff0000"], ["CD", "#00ff00"])
+    })
+    const held = table([[cell(["q\u{1f44d}\u{1f3fd}A"])[0][0], cell(["BC"])[0][0]]])
+    // Pressed on "A" on the second line of its cell.
+    const tall = table(cell(["x\nq\u{1f44d}\u{1f3fd}A"]))
+    // Pressed on "A" and dragged into its second cell before the reply.
+    const leaving = table([[cell(["q\u{1f44d}\u{1f3fd}A"])[0][0], cell(["BC"])[0][0]]])
+    await renderer.idle()
+    const left = new Selection(
+      leaving,
+      { x: leaving.x + 1 + row.before, y: leaving.y },
+      { x: leaving.x + 1 + row.before, y: leaving.y },
+    )
+    left.isStart = true
+    leaving.onSelectionChanged(left)
+    const tallPress = new Selection(
+      tall,
+      { x: tall.x + 1 + row.before, y: tall.y + 1 },
+      { x: tall.x + 1 + row.before, y: tall.y + 1 },
+    )
+    tallPress.isStart = true
+    tall.onSelectionChanged(tallPress)
+    left.isStart = false
+    left.focus = { x: leaving.x + 2 + row.before, y: leaving.y }
+    leaving.onSelectionChanged(left)
+    const press = new Selection(
+      held,
+      { x: held.x + 1 + row.before, y: held.y },
+      { x: held.x + 1 + row.before, y: held.y },
+    )
+    press.isStart = true
+    held.onSelectionChanged(press)
+    for (const target of [dragged, restyled, restyledInReply]) {
+      const drag = new Selection(
+        target,
+        { x: target.x + row.before, y: target.y },
+        { x: target.x + row.before, y: target.y },
+      )
+      drag.isStart = true
+      target.onSelectionChanged(drag)
+      drag.isStart = false
+      drag.focus = { x: target.x + row.before + 1, y: target.y }
+      drag.isDragging = false
+      target.onSelectionChanged(drag)
+    }
+    expect([previous, dragged.getSelectedText(), restyled.getSelectedText(), held.getSelectedText()]).toEqual([
+      null,
+      "AB",
+      "AB",
+      "",
+    ])
+    expect(renderer.widthMethod).toBe(row.from)
+    expect(selections()).toEqual(["A", "AB", "AB", "", ""])
+    stdin.emit("data", Buffer.from(row.reply))
+    await settleUntil(() => renderer.widthMethod === row.to)
+    empty.insertText("\u{1f44d}\u{1f3fd}")
+    const late = make("\u{1f44d}\u{1f3fd}")
+    const lateHint = placeholder()
+    await renderer.idle()
+    expect([typed.cursorOffset, empty.cursorOffset, late.cursorOffset]).toEqual([row.cells, row.cells, row.cells])
+    expect([text.lineInfo.lineWidthCols[0], code.lineInfo.lineWidthCols[0]]).toEqual([row.cells + 1, row.cells + 1])
+    expect([text.width, code.width]).toEqual([row.cells + 1, row.cells + 1])
+    const lateTable = table()
+    const lateColored = table(cell(["\u{1f44d}\u{1f3fd}", "#ff0000"], ["AB", "#00ff00"], ["CD", "#0000ff"]))
+    await renderer.idle()
+    expect([early, updated, saved, adopted, cleared, lateTable].map((value) => value.width)).toEqual(
+      Array(6).fill(row.cells + 1),
+    )
+    const colors = ["#ff0000", "#00ff00", "#0000ff"]
+    expect(colors.map((color) => painted(colored, color, "fg"))).toEqual(
+      colors.map((color) => painted(lateColored, color, "fg")),
+    )
+    expect(colors.map((color) => painted(colored, color, "fg")).slice(1)).toEqual(["AB", "CD"])
+    expect([calls.saved > 0, calls.adopted > 0]).toEqual([true, true])
+    // The table's own pass ran before the caller's: the first call with the new method saw the moved selection.
+    expect(firstSeen).toEqual([dragged.getSelection()])
+    expect(firstSeen[0]).not.toBeNull()
+    // Restyled with the same text after the reply: the finished selection stays, and the rest shows the new colours.
+    restyled.content = cell(["\u{1f44d}\u{1f3fd}", "#0000ff"], ["AB", "#ff0000"], ["CD", "#00ff00"])
+    await renderer.idle()
+    expect([
+      restyled.getSelectedText(),
+      painted(restyled, "#0000ff", "fg"),
+      painted(restyled, "#00ff00", "fg"),
+    ]).toEqual(["AB", "\u{1f44d}\u{1f3fd}", "CD"])
+    expect([restyledInReply.getSelectedText(), painted(restyledInReply, "#00ff00", "fg")]).toEqual(["AB", "CD"])
+    // Replaced with other text, the cell drops the range rather than select what took its place.
+    restyled.content = cell(["\u{1f44d}\u{1f3fd}", "#0000ff"], ["XY", "#ff0000"], ["CD", "#00ff00"])
+    await renderer.idle()
+    expect(restyled.getSelectedText()).toBe("")
+    adopted.onLifecyclePass = null
+    const adoptedCalls = calls.adopted
+    adopted.requestRender()
+    await renderer.idle()
+    expect(calls.adopted).toBe(adoptedCalls)
+    // The held press drags to "q", back over its old column, to "q", into the second cell and to "q" again: at each
+    // step it selects what a press on the same "A" made after the reply does.
+    const lateHeld = table([[cell(["q\u{1f44d}\u{1f3fd}A"])[0][0], cell(["BC"])[0][0]]])
+    await renderer.idle()
+    expect(lateHeld.width).toBe(held.width)
+    const latePress = new Selection(
+      lateHeld,
+      { x: lateHeld.x + 1 + row.cells, y: lateHeld.y },
+      { x: lateHeld.x + 1 + row.cells, y: lateHeld.y },
+    )
+    latePress.isStart = true
+    lateHeld.onSelectionChanged(latePress)
+    const steps = [0, 1 + row.before, 0, 2 + row.cells, 0]
+    const drags = (target: TextTableRenderable, selection: Selection) =>
+      steps.map((dx) => {
+        selection.isStart = false
+        selection.focus = { x: target.x + dx, y: target.y }
+        target.onSelectionChanged(selection)
+        return target.getSelectedText()
+      })
+    const heldSteps = drags(held, press)
+    expect(heldSteps).toEqual(drags(lateHeld, latePress))
+    // The press that left its cell before the reply comes back to it, as a later press that left it does.
+    latePress.isStart = true
+    latePress.focus = latePress.anchor
+    lateHeld.onSelectionChanged(latePress)
+    latePress.isStart = false
+    latePress.focus = { x: lateHeld.x + 2 + row.cells, y: lateHeld.y }
+    lateHeld.onSelectionChanged(latePress)
+    expect(drags(leaving, left)).toEqual(drags(lateHeld, latePress))
+    tallPress.isStart = false
+    tallPress.focus = { x: tall.x, y: tall.y + 1 }
+    tall.onSelectionChanged(tallPress)
+    expect(tall.getSelectedText()).toBe("q\u{1f44d}\u{1f3fd}A")
+    // A new press after the gesture starts from its own cell: from "q" to "A".
+    const again = new Selection(held, { x: held.x, y: held.y }, { x: held.x, y: held.y })
+    again.isStart = true
+    held.onSelectionChanged(again)
+    again.isStart = false
+    again.focus = { x: held.x + 1 + row.cells, y: held.y }
+    held.onSelectionChanged(again)
+    expect(held.getSelectedText()).toBe("q\u{1f44d}\u{1f3fd}A")
+    expect([dragged.getSelectedText(), heldSteps[0]]).toEqual(["AB", "q\u{1f44d}\u{1f3fd}A"])
+    expect(["#ff0000", "#00ff00", "#0000ff"].map((color) => painted(styled, color, "fg"))).toEqual([
+      "\u{1f44d}\u{1f3fd}",
+      "AB",
+      "CD",
+    ])
+    for (const widget of recolored) widget.selectionBg = "#00ff00"
+    await renderer.idle()
+    expect(recolored.map((widget) => painted(widget, "#00ff00", "bg"))).toEqual(["AB", "AB"])
+    for (const widget of recolored) widget.selectionFg = "#ff00ff"
+    await renderer.idle()
+    expect(recolored.map((widget) => painted(widget, "#ff00ff", "fg"))).toEqual(["AB", "AB"])
+    expect(selections()).toEqual(["A", "AB", "AB", "", ""])
+    pressed.insertText("X")
+    expect(pressed.plainText).toContain("\u{1f44d}\u{1f3fd}")
+    expect(hint.lineInfo.lineWidthCols).toEqual(lateHint.lineInfo.lineWidthCols)
+    expect(selected.getSelectedText()).toBe("A")
+    selected.editorView.deleteSelectedText()
+    expect(selected.plainText).toBe("\u{1f44d}\u{1f3fd}\nBCD")
+    expect(marked.extmarks.get(mark)).toMatchObject({ start: row.cells, end: row.cells + 1 })
+  }
+})
+
 // ---- Shutdown bytes reach the remote Writable (F1 regression test) ----
 
 test("destroy emits shutdown ANSI sequence through the custom Writable", async () => {
@@ -1622,15 +1955,15 @@ test("raw output pressure delays a running renderer until the Session drains", a
   renderer.root.add(new TextRenderable(renderer, { content: `${"x".repeat(40)}\n${"y".repeat(40)}` }))
   renderer.start()
   clock.advance(40)
-  await settle(16)
+  await finishRender(renderer)
   expect(frames).toBe(0)
 
   stdout.release()
   for (let frame = 0; frame < 4; frame++) {
-    await settle(16)
+    await serviceReadyFrames(renderer)
     clock.advance(40)
   }
-  await settle(16)
+  await serviceReadyFrames(renderer)
   expect(frames).toBeGreaterThanOrEqual(3)
   expect(renderer.isRunning).toBe(true)
   expect(renderer.getSchedulerState().hasScheduledRender).toBe(true)
@@ -1752,7 +2085,7 @@ test.each(
 
     // A skip retries after Session idle; a failure waits for a later render request.
     await renderer.nativeScene.driver.idle()
-    await settle()
+    await serviceReadyFrames(renderer)
     clock.advance(1000)
     await finishRender(renderer)
     if (status === "Failed") {
@@ -1936,6 +2269,8 @@ const processExit = (renderer: CliRenderer) => {
   renderer.nativeScene.driver.dispose()
   expect(flushed).toBe(0)
 }
+const listenerWrites = (renderer: CliRenderer, stdout: CollectingStdout) =>
+  renderer.once(CliRenderEvents.EXTERNAL_OUTPUT, () => stdout.write("B"))
 const sessionClose = async (renderer: CliRenderer) => {
   const closing = renderer.nativeScene.driver.close()
   renderer.destroy()
@@ -1954,6 +2289,13 @@ test.each<[string, StdoutStep[], string]>([
   ["2-byte split across a frame", splitBytes("caf\u00e9", 4, (renderer) => renderer.idle()), "caf\u00e9"],
   ["3-byte split", splitBytes("\u4e00", 1), "\u4e00"],
   ["4-byte split", splitBytes("\u{10437}", 1), "\u{10437}"],
+  ["a combining mark in a later write", ["xe", "\u0301y\n"], "xe\u0301y"],
+  ["VS16 in a later write", ["\u2764", "\ufe0f\n"], "\u2764\ufe0f"],
+  ["a combining mark after the last column", ["x".repeat(79) + "e", "\u0301\n"], `${"x".repeat(79)}e\u0301`],
+  ["capture set again before a combining mark", ["e", capture, "\u0301\n"], "e\u0301"],
+  ["a CR between a row and its LF", ["OK", "\r", "\n"], "OK"],
+  ["a listener write during a frame", [listenerWrites, "A"], "AB"],
+  ["a listener write during destroy", [listenerWrites, "A", destroy], "AB|"],
   ["empty writes inside a split", splitBytes("\u00e9", 1, "", null as never, ["", ""], ["", "bogus"]), "\u00e9"],
   ["string inside a split", splitBytes("\u00e9", 1, "x"), "\ufffdx\ufffd"],
   ["capture set again inside a split", splitBytes("\u00e9", 1, capture), "\u00e9"],
@@ -1973,7 +2315,7 @@ test.each<[string, StdoutStep[], string]>([
   ["split across suspend during a deferred passthrough", ["a", passthrough, suspendInSplit], "a|caf\u00e9"],
   ["passthrough during a pending native mode", [pendingModeInSplit], "|\u00e9"],
   ["exit after a lead byte", [lead, processExit], ""],
-  ["destroy after the session closes", ["a", lead, sessionClose], ""],
+  ["destroy after the session closes", ["a\n", lead, sessionClose], ""],
   ["output failure after a lead byte", ["a", lead, outputFailure], ""],
   ["SGR", ["\x1b[31mred\x1b[0m [1m]\x1b[m\x1b[38;2;1;2;3mx\x1b[2@\x1b[?25h\x1b[ q\x1b[3~~\n"], "red [1m]x~"],
   ["SGR across a newline", ["\x1b[1mbold\nnext\x1b[22m\n"], "bold\r\nnext"],
@@ -2139,6 +2481,11 @@ const rawModeActions: Record<string, (renderer: CliRenderer) => Promise<unknown>
     spyOn(renderer.nativeScene.driver, "suspend").mockRejectedValue(0), renderer.suspend()
   ),
   "destroy during suspend": (renderer) => (renderer.suspend().catch(() => {}), renderer.destroy(), renderer.closed),
+  // Until the suspension settles the exit-signal handler destroys; with no handler the signal would kill the process.
+  // SIGUSR2 is in no default list, so renderers that other files leave behind don't listen.
+  "signal during suspend": async (renderer) => (
+    renderer.suspend().catch(() => {}), process.emit("SIGUSR2") && renderer.closed
+  ),
   // The footer change applies as the transition clears, and its resize listener resumes in that turn.
   "footer resize during a suspension": async (renderer) => {
     renderer.screenMode = "split-footer"
@@ -2159,6 +2506,7 @@ test.each<{ action: string; sync: string[]; settled: string[] }>([
   { action: "suspend behind held output", sync: [], settled: ["off after mouse bytes"] },
   { action: "failing suspend", sync: [], settled: ["off"] },
   { action: "destroy during suspend", sync: [], settled: ["off after mouse bytes after close"] },
+  { action: "signal during suspend", sync: [], settled: ["off after mouse bytes after close"] },
   { action: "footer resize during a suspension", sync: [], settled: ["off after mouse bytes", "on"] },
   { action: "resume", sync: ["on"], settled: ["on"] },
   { action: "failing resume", sync: [], settled: [] },
@@ -2177,7 +2525,8 @@ test.each<{ action: string; sync: string[]; settled: string[] }>([
     rawMode.push(`${enabled ? "on" : "off"}${mouseBytes ? " after mouse bytes" : ""}${closed ? " after close" : ""}`)
     return stdin
   }
-  const renderer = await createCliRenderer({ stdin, stdout, exitSignals: [] })
+  const listeners = process.listenerCount("SIGUSR2")
+  const renderer = await createCliRenderer({ stdin, stdout, exitSignals: ["SIGUSR2"] })
   driver = renderer.nativeScene.driver
   try {
     if (action.includes("resume")) await renderer.suspend()
@@ -2191,14 +2540,17 @@ test.each<{ action: string; sync: string[]; settled: string[] }>([
     }
     const done = rawModeActions[action]!(renderer).catch((error: Error) => error.message)
     const log = [...rawMode]
-    await settle(4)
     stdout.release()
     await done
     await renderer.idle()
-    expect({ sync: log, settled: rawMode, suspended: renderer.controlState === "explicit_suspended" }).toEqual({
+    const suspended = renderer.controlState === "explicit_suspended"
+    const exitListeners = process.listenerCount("SIGUSR2") - listeners
+    expect({ sync: log, settled: rawMode, suspended, exitListeners }).toEqual({
       sync,
       settled,
       suspended: action.includes("suspend") || ["failing resume", "resume after destroy"].includes(action),
+      // A settled suspension leaves signals to the next program; a resumed renderer takes them back.
+      exitListeners: Number(action === "resume" || action.startsWith("footer")),
     })
   } finally {
     renderer.destroy()

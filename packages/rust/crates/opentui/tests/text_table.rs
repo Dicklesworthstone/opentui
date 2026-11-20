@@ -79,6 +79,19 @@ fn styled_cells_draw_in_a_grid() {
 }
 
 #[test]
+fn columns_align_their_lines_and_follow_a_change() {
+    let app = TestApp::new(20, 6);
+    let table = table(&app, &[&["Key", "Value"], &["a", "b"]])
+        .column_width_mode(ColumnWidthMode::Content)
+        .column_alignments([Alignment::Right, Alignment::Center]);
+    app.root().add(&table);
+    // Core: "aligns each column's lines and follows a columnAlignments change".
+    assert_eq!(top(&app, 4)[3], "│  a│  b  │");
+    table.column_alignments([Alignment::Left]);
+    assert_eq!(top(&app, 4)[3], "│a  │b    │");
+}
+
+#[test]
 fn cells_wrap_and_columns_fit_a_narrow_width() {
     let app = TestApp::new(60, 16);
     let table = TextTable::new(&app).width(34).set_content([
@@ -548,6 +561,26 @@ fn a_drag_within_one_cell_selects_part_of_it() {
     let (status, _) = find(&app, "status");
     app.drag((x + 3, y), (status + 2, y));
     assert_eq!(table.selected_text(), "alphabet\tsta");
+}
+
+#[test]
+fn a_selection_from_outside_anchors_by_position_after_one_in_the_table_ends() {
+    let app = TestApp::new(30, 6);
+    app.root().add(&Text::new(&app, "text"));
+    let table = table(&app, &[&["aaaa", "bbbb"], &["cccc", "dddd"]])
+        .grid_lines(false)
+        .column_width_mode(ColumnWidthMode::Content);
+    app.root().add(&table);
+    // A drag inside "dddd", then a click elsewhere: its pressed cell must not anchor the next gesture.
+    let (x, y) = find(&app, "dddd");
+    app.drag((x + 1, y), (x + 2, y));
+    assert_eq!(table.selected_text(), "dd");
+    app.advance(LATER);
+    app.click(20, 5);
+    assert_eq!(table.selected_text(), "");
+    app.advance(LATER);
+    app.drag((1, 0), (x + 2, y));
+    assert_eq!(table.selected_text(), "aaaa\tbbbb\ncccc\tddd");
 }
 
 fn grid(app: &TestApp) -> TextTable {

@@ -8,8 +8,6 @@ const edv = @import("editor-view.zig");
 const math = std.math;
 const assert = std.debug.assert;
 const fillU32 = @import("utils.zig").fillU32;
-const nonNegative = @import("utils.zig").nonNegative;
-const unsigned = @import("utils.zig").unsigned;
 
 const gp = @import("grapheme.zig");
 const link = @import("link.zig");
@@ -53,17 +51,12 @@ pub const grapheme_bytes_max = 128;
 /// layout gives a lone control zero width.
 pub fn isPrintableGlyph(bytes: []const u8, width: u32) bool {
     if (bytes.len > grapheme_bytes_max or width > gp.glyph_width_max) return false;
-    for (bytes, 0..) |byte, index| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-        // U+0080..U+009F encode as C2 80..C2 9F.
-        if (byte == 0xc2 and index + 1 < bytes.len and bytes[index + 1] < 0xa0) return false;
-    }
-    return true;
+    return !utf8.containsControl(bytes);
 }
 
-/// The code point form of the control rule in isPrintableGlyph.
+/// The code point form of the control rule in isPrintableGlyph, kept for Zig callers of this module.
 pub fn isControlCodepoint(codepoint: u32) bool {
-    return codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f);
+    return utf8.isControl(codepoint);
 }
 
 const MAX_UNICODE_CODEPOINT: u32 = 0x10FFFF;
@@ -1893,7 +1886,7 @@ pub const OptimizedBuffer = struct {
             // Printable ASCII is one cell per byte and takes no pool or tracker capacity, so it
             // skips the copy and the prepared runs. The bytes left of column 0 are clipped.
             const clipped_byte_count: usize = if (x < 0) @min(text.len, @abs(x)) else 0;
-            var column: u32 = @intCast(nonNegative(x));
+            var column: u32 = @intCast(@max(x, 0));
             for (text[clipped_byte_count..]) |byte| {
                 if (column >= end) break;
                 self.setTextCell(column, row, makeCell(byte, fg, bg orelse self.get(column, row).?.bg, attributes));
@@ -2115,8 +2108,8 @@ pub const OptimizedBuffer = struct {
         const clampedSrcWidth = @min(srcWidth, frameBuffer.width - srcX);
         const clampedSrcHeight = @min(srcHeight, frameBuffer.height - srcY);
 
-        const startDestX = nonNegative(destX);
-        const startDestY = nonNegative(destY);
+        const startDestX = @max(0, destX);
+        const startDestY = @max(0, destY);
         const endDestX = @min(@as(i32, @intCast(self.width)) - 1, destX + @as(i32, @intCast(clampedSrcWidth)) - 1);
         const endDestY = @min(@as(i32, @intCast(self.height)) - 1, destY + @as(i32, @intCast(clampedSrcHeight)) - 1);
 
@@ -2442,7 +2435,10 @@ pub const OptimizedBuffer = struct {
             // The glyph that this draw wrote just before the current cluster, if any.
             var mark_base: ?MarkBase = null;
 
-            const vline_span_info = view.getVirtualLineSpans(vline_idx);
+            const vline_span_info = view.getVirtualLineSpans(vline_idx) catch |err| blk: {
+                if (checked) return err;
+                break :blk tbv.VirtualLineSpanInfo{ .spans = &.{}, .source_line = 0, .source_col_start = 0 };
+            };
             const spans = vline_span_info.spans;
             const col_offset = vline_span_info.source_col_start;
             var lineFg = text_defaults.fg orelse ansi.rgbColor(255, 255, 255, 255);
@@ -2455,16 +2451,16 @@ pub const OptimizedBuffer = struct {
             // Spans run from column 0 with rising columns, so span k ends after column k and the one
             // that holds `start_col` has an index of at most `start_col`.
             const start_col = col_offset + horizontal_offset;
-            var span_idx = lowerBound(spans[0..@min(spans.len, start_col)], "next_col", start_col +| 1, .span_search_steps);
+            var span_idx = lowerBound(spans[0..@min(spans.len, start_col)], "end_col_exclusive", start_col +| 1, .span_search_steps);
 
             var next_change_col: u32 = if (span_idx < spans.len)
-                spans[span_idx].next_col
+                spans[span_idx].end_col_exclusive
             else
                 std.math.maxInt(u32);
 
-            // Apply the style at the starting position
-            if (span_idx < spans.len and spans[span_idx].col <= start_col) {
-                if (text_buffer.resolveStyle(spans[span_idx].style_id)) |resolved_style| {
+            // Apply the style at the starting position; spans cover every column from 0.
+            if (span_idx < spans.len) {
+                if (text_buffer.resolveSpan(spans[span_idx])) |resolved_style| {
                     if (resolved_style.fg) |fg| {
                         lineFg = fg;
                     }
@@ -2651,7 +2647,7 @@ pub const OptimizedBuffer = struct {
                         lineBg = defaultBg;
                         lineAttributes = defaultAttributes;
 
-                        if (text_buffer.resolveStyle(new_span.style_id)) |resolved_style| {
+                        if (text_buffer.resolveSpan(new_span)) |resolved_style| {
                             if (resolved_style.fg) |fg| {
                                 lineFg = fg;
                             }
@@ -2661,7 +2657,7 @@ pub const OptimizedBuffer = struct {
                             lineAttributes |= resolved_style.attributes;
                         }
 
-                        next_change_col = new_span.next_col;
+                        next_change_col = new_span.end_col_exclusive;
                     }
 
                     if (vline.is_truncated) {
@@ -2679,7 +2675,7 @@ pub const OptimizedBuffer = struct {
                                 lineAttributes = defaultAttributes;
                                 next_change_col = std.math.maxInt(u32);
                             } else {
-                                const suffix_span_idx = lowerBound(spans, "next_col", suffix_col_pos +| 1, .span_search_steps);
+                                const suffix_span_idx = lowerBound(spans, "end_col_exclusive", suffix_col_pos +| 1, .span_search_steps);
                                 if (suffix_span_idx < spans.len) {
                                     span_idx = suffix_span_idx;
                                 }
@@ -2687,7 +2683,7 @@ pub const OptimizedBuffer = struct {
                                 lineFg = defaultFg;
                                 lineBg = defaultBg;
                                 lineAttributes = defaultAttributes;
-                                if (text_buffer.resolveStyle(active_span.style_id)) |resolved_style| {
+                                if (text_buffer.resolveSpan(active_span)) |resolved_style| {
                                     if (resolved_style.fg) |fg| {
                                         lineFg = fg;
                                     }
@@ -2696,7 +2692,7 @@ pub const OptimizedBuffer = struct {
                                     }
                                     lineAttributes |= resolved_style.attributes;
                                 }
-                                next_change_col = active_span.next_col;
+                                next_change_col = active_span.end_col_exclusive;
                             }
                         }
                     }
@@ -3512,10 +3508,10 @@ pub const OptimizedBuffer = struct {
         }
         if (clip_x0 >= clip_x1 or clip_y0 >= clip_y1) return false;
 
-        const left = unsigned(u32, clip_x0 - @as(i64, pos_x));
-        const top = unsigned(u32, clip_y0 - @as(i64, pos_y));
-        const right = unsigned(u32, clip_x1 - @as(i64, pos_x));
-        const bottom = unsigned(u32, clip_y1 - @as(i64, pos_y));
+        const left: u32 = @intCast(clip_x0 - @as(i64, pos_x));
+        const top: u32 = @intCast(clip_y0 - @as(i64, pos_y));
+        const right: u32 = @intCast(clip_x1 - @as(i64, pos_x));
+        const bottom: u32 = @intCast(clip_y1 - @as(i64, pos_y));
         const clipped_source_x = source_x + @as(u32, @intCast((@as(u64, left) * source_width) / width));
         const clipped_source_y = source_y + @as(u32, @intCast((@as(u64, top) * source_height) / height));
         const source_end_x = source_x + @as(u32, @intCast((@as(u64, right) * source_width + width - 1) / width));
@@ -3690,8 +3686,8 @@ pub const OptimizedBuffer = struct {
         // Each cell samples 2x2 source pixels. Draw only the source cells inside the buffer.
         const source_cells_x: i64 = (sourceWidth + 1) / 2;
         const source_cells_y: i64 = @intCast((pixels.len / alignedBytesPerRow + 1) / 2);
-        const start_x: u32 = @intCast(nonNegative(posX));
-        const start_y: u32 = @intCast(nonNegative(posY));
+        const start_x: u32 = @intCast(@max(0, posX));
+        const start_y: u32 = @intCast(@max(0, posY));
         const end_x = @min(@as(i64, self.width), @as(i64, posX) + source_cells_x);
         const end_y = @min(@as(i64, self.height), @as(i64, posY) + source_cells_y);
 
@@ -3761,8 +3757,8 @@ pub const OptimizedBuffer = struct {
         // Skip the source cells left of or above the buffer.
         const skip_x: u32 = @intCast(@min(terminalWidthCells, @max(0, -@as(i64, posX))));
         const skip_y: u32 = @intCast(@min(terminalHeightCells, @max(0, -@as(i64, posY))));
-        const start_x: u32 = @intCast(nonNegative(posX));
-        const start_y: u32 = @intCast(nonNegative(posY));
+        const start_x: u32 = @intCast(@max(0, posX));
+        const start_y: u32 = @intCast(@max(0, posY));
         if (start_x >= self.width or start_y >= self.height) return;
         const width = @min(terminalWidthCells - skip_x, self.width - start_x);
         const height = @min(terminalHeightCells - skip_y, self.height - start_y);
@@ -3781,7 +3777,7 @@ pub const OptimizedBuffer = struct {
                     const bg = ansi.rgbaFromFloats(colors[0], colors[1], colors[2], colors[3]);
                     const fg = ansi.rgbaFromFloats(colors[4], colors[5], colors[6], colors[7]);
                     var char = @as(*align(1) const u32, @ptrCast(data.ptr + offset + 32)).*;
-                    if (char == 0 or char > MAX_UNICODE_CODEPOINT or (char >= 0xd800 and char <= 0xdfff)) {
+                    if (!utf8.isScalar(char) or char == 0) {
                         char = DEFAULT_SPACE_CHAR;
                     } else if (char < 32 or (char > 126 and char < 0x2580) or !isSingleWidthBorderChar(char)) {
                         char = BLOCK_CHAR;

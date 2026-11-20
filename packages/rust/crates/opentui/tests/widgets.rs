@@ -7,9 +7,115 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+#[path = "support/allocations.rs"]
+mod allocations;
+
 fn rows(app: &TestApp) -> Vec<String> {
     let capture = app.render();
     (0..capture.height).map(|y| capture.row(y).trim_end().to_owned()).collect()
+}
+
+#[test]
+fn sibling_paint_and_hits_match_a_fresh_tree() {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../../../core/src/tests/fixtures/sibling-paint-order.json")).unwrap();
+    for row in rows {
+        let key = row["key"].as_str().unwrap();
+        let after = row["after"].as_str().unwrap();
+        let observe = |fresh: bool| {
+            let app = TestApp::new(3, 1);
+            let nodes = ["A", "B", "C"].map(|k| {
+                let width = 3 - "ABC".find(k).unwrap();
+                Text::new(&app, k.repeat(width))
+                    .absolute()
+                    .width(width as u32)
+                    .height(1)
+                    .z_index(i32::from(row["raised"] == k))
+            });
+            let parent = app.root();
+            let other = View::new(&app).width(0).height(0);
+            let child = &nodes["ABC".find(key).unwrap()];
+            if row["reparent"] == true {
+                parent.add(&other);
+                if !fresh {
+                    other.add(child);
+                }
+            }
+            for k in (if fresh { after } else { row["before"].as_str().unwrap() }).chars() {
+                parent.add(&nodes["ABC".find(k).unwrap()]);
+            }
+            if !fresh {
+                app.present().unwrap();
+                parent.insert(after.find(key).unwrap() + usize::from(row["reparent"] == true), child);
+            }
+            let frame = app.text();
+            let hits = (0..3)
+                .map(|x| {
+                    let hit = app.session().hit_test(x, 0).unwrap();
+                    nodes.iter().zip('A'..='C').find(|(n, _)| Some(n.id()) == hit).map_or('?', |(_, k)| k)
+                })
+                .collect::<String>();
+            (frame, hits)
+        };
+        let fresh = observe(true);
+        let expected = row["frame"].as_str().unwrap();
+        assert_eq!((&*fresh.0, &*fresh.1), (expected, expected), "{row}");
+        assert_eq!(observe(false), fresh, "{row}");
+    }
+}
+
+#[test]
+fn resize_handlers_run_depth_first_in_paint_order() {
+    // H stands for a post-layout hook: the root's absolute, zero-height last child. A terminal resize resizes every
+    // node. The scroll box (S, its rows s0..s15 in `rows`) shows two rows; its rows all resize before their children,
+    // and the walk skips the children of the rows it culls.
+    let cases = [
+        ("child order", "", "A a1 a2 a21 rows t0 t1 B H"),
+        ("a raised child stays in its parent", "a1", "A a2 a21 a1 rows t0 t1 B H"),
+        ("a raised sibling comes after", "A", "rows t0 t1 B H A a1 a2 a21"),
+        ("a moved node comes first", "move", "H A a1 a2 a21 rows t0 t1 B"),
+        ("adding the last child again is a move", "readd", "H A a1 a2 a21 rows t0 t1 B"),
+        ("a node added during the walk waits for the next round", "add", "A a1 a2 a21 rows t0 t1 B H C"),
+    ];
+    let rows = (0..16).fold("S".to_owned(), |rows, row| format!("{rows} s{row}"));
+    type Log = Rc<RefCell<Vec<String>>>;
+    fn node<W: Widget>(log: &Log, name: &str, widget: W) -> W {
+        let (log, name) = (log.clone(), name.to_owned());
+        widget.on_resize(move |_, _| log.borrow_mut().push(name.clone()))
+    }
+    for (name, change, expected) in cases {
+        let app = TestApp::new(20, 10);
+        let log = Log::default();
+        let line = |name: &str| node(&log, name, View::new(&app).height(1));
+        let a = node(&log, "A", View::new(&app).grow(1.0).z_index(i32::from(change == "A")));
+        a.add(&line("a1").z_index(i32::from(change == "a1"))).add(&line("a2").child(&line("a21")));
+        let scroll = node(&log, "S", ScrollBox::new(&app).height(2).scrollbars(false));
+        for row in 0..16 {
+            scroll.add(&line(&format!("s{row}")).child(&line(&format!("t{row}"))));
+        }
+        let quarter = |name: &str| node(&log, name, View::new(&app).absolute().width(Length::percent(25.0)));
+        let hook = quarter("H").height(0);
+        app.root().add(&a).add(&scroll).add(&quarter("B").height(1)).add(&hook);
+        app.render();
+        log.borrow_mut().clear();
+        if change == "move" {
+            app.root().insert(3, &hook);
+        }
+        if change == "readd" {
+            app.root().add(&hook);
+        }
+        if change == "add" {
+            let (log, root, added) = (log.clone(), app.root(), Rc::new(Cell::new(false)));
+            a.on_resize(move |cx, _| {
+                if !added.replace(true) {
+                    root.add(&node(&log, "C", View::new(cx.app()).absolute().width(Length::percent(25.0))));
+                }
+            });
+        }
+        app.resize(30, 10);
+        app.render();
+        assert_eq!(log.borrow().join(" "), expected.replace("rows", &rows), "{name}");
+    }
 }
 
 #[test]
@@ -71,6 +177,26 @@ fn column_and_row_gaps_space_one_axis() {
     assert_eq!(rows(&app), ["ab cd ef", "gh", ""]);
     row.row_gap(1);
     assert_eq!(rows(&app), ["ab cd ef", "", "gh"]);
+}
+
+#[test]
+fn box_sizing_aspect_ratio_and_percentage_basis_size_views() {
+    let app = TestApp::new(20, 14);
+    let child = View::new(&app).height(1).basis(Length::percent(50.0));
+    let row = View::new(&app).row().width(10).min_height(3).padding(1).box_sizing(BoxSizing::ContentBox).child(&child);
+    let ratio = View::new(&app).width(12).aspect_ratio(1.5);
+    app.root().add(&row).add(&ratio);
+    let read = || {
+        app.render();
+        (row.rect().width, row.rect().height, child.rect().width, ratio.rect().height)
+    };
+    // Content-box adds the padding to the width and the minimum height; the basis is half the inner width.
+    assert_eq!(read(), (12.0, 5.0, 5.0, 8.0));
+    row.box_sizing(BoxSizing::BorderBox);
+    child.basis(Length::percent(25.0));
+    ratio.aspect_ratio(f32::NAN);
+    // An empty view is one row high, as without a ratio.
+    assert_eq!(read(), (10.0, 3.0, 2.0, 1.0));
 }
 
 // As in Core, a list lays out its rows as a column with `overflow: scroll` does: a row direction does not apply, and a
@@ -140,29 +266,96 @@ fn inputs_type_move_delete_and_undo() {
     app.press("ctrl+.");
     assert_eq!(input.value(), ">hel");
     assert_eq!(app.render().row(0).trim_end(), ">hel");
+
+    // 606: in a field narrower than its line, the visual line end is the line end, from before (Home) or past
+    // (Left) the scroll offset.
+    let app = TestApp::new(4, 2);
+    let input = Input::new(&app).width(4).set_value("abcdefgh");
+    let area = Textarea::new(&app).width(4).height(1).wrap(WrapMode::None).set_text("abcdefgh");
+    app.root().add(&input).add(&area);
+    let scroll_then_press = |start, key| {
+        app.press("end");
+        app.render();
+        app.press(start);
+        app.press(key);
+    };
+    let rows = [
+        ("home", "alt+e", ""),
+        ("left", "super+right", ""),
+        ("home", "shift+alt+e", "abcdefgh"),
+        ("left", "shift+super+right", "h"),
+    ];
+    for (start, key, selected) in rows {
+        input.focus();
+        scroll_then_press(start, key);
+        assert_eq!((input.cursor_offset(), input.selected_text()), (8, selected.to_owned()), "Input {start} {key}");
+        area.focus();
+        scroll_then_press(start, key);
+        assert_eq!((area.cursor_offset(), area.selected_text()), (8, selected.to_owned()), "Textarea {start} {key}");
+    }
 }
 
 #[test]
-fn inputs_select_with_shift_and_replace_selection() {
-    let app = TestApp::new(30, 1);
-    let input = Input::new(&app).set_value("abc def");
-    app.root().add(&input);
-    input.focus();
-    app.press("shift+left");
-    app.press("shift+left");
-    app.press("shift+left");
-    assert_eq!(input.selected_text(), "def");
-    app.type_text("xyz");
-    assert_eq!(input.value(), "abc xyz");
-    app.press("super+a");
-    assert_eq!(input.selected_text(), "abc xyz");
-    app.press("left");
-    assert_eq!(input.cursor_offset(), 0);
-    assert_eq!(input.selected_text(), "");
-    app.press("alt+shift+f");
-    assert!(!input.selected_text().is_empty());
-    app.press("backspace");
-    assert!(input.value().ends_with("xyz"), "{:?}", input.value());
+fn editors_select_with_shift_and_replace_selection() {
+    // Core's rows for the same keys (cell occupancy): a selection covers the cell it started on and the cursor's cell,
+    // but not an empty one past the end of a line. A mouse selection grows from the cell at its other end.
+    for (text, keys, selected, typed) in [
+        ("a界", "left shift+left", "a界", "x"),
+        ("a界", "home shift+right", "a界", "x"),
+        ("a界", "shift+left", "界", "ax"),
+        ("a界", "left shift+left shift+right", "", "ax界"),
+        ("abc def", "shift+left shift+left shift+left", "def", "abc x"),
+        ("abcdef", "left left left shift+left shift+left", "bcd", "axef"),
+        ("abcdef", "shift+left shift+right", "", "abcdefx"),
+        ("abcdef", "left left left shift+right shift+left backspace shift+right", "de", "abxf"),
+        ("abcdef", "left left left shift+home", "abcd", "xef"),
+        ("abc def", "home alt+shift+f", "abc d", "xef"),
+        ("abc def", "super+a", "abc def", "x"),
+        ("abc def", "super+a left", "", "xabc def"),
+        ("ab\ncd", "up shift+right", "\nc", "abxd"),
+        ("ab\ncd", "up home shift+right shift+right", "ab", "x\ncd"),
+        ("ab\ncd", "left left shift+up", "ab\nc", "xd"),
+        ("drag me", "drag 0 3, shift+right", "drag ", "xme"),
+        ("drag me", "drag 3 0, shift+right", "rag", "dx me"),
+        ("drag me", "drag 0 3, shift+left", "dra", "xg me"),
+        ("a界b", "drag 2 0, shift+right", "界", "axb"),
+        ("a界b", "drag 2 0, shift+right shift+right", "界b", "ax"),
+        ("abc", "drag 3 0, shift+end", "", "abcx"),
+        ("alpha beta gamma", "double-click 7, shift+right", "beta ", "alpha xgamma"),
+        ("alpha beta gamma", "double-click 7, shift+home shift+right", "lpha b", "axeta gamma"),
+        ("alpha beta gamma", "triple-click 7, shift+right", "alpha beta gamma", "x"),
+    ] {
+        for single_line in [true, false] {
+            if single_line && text.contains('\n') {
+                continue;
+            }
+            let app = TestApp::new(20, 1);
+            let (input, area) = (Input::new(&app).set_value(text), Textarea::new(&app).set_text(text));
+            if single_line {
+                app.root().add(&input);
+                input.focus();
+            } else {
+                app.root().add(&area);
+                area.focus();
+            }
+            app.render();
+            let (gesture, keys) = keys.split_once(", ").unwrap_or(("", keys));
+            match gesture.split(' ').collect::<Vec<_>>()[..] {
+                ["drag", from, to] => app.drag((from.parse().unwrap(), 0), (to.parse().unwrap(), 0)),
+                [clicks, at] => {
+                    (0..if clicks == "double-click" { 2 } else { 3 }).for_each(|_| app.click(at.parse().unwrap(), 0))
+                }
+                _ => {}
+            }
+            keys.split(' ').for_each(|key| app.press(key));
+            let state = || {
+                if single_line { (input.selected_text(), input.value()) } else { (area.selected_text(), area.text()) }
+            };
+            let now = state().0;
+            app.type_text("x");
+            assert_eq!((now.as_str(), state().1.as_str()), (selected, typed), "{text:?} {keys} {single_line}");
+        }
+    }
 }
 
 #[test]
@@ -418,6 +611,48 @@ fn an_always_shown_vertical_scrollbar_fills_its_track_until_the_content_overflow
     assert!(!column(&app).contains(&thumb));
 }
 
+// Scrollbar options set on a rendered box show what a box built with them shows, with no size change between.
+#[test]
+fn scrollbar_options_changed_after_a_frame_match_a_fresh_box() {
+    let bars = |lines: usize, (show, always): (bool, bool), last: (bool, bool)| {
+        let app = TestApp::new(8, 4);
+        let scroll = ScrollBox::new(&app).grow(1.0).scrollbars(show).vertical_scrollbar_always(always);
+        scroll.add(&Text::new(&app, "a\n".repeat(lines)).shrink(0.0));
+        app.root().add(&scroll);
+        app.render();
+        // Each setter alone, so neither covers for the other.
+        (show != last.0).then(|| scroll.scrollbars(last.0));
+        (always != last.1).then(|| scroll.vertical_scrollbar_always(last.1));
+        let capture = (app.render(), app.render()).1;
+        let column: String = (0..4).map(|y| capture.row(y).chars().nth(7).unwrap_or(' ')).collect();
+        (column, scroll.content_view().rect().width)
+    };
+    let options = [(false, false), (false, true), (true, false), (true, true)];
+    for lines in [0, 6] {
+        for (first, last) in options.iter().flat_map(|&first| options.map(|last| (first, last))) {
+            assert_eq!(bars(lines, first, last), bars(lines, last, last), "{lines} lines, {first:?} then {last:?}");
+        }
+    }
+    // A box that fits on both axes shows no bar, and between frames the last call wins.
+    let app = TestApp::new(8, 4);
+    app.root().add(&ScrollBox::new(&app).grow(1.0).axes(true, true).child(&Text::new(&app, "a")));
+    assert_eq!(rows(&app)[3], "");
+    let scroll = ScrollBox::new(&app).grow(1.0).child(&Text::new(&app, "a\n".repeat(6)).shrink(0.0));
+    app.root().clear().add(&scroll);
+    app.render();
+    scroll.scrollbars(false).scrollbars(true).scrollbars(false);
+    app.render();
+    assert_eq!(scroll.content_view().rect().width, 8.0);
+    // Options set from a resize handler stay within the per-frame toggle limit, so the frame still lays out.
+    let app = TestApp::new(8, 4);
+    let scroll = ScrollBox::new(&app).grow(1.0).child(&Text::new(&app, "a"));
+    let handle = scroll.clone();
+    scroll.content_view().on_resize(move |_, rect| drop(handle.vertical_scrollbar_always(rect.width >= 8.0)));
+    app.root().add(&scroll);
+    app.render();
+    app.render();
+}
+
 #[test]
 fn sticky_scroll_boxes_follow_new_content() {
     let app = TestApp::new(12, 3);
@@ -545,6 +780,120 @@ fn scroll_moves_to_the_end_follow_content_added_before_the_frame() {
     scroll.add(&Text::new(&app, "line 13"));
     app.render();
     assert_eq!(scroll.scroll_position().1, 3.0);
+}
+
+#[test]
+fn scroll_events_report_each_move_once_before_it_paints() {
+    // 10 lines in 4 rows scroll from 0 to 6. `|` ends a frame; an event is its cause and row (`x` and a column for a
+    // horizontal move); `H` is the resize handler of the root's last child. `bar` clicks the scrollbar's last row;
+    // `sticky` makes the box follow the bottom; `add` adds a line; `tall`, `wide`, `slim` and `narrow` resize the
+    // terminal, the last taller and wrapping every line to two rows; `poke` resizes only H; `arm` makes H scroll to
+    // row 2; `on` adds the scroll handler,
+    // which rows without it add first; `echo` adds a handler that scrolls by 2 once; `defer` scrolls to row 4 from a
+    // task an animation step defers; `sideways` makes the box follow its right edge over a 40-column row, and `widen`
+    // adds a 50-column row.
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("wheel steps before a frame are one event", &["wheel", "wheel", "wheel", "F"], "Wheel 3 |"),
+        ("each frame reports its own moves", &["wheel", "F", "wheel", "F"], "Wheel 1 | Wheel 2 |"),
+        ("a key", &["down", "F"], "Key 1 |"),
+        ("nothing moved", &["home", "F", "wheel", "up", "F", "wheel", "F"], "| | Wheel 1 |"),
+        ("a handler's own move", &["echo", "wheel", "F", "wheel", "F"], "Wheel 1 Program 3 | Wheel 4 |"),
+        ("the scrollbar", &["bar", "F"], "Pointer 5 |"),
+        ("the program, before layout is known", &["3", "F", "F"], "Program 3 | |"),
+        ("a move to the end follows content added before the frame", &["end", "add", "F"], "Key 6 Key 7 |"),
+        ("a sticky box follows new content", &["sticky", "add", "F", "add", "F"], "Layout 7 | Layout 8 |"),
+        ("a clamp to a taller view", &["end", "F", "tall", "F"], "Key 6 | Layout 4 |"),
+        ("view and content resize at once", &["sticky", "add", "F", "narrow", "F"], "Layout 7 | Layout 15 H |"),
+        (
+            "view and content widen at once",
+            &["sideways", "F", "widen", "slim", "F"],
+            "Program x21 Program x20 | Layout x34 H |",
+        ),
+        ("a move between frames is reported before layout", &["wheel", "wide", "F"], "Wheel 1 H |"),
+        ("a move deferred to the frame is reported before layout", &["defer", "poke", "F"], "Program 4 H |"),
+        ("a handler's move during a frame is reported after it", &["arm", "wide", "F"], "H Program 2 |"),
+        ("moves before the first handler are not reported", &["5", "F", "on", "wide", "F"], "| H |"),
+        ("a key at the end follows new content", &["6", "F", "end", "add", "F"], "Program 6 | Key 7 |"),
+    ];
+    for &(name, steps, expected) in cases {
+        let app = TestApp::new(20, 4);
+        let scroll = ScrollBox::new(&app).grow(1.0);
+        for line in 0..10 {
+            scroll.add(&Text::new(&app, format!("line {line} of text")));
+        }
+        let (armed, log) = (Rc::new(Cell::new(false)), Rc::new(RefCell::new(Vec::new())));
+        let hook = View::new(&app).absolute().width(Length::percent(25.0)).height(0).on_resize({
+            let (scroll, armed, log) = (scroll.clone(), armed.clone(), log.clone());
+            move |_, _| {
+                log.borrow_mut().push("H".to_owned());
+                if armed.replace(false) {
+                    scroll.scroll_to(0.0, 2.0);
+                }
+            }
+        });
+        app.root().add(&scroll).add(&hook);
+        scroll.focus();
+        app.render();
+        log.borrow_mut().clear();
+        let listen = || {
+            scroll.on_scroll({
+                let (log, scroll) = (log.clone(), scroll.clone());
+                move |_, event| {
+                    assert_eq!(event.position, scroll.scroll_position());
+                    let at = match event.position {
+                        (0.0, y) => y.to_string(),
+                        (x, _) => format!("x{x}"),
+                    };
+                    log.borrow_mut().push(format!("{:?} {at}", event.cause));
+                }
+            })
+        };
+        if !steps.contains(&"on") {
+            listen();
+        }
+        for &step in steps {
+            match step {
+                "F" => {
+                    app.render();
+                    log.borrow_mut().push("|".into());
+                }
+                "wheel" => app.scroll(2, 1, true),
+                "bar" => app.click(19, 3),
+                "sticky" => drop(scroll.sticky(true)),
+                "add" => drop(scroll.add(&Text::new(&app, "added"))),
+                "tall" => app.resize(20, 6),
+                "narrow" => app.resize(12, 6),
+                "slim" => app.resize(16, 4),
+                "poke" => drop(hook.width(6)),
+                "on" => drop(listen()),
+                "echo" => drop(scroll.on_scroll({
+                    let (scroll, once) = (scroll.clone(), Cell::new(false));
+                    move |_, _| drop((!once.replace(true)).then(|| scroll.scroll_by(0.0, 2.0)))
+                })),
+                "defer" => {
+                    let scroll = scroll.clone();
+                    app.animate(move |cx, _| {
+                        let scroll = scroll.clone();
+                        cx.app().defer(move |_| drop(scroll.scroll_to(0.0, 4.0)));
+                        false
+                    });
+                }
+                "sideways" => {
+                    scroll.axes(true, false).sticky(true).sticky_start(opentui::widget::ScrollEdge::Right);
+                    scroll.add(&View::new(&app).width(40).height(1));
+                }
+                "widen" => drop(scroll.add(&View::new(&app).width(50).height(1))),
+                "arm" => armed.set(true),
+                "wide" => app.resize(24, 4),
+                "home" | "end" | "up" | "down" => app.press(step),
+                delta => drop(scroll.scroll_by(0.0, delta.parse().unwrap())),
+            }
+        }
+        assert_eq!(log.borrow().join(" "), expected, "{name}");
+        // The app's teardown releases a scroll handler that holds its own box.
+        drop((app, scroll, hook));
+        assert_eq!(Rc::strong_count(&log), 1, "{name}");
+    }
 }
 
 #[test]
@@ -791,6 +1140,77 @@ fn custom_components_paint_and_handle_input() {
     assert_eq!(rows(&app)[1], " count 42");
 }
 
+/// A run of cells paints what the same cells drawn one by one paint, over frames that change: characters that
+/// packed cells draw as blocks, wide characters cut by a row's end, a clip or the screen, combining marks,
+/// attributes, and translucent and default colors.
+#[test]
+fn cell_runs_paint_like_single_cells() {
+    struct Run {
+        cells: Vec<(char, Style)>,
+        width: u32,
+        at: (i32, i32),
+        clip: bool,
+        batched: bool,
+    }
+    impl Component for Run {
+        fn paint(&self, painter: &mut Painter<'_>) {
+            let draw = |painter: &mut Painter<'_>| {
+                let (x, y) = self.at;
+                if self.batched {
+                    let cells: Vec<_> =
+                        self.cells.iter().map(|&(character, style)| PaintCell::new(character, style)).collect();
+                    painter.cells(x, y, self.width, &cells);
+                    return;
+                }
+                for (index, &(character, style)) in (0u32..).zip(&self.cells).filter(|_| self.width != 0) {
+                    painter.cell(x + (index % self.width) as i32, y + (index / self.width) as i32, character, style);
+                }
+            };
+            if self.clip { painter.clip(1, 1, 5, 2, draw) } else { draw(painter) }
+        }
+    }
+    let bold = "aé─Z".chars().map(|character| (character, Style::new().bold())).collect::<Vec<_>>();
+    let twins = [false, true].map(|batched| {
+        let app = TestApp::new(10, 4);
+        // The single cells paint without the frame check, which must change no cell.
+        app.set_verify(batched);
+        let run = Run { cells: bold.clone(), width: 4, at: (0, 0), clip: false, batched };
+        let run = Custom::new(&app, run).absolute().position(Edge::Left, 1).width(9).height(4);
+        app.root().add(&Text::new(&app, "0123456789\n9876543210\n0123456789\n9876543210")).add(&run);
+        (app, run)
+    });
+    let capture = twins[1].0.render();
+    assert_eq!(capture.row(0), "0aé─Z56789");
+    assert!((1..5).all(|x| capture.cell(x, 0).unwrap().attributes == Attributes::BOLD));
+    assert_eq!(twins[0].0.render(), capture);
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = |below: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % below
+    };
+    let characters = ['a', 'é', '─', '█', '界', '😀', '\u{301}', '\t'];
+    let colors = [None, Some(Color::rgb(200, 40, 0)), Some(Color::rgba(0, 90, 200, 128)), Some(Color::TRANSPARENT)];
+    for seed in 0..64 {
+        let cells: Vec<_> = (0..next(25))
+            .map(|_| {
+                let style = Style {
+                    fg: colors[next(4) as usize],
+                    bg: colors[next(4) as usize],
+                    attributes: Attributes::from_bits(next(256) as u8),
+                };
+                (characters[next(characters.len() as u64) as usize], style)
+            })
+            .collect();
+        let (width, at, clip) = (next(7) as u32, (next(14) as i32 - 3, next(7) as i32 - 2), next(2) == 1);
+        for (_, run) in &twins {
+            run.update(|run| (run.cells, run.width, run.at, run.clip) = (cells.clone(), width, at, clip));
+        }
+        assert_eq!(twins[0].0.render(), twins[1].0.render(), "seed {seed}");
+    }
+}
+
 #[test]
 fn native_failures_end_the_frame_with_an_error() {
     let app = TestApp::new(10, 1);
@@ -864,9 +1284,12 @@ fn syntax_fg(app: &TestApp, name: &str) -> Color {
 fn code_highlights_numbers_lines_and_scrolls() {
     use opentui::widget::Code;
     let app = TestApp::new(24, 3);
-    let code = Code::new(&app).filetype("rust").line_numbers(true).grow(1.0);
+    let code = Code::new(&app).filetype("rust").line_numbers(true).wrap(WrapMode::Word).grow(1.0);
     let source: String = (1..=12).map(|line| format!("let x{line} = \"v\"; // c\n")).collect();
     code.set_code(source.trim_end());
+    // Before its first layout the view has no width, so it wraps nothing: 12 rows, not one per character.
+    assert_eq!(code.scroll_to(u32::MAX).scroll_position(), 12);
+    code.scroll_to(0);
     app.root().add(&code);
     // Core's gutter: at least three cells, with one cell of padding on each side of the number.
     assert_eq!(rows(&app), ["  1 let x1 = \"v\"; // c", "  2 let x2 = \"v\"; // c", "  3 let x3 = \"v\"; // c"]);
@@ -887,18 +1310,16 @@ fn code_highlights_numbers_lines_and_scrolls() {
 fn followed_code_keeps_appended_text_in_view() {
     use opentui::widget::Code;
     let app = TestApp::new(12, 3);
-    let log = Code::new(&app).follow(true).grow(1.0);
+    // Text given before follow and before the first frame is followed too.
+    let log = Code::new(&app).grow(1.0).append("line 0\nline 1\nline 2\nline 3\n").follow(true);
     app.root().add(&log);
     app.render();
-    for line in 0..6 {
+    for line in 4..6 {
         log.append(&format!("line {line}\n"));
         app.render();
     }
     // The trailing newline leaves an empty last line in view.
     assert_eq!(rows(&app), ["line 4", "line 5", ""]);
-    log.scroll_to(0);
-    log.append("line 6\n");
-    assert_eq!(rows(&app)[0], "line 0");
 }
 
 #[test]
@@ -953,7 +1374,7 @@ fn tables_return_their_columns_and_rows() {
 
 #[test]
 fn image_views_decode_and_present_images() {
-    use opentui::native::{Image, ImageProtocol, SessionOptions};
+    use opentui::native::{Image, ImageFit, ImageProtocol, SessionOptions};
     use opentui::widget::ImageView;
     let app = TestApp::new(4, 2);
     let red = [255u8, 0, 0, 255];
@@ -963,8 +1384,17 @@ fn image_views_decode_and_present_images() {
     app.root().add(&view);
     // Native code turns image placements into glyphs when it encodes output, so captures show blank cells.
     app.render();
+    // Core's `getFittedSize` rows for its 2x2 image.
+    assert_eq!(view.fitted_size(60, 40, 2.0), (60, 30));
+    assert_eq!(view.fit(ImageFit::Cover).fitted_size(60, 40, 2.0), (80, 40));
+    assert_eq!(view.fit(ImageFit::Fill).fitted_size(60, 40, 2.0), (60, 40));
+    // 100x40 cells at 900x800 pixels: 9x20-pixel cells, which native paint fits with.
+    assert_eq!(view.cell_aspect(), 2.0);
+    app.session().set_image_resolution(100, 40, 900, 800).unwrap();
+    assert_eq!(view.fit(ImageFit::Contain).fitted_size(60, 40, view.cell_aspect()), (60, 27));
     assert!(view.load(b"not an image").is_err());
     view.image(None);
+    assert_eq!(view.fitted_size(60, 40, 2.0), (0, 0));
     app.render();
 
     // Three Kitty uploads of noise, which compresses to nothing, are about 12 KB each and do not fit one frame of a
@@ -1123,6 +1553,15 @@ fn markdown_renders_blocks_inline_styles_and_code() {
     // The fence's filetype highlights the block.
     let keyword = if cfg!(feature = "tree-sitter") { syntax_fg(&app, "keyword") } else { colors.text };
     assert_eq!(capture.cell(1, 9).unwrap().fg, keyword);
+    // A new syntax theme restyles the block; after the app's theme changes, a new document's blocks take its colors.
+    doc.syntax_theme(opentui::syntax::SyntaxTheme::new().style("keyword", Style::new().fg(Color::RED)));
+    let red = if cfg!(feature = "tree-sitter") { Color::RED } else { colors.text };
+    assert_eq!(app.render().cell(1, 9).unwrap().fg, red);
+    app.set_theme(opentui::theme::Theme::light());
+    doc.detach();
+    app.root().add(&Markdown::new(&app).set_markdown("```rust\nfn main() {}\n```"));
+    let keyword = if cfg!(feature = "tree-sitter") { syntax_fg(&app, "keyword") } else { app.theme().foreground };
+    assert_eq!(app.render().cell(1, 0).unwrap().fg, keyword);
 }
 
 #[test]
@@ -1130,10 +1569,12 @@ fn markdown_styles_text_by_syntax_scope() {
     use opentui::syntax::SyntaxTheme;
     use opentui::widget::{Markdown, MarkdownColors};
     let app = TestApp::new(30, 8);
-    let [text, heading, italic, label, link, url, escape, conceal] =
+    let [default, heading, italic, label, link, url, escape, conceal] =
         [0x101010, 0x202020, 0x303030, 0x404040, 0x505050, 0x606060, 0x707070, 0x808080].map(Color::hex);
+    // As in Core, prose takes the text color over the `default` scope's.
+    let text = MarkdownColors::from_theme(&app.theme()).text;
     let syntax = SyntaxTheme::new()
-        .style("default", Style::new().fg(text))
+        .style("default", Style::new().fg(default))
         .style("markup.heading", Style::new().fg(heading).bold())
         .style("markup.italic", Style::new().fg(italic).italic())
         .style("markup.link.label", Style::new().fg(label))
@@ -1190,12 +1631,29 @@ fn code_without_a_grammar_shows_plain_text() {
 
 #[cfg(feature = "tree-sitter")]
 #[test]
+fn display_math_without_a_renderer_shows_plain_tex() {
+    use opentui::widget::{Markdown, MarkdownExtension};
+    // Even with a grammar named `math`, which a ```math fence takes, display math shows plain TeX, as in Core.
+    opentui::syntax::register_alias("math", "rust");
+    let app = TestApp::new(20, 4);
+    let doc = Markdown::new(&app).extensions(&[MarkdownExtension::Math]);
+    app.root().add(&doc.set_markdown("$$\nfn x\n$$\n\n```math\nfn x\n```").grow(1.0));
+    let keyword = syntax_fg(&app, "keyword");
+    assert!(app.wait_until(Duration::from_secs(10), || app.render().cell(0, 2).unwrap().fg == keyword));
+    assert_eq!(rows(&app)[..3], ["fn x", "", "fn x"]);
+    assert_eq!(app.render().cell(0, 0).unwrap().fg, app.theme().foreground);
+}
+
+#[cfg(feature = "tree-sitter")]
+#[test]
 fn highlighted_code_restyles_appends_and_theme_changes() {
     use opentui::syntax::SyntaxTheme;
     use opentui::widget::Code;
-    let app = TestApp::new(30, 2);
+    let app = TestApp::new(30, 3);
     let code = Code::new(&app).filetype("rs").grow(1.0);
     app.root().add(&code);
+    let other = Code::new(&app).filetype("rs").set_code("let peer;").height(1);
+    app.root().add(&other);
     code.append("let a = 1;");
     code.append(" // done");
     let capture = app.render();
@@ -1208,9 +1666,19 @@ fn highlighted_code_restyles_appends_and_theme_changes() {
     assert_eq!(capture.cell(0, 1).unwrap().fg, app.theme().foreground);
     let keyword = syntax_fg(&app, "keyword");
     assert!(app.wait_until(Duration::from_secs(10), || app.render().cell(0, 1).unwrap().fg == keyword));
-    code.syntax_theme(SyntaxTheme::new().style("keyword", Style::new().fg(Color::RED)));
+    // Two appends keep the shown highlight: the tail stays plain until the worker's lands.
+    code.append(" let c;").append(" let d;");
+    assert_eq!(app.render().cell(7, 1).unwrap().fg, app.theme().foreground);
+    let mut theme = SyntaxTheme::new().style("keyword", Style::new().fg(Color::RED));
+    for i in 0..128 {
+        theme.set(format!("unused.{i}"), Style::new());
+    }
+    let before = allocations::count();
+    code.syntax_theme(theme);
+    assert!(allocations::count() - before < 128, "restyling copied the unused scopes");
     let capture = app.render();
     assert_eq!(capture.cell(0, 0).unwrap().fg, Color::RED);
+    assert_eq!(capture.cell(0, 2).unwrap().fg, keyword);
     assert_eq!(capture.cell(11, 0).unwrap().fg, app.theme().foreground);
     code.filetype(None);
     assert_eq!(app.render().cell(0, 0).unwrap().fg, app.theme().foreground);
@@ -1259,6 +1727,74 @@ fn measurement_panics_resume_after_native_layout() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.render()));
     let message = *result.expect_err("the panic reaches the caller").downcast::<&str>().unwrap();
     assert_eq!(message, "measure failed");
+}
+
+#[test]
+fn input_max_length_follows_cores_vectors() {
+    // Core's Input test runs the same rows.
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../core/src/renderables/input-max-length.conformance.json"))
+            .unwrap();
+    let app = TestApp::new(20, 1);
+    for row in corpus["rows"].as_array().unwrap() {
+        let (value, max) = (row[1].as_str().unwrap(), row[2].as_u64().unwrap() as usize);
+        for input in
+            [Input::new(&app).max_length(max).set_value(value), Input::new(&app).set_value(value).max_length(max)]
+        {
+            app.root().add(&input);
+            input.focus();
+            for _ in 0..row[3].as_u64().unwrap() {
+                app.press("shift+left");
+            }
+            input.insert(row[4].as_str().unwrap());
+            assert_eq!(input.value(), row[5], "{}", row[0]);
+        }
+    }
+    // Not shared: Core's Textarea has no maxLength, and Rust's counts characters.
+    assert_eq!(Textarea::new(&app).max_length(2).set_text("😀\n😀").text(), "😀\n");
+}
+
+#[test]
+fn pastes_follow_cores_vectors() {
+    // Core's Textarea paste test runs the same rows.
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../core/src/renderables/paste.conformance.json")).unwrap();
+    for row in corpus["rows"].as_array().unwrap() {
+        let app = TestApp::new(40, 4);
+        let area = Textarea::new(&app).set_text("x");
+        let input = Input::new(&app).set_value("x");
+        app.root().add(&area).add(&input);
+        area.focus();
+        app.paste(row[1].as_str().unwrap());
+        input.focus();
+        app.paste(row[1].as_str().unwrap());
+        assert_eq!([area.text(), input.value()], [row[2].clone(), row[3].clone()], "{}", row[0]);
+    }
+}
+
+#[test]
+fn editors_keep_control_characters_as_cores_vectors_do() {
+    // Core's EditBufferRenderable test runs the same rows. Rust's builders set the text, so "constructor" is "value".
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../core/src/renderables/editor-controls.conformance.json"))
+            .unwrap();
+    let app = TestApp::new(20, 2);
+    for row in corpus["rows"].as_array().unwrap() {
+        let [name, widget, path, text, expected] = [0, 1, 2, 3, 4].map(|index| row[index].as_str().unwrap());
+        let value = match (widget, path) {
+            ("input", "insert") => Input::new(&app).max_length(6).insert(text).insert("!").value(),
+            ("input", _) => Input::new(&app).max_length(6).set_value(text).insert("!").value(),
+            (_, "insert") => Textarea::new(&app).insert(text).insert("!").text(),
+            _ => Textarea::new(&app).set_text(text).insert("!").text(),
+        };
+        assert_eq!(value, expected, "{name}: {widget} {path}");
+    }
+    // The buffer shows controls as notation cells, so no raw control reaches the terminal.
+    let area = Textarea::new(&app).set_text("A\x07B\x1bC\x0cD\u{85}E");
+    app.root().add(&area);
+    let frame = app.render().text();
+    assert!(frame.contains("A^GB^[C^LD<85>E"), "{frame:?}");
+    assert!(!frame.chars().any(|character| character.is_control() && character != '\n'), "{frame:?}");
 }
 
 #[test]
@@ -1388,7 +1924,7 @@ fn mouse_selection_spans_widgets_in_reading_order() {
     // A press on a widget that cannot select ends the selection.
     app.click(3, 2);
     assert_eq!(app.selected_text(), None);
-    assert_eq!(first.selected_text(), "");
+    assert_eq!(first.set_text("first line").selected_text(), "");
 }
 
 #[test]
@@ -1407,6 +1943,117 @@ fn double_and_triple_clicks_select_words_and_lines() {
     app.advance(Duration::from_millis(600));
     app.click(8, 0);
     assert_eq!(app.selected_text(), None);
+}
+
+// As in Core, a text whose content changes applies the selection again at the same cells of the text, during the
+// gesture or after it, even after the text moved, so it selects what a fresh gesture on the new content selects.
+#[test]
+fn a_selection_follows_its_gesture_when_the_content_changes() {
+    use opentui::widget::Code;
+    let [down, drag, up] =
+        [MouseEventKind::Down, MouseEventKind::Drag, MouseEventKind::Up].map(|kind| kind(MouseButton::Left));
+    // Presses at (1, 1) of "ab cd\ncd" in a 4x2 text above "def": a drag to (0, 2) in "def", a double click, a
+    // triple click. Each change replaces the text, appends to it, or sets it again after a wrap change, which wraps
+    // "cd" of the first line to the second row. Expected: the text's selection and the app's, from Core.
+    let changes = [("xab cd\nxcd", WrapMode::None), ("ab cd\ncde", WrapMode::None), ("ab cd\ncd", WrapMode::Word)];
+    let rows: [(u16, [&str; 3]); 3] =
+        [(1, ["cd", "de", "d\nc"]), (2, ["xcd", "cde", "cd"]), (3, ["xcd", "cde", "ab cd"])];
+    for is_code in [false, true] {
+        for (presses, expected) in rows {
+            for ((content, wrap), expected) in changes.into_iter().zip(expected) {
+                // Core's Code ignores equal text, so it keeps the selection made under the old wrap mode.
+                if is_code && wrap == WrapMode::Word {
+                    continue;
+                }
+                for when in ["fresh", "after", "during", "moved"] {
+                    let app = TestApp::new(8, 4);
+                    let first = if when == "fresh" { (content, wrap) } else { ("ab cd\ncd", WrapMode::None) };
+                    let text = Text::new(&app, first.0).wrap(first.1).size(4, 2);
+                    let code = Code::new(&app).wrap(first.1).size(4, 2).set_code(first.0);
+                    let change = || match (when, is_code) {
+                        ("fresh", _) => {}
+                        (_, false) => drop(text.wrap(wrap).set_text(content)),
+                        (_, true) => drop(code.wrap(wrap).set_code(content)),
+                    };
+                    let root = if is_code { app.root().add(&code) } else { app.root().add(&text) };
+                    root.add(&Text::new(&app, "def"));
+                    app.render();
+                    let (x, y) = if presses == 1 { (0, 2) } else { (1, 1) };
+                    for press in 1..=presses {
+                        app.mouse(down, 1, 1);
+                        if presses == 1 {
+                            app.mouse(drag, x, y);
+                        }
+                        if when == "during" && press == presses {
+                            change();
+                        }
+                        app.mouse(up, x, y);
+                    }
+                    if when == "moved" {
+                        app.root().insert(0, &Text::new(&app, "top"));
+                        app.render();
+                    }
+                    if matches!(when, "after" | "moved") {
+                        change();
+                    }
+                    app.render();
+                    let at = format!("code {is_code}, {presses} presses, {content:?} {wrap:?} {when}");
+                    assert_eq!(if is_code { code.selected_text() } else { text.selected_text() }, expected, "{at}");
+                    assert_eq!(app.selected_text().as_deref(), Some(expected), "{at}");
+                }
+            }
+        }
+    }
+    // One widget, a gesture at (x, y) (one press: a drag four cells right; three: a triple click), then each step
+    // sets the text and the wrap mode, with the app's selection after the next frame, from Core: a followed log,
+    // a replace that clamps the scroll, a wrap set after the text, a drag that selected nothing at release (Core
+    // paints "ew " but copies nothing; the app copies what is painted), and a line that goes and comes back.
+    type Step = (&'static str, Option<WrapMode>, Option<&'static str>);
+    let log = "aa\nbb\ncc\ndd";
+    let regrow: &[Step] = &[("ab", None, None), ("ab\ntwo words", None, Some("two words"))];
+    type Row = (bool, bool, &'static str, (u16, u16), u16, (u16, u16), &'static [Step]);
+    let rows: &[Row] = &[
+        (true, true, log, (4, 2), 3, (1, 1), &[("aa\nbb\ncc\ndd\nee", None, Some("ee"))]),
+        (true, true, log, (4, 2), 3, (1, 0), &[("one\ntwo", None, Some("one"))]),
+        (true, false, "ab cd\nxy", (4, 2), 3, (1, 1), &[("xab cd\nxcd", Some(WrapMode::Word), Some("xab cd"))]),
+        (false, false, "old", (6, 2), 1, (1, 1), &[("old\nnew stuff", None, Some("ew "))]),
+        (true, false, "old", (6, 2), 1, (1, 1), &[("old\nnew stuff", None, Some("ew st"))]),
+        (false, false, "ab\ncd", (8, 2), 3, (1, 1), regrow),
+        (true, false, "ab\ncd", (8, 2), 3, (1, 1), regrow),
+    ];
+    for &(is_code, follow, first, (width, height), presses, (x, y), steps) in rows {
+        let app = TestApp::new(8, 4);
+        let text = Text::new(&app, first).size(width, height);
+        let code = Code::new(&app).size(width, height).follow(follow).set_code(first);
+        let _ = if is_code { app.root().add(&code) } else { app.root().add(&text) };
+        app.render();
+        let end = if presses == 1 { x + 4 } else { x };
+        for _ in 0..presses {
+            app.mouse(down, x, y);
+            if presses == 1 {
+                app.mouse(drag, end, y);
+            }
+            app.mouse(up, end, y);
+        }
+        for &(content, wrap, expected) in steps {
+            if is_code {
+                code.set_code(content);
+                if let Some(wrap) = wrap {
+                    code.wrap(wrap);
+                }
+            } else {
+                text.set_text(content);
+            }
+            app.render();
+            assert_eq!(app.selected_text().as_deref(), expected, "code {is_code}, {first:?} then {content:?}");
+        }
+        // Scrolling afterwards leaves the selection on its text.
+        if is_code {
+            code.perform(ScrollAction::Up);
+            app.render();
+            assert_eq!(app.selected_text().as_deref(), steps[steps.len() - 1].2, "{first:?} scrolled");
+        }
+    }
 }
 
 #[test]
@@ -1443,7 +2090,7 @@ fn code_views_and_textareas_join_a_selection() {
     // Shift+arrow in the textarea keeps only its own part.
     notes.focus();
     app.press("shift+right");
-    assert_eq!(code.selected_text(), "");
+    assert_eq!(code.set_code("let a = 3;").selected_text(), "");
     assert_eq!(title.selected_text(), "");
     assert_eq!(notes.selected_text(), "note ");
 }
@@ -1502,6 +2149,22 @@ fn a_palette_refresh_reports_what_came_once_and_runs_a_queued_refresh_after() {
     app.advance(Duration::from_secs(1));
     assert_eq!(seen.borrow().len(), 2);
     assert_eq!(app.palette().and_then(|palette| palette.background), Some(Color::rgb(255, 255, 255)));
+    // Any one color is an answer: the wait ends the refresh with only that color.
+    let (rgb, n) = (Color::rgb(1, 2, 3), None);
+    let c = Some(rgb);
+    for (calls, reply, expected) in [
+        (3, OscColor::Palette(0, rgb), (c, n, n, n)),
+        (4, OscColor::Foreground(rgb), (n, c, n, n)),
+        (5, OscColor::Background(rgb), (n, n, c, n)),
+        (6, OscColor::Cursor(rgb), (n, n, n, c)),
+    ] {
+        app.refresh_palette();
+        app.event(Event::Color(reply));
+        app.advance(Duration::from_secs(1));
+        let palette = app.palette().unwrap();
+        let got = (palette.colors[0], palette.foreground, palette.background, palette.cursor);
+        assert_eq!((seen.borrow().len(), got), (calls, expected), "{reply:?}");
+    }
 }
 
 #[test]
@@ -1531,6 +2194,8 @@ fn line_numbers_follow_wrapping_signs_and_colors() {
     let editor = Textarea::new(&app).grow(1.0);
     editor.set_text("one\ntwo is long\nthree");
     let numbered = LineNumbers::new(&app, &editor).grow(1.0);
+    // Before the first frame the editor has no width, so it wraps nothing.
+    assert_eq!(editor.view().info(false).unwrap().total_virtual_line_count, 3);
     app.root().add(&numbered);
     assert_eq!(rows(&app), [" 1 one", " 2 two is long", " 3 three", ""]);
     assert_eq!(app.render().cell(1, 0).unwrap().fg, app.theme().muted);
@@ -1655,6 +2320,20 @@ fn diffs_show_unified_and_split_views_with_numbers_signs_and_colors() {
 
     diff.set_diff("@@ broken\n");
     assert_eq!(rows(&app)[0], "Error parsing diff: unknown hunk header on line 1:");
+
+    // Same displayed text: changing every marker adds map buckets, not a string allocation per row.
+    diff.view(DiffView::Unified);
+    let context = format!("@@ -1,128 +1,128 @@\n{}", " x\n".repeat(128));
+    diff.set_diff(&context);
+    let rebuild = |patch: &str| {
+        let before = allocations::count();
+        diff.set_diff(patch);
+        allocations::count() - before
+    };
+    for (ranges, line) in [("-0,0 +1,128", "+x\n"), ("-1,128 +0,0", "-x\n")] {
+        let signed = format!("@@ {ranges} @@\n{}", line.repeat(128));
+        assert!(rebuild(&signed) < rebuild(&context) + 128, "each {line:?} row allocated its own sign");
+    }
 }
 
 #[test]
@@ -1700,22 +2379,57 @@ fn accelerated_wheel_bursts_scroll_further() {
     assert_eq!(scroll.scroll_position().1, 1.0);
 }
 
+// Core's offsets: a sticky box follows only its start edge, and stays stuck after a scroll in a range of one cell.
 #[test]
-fn sticky_boxes_follow_the_edge_they_start_at() {
-    use opentui::widget::ScrollEdge;
-    let app = TestApp::new(20, 4);
-    let scroll = scroll_box_with_lines(&app, 2).sticky(true).sticky_start(ScrollEdge::Top);
-    for line in 2..10 {
-        scroll.add(&Text::new(&app, format!("line {line}")));
+fn sticky_boxes_follow_only_the_edge_they_start_at() {
+    use opentui::widget::ScrollEdge::{self, *};
+    // Edge, content size, explicit scroll, grown size, offset after growing with and without a frame in between.
+    let cases: [(ScrollEdge, u16, f64, u16, [f64; 2]); 11] = [
+        (Bottom, 3, 0.0, 6, [4.0, 4.0]),
+        (Bottom, 4, 1.0, 6, [1.0, 1.0]),
+        (Bottom, 6, 0.0, 7, [0.0, 0.0]),
+        (Bottom, 6, 2.0, 7, [2.0, 2.0]),
+        (Bottom, 6, f64::INFINITY, 7, [5.0, 5.0]),
+        (Top, 3, 1.0, 6, [0.0, 0.0]),
+        (Top, 3, f64::INFINITY, 6, [0.0, 0.0]),
+        (Top, 6, f64::INFINITY, 7, [4.0, 5.0]),
+        (Top, 6, 2.0, 7, [2.0, 2.0]),
+        (Right, 3, 0.0, 6, [4.0, 4.0]),
+        (Left, 6, f64::INFINITY, 7, [4.0, 5.0]),
+    ];
+    for ((edge, before, to, after, expected), frame) in cases.into_iter().flat_map(|case| [(case, 0), (case, 1)]) {
+        let (app, x) = (TestApp::new(4, 2), matches!(edge, Left | Right));
+        let scroll = ScrollBox::new(&app).size(2, 2).axes(x, !x).scrollbars(false).sticky(true).sticky_start(edge);
+        let size =
+            |view: &View, length: u16| if x { view.width(length).height(2) } else { view.width(2).height(length) };
+        let content = size(&View::new(&app).shrink(0.0), before);
+        app.root().add(&scroll.child(&content));
+        app.render();
+        scroll.scroll_to(if x { to } else { 0.0 }, if x { 0.0 } else { to });
+        if frame == 0 {
+            app.render();
+        }
+        size(&content, after);
+        app.render();
+        let (offset_x, offset_y) = scroll.scroll_position();
+        assert_eq!(if x { offset_x } else { offset_y }, expected[frame], "{edge:?} {before} {to} {after} {frame}");
     }
+    // Both axes: x has no edge, and setting one edge leaves the other axis's follow alone.
+    let app = TestApp::new(4, 2);
+    let scroll = ScrollBox::new(&app).size(2, 2).axes(true, true).scrollbars(false).sticky(true);
+    let content = View::new(&app).shrink(0.0).width(6).height(8);
+    app.root().add(&scroll.child(&content));
     app.render();
-    assert_eq!(scroll.scroll_position().1, 0.0);
-    scroll.perform(ScrollAction::Bottom);
+    scroll.scroll_to(f64::INFINITY, 3.0);
     app.render();
-    scroll.add(&Text::new(&app, "line 10"));
+    content.width(8).height(4);
     app.render();
-    assert_eq!(scroll.scroll_position().1, 7.0);
-    assert!(rows(&app)[3].starts_with("line 10"));
+    assert_eq!(scroll.scroll_position(), (4.0, 2.0));
+    scroll.sticky_start(Right);
+    app.render();
+    content.height(8);
+    app.render();
+    assert_eq!(scroll.scroll_position(), (6.0, 2.0));
 }
 
 #[test]
@@ -1782,11 +2496,11 @@ fn markdown_renders_nested_lists_quotes_and_tables() {
             "│ - inside",
             "",
             "┌──────────────┬─────────────┐",
-            "│Name          │Size         │",
+            "│Name          │         Size│",
             "├──────────────┼─────────────┤",
-            "│a             │1            │",
+            "│a             │            1│",
             "├──────────────┼─────────────┤",
-            "│bb            │22           │",
+            "│bb            │           22│",
             "└──────────────┴─────────────┘",
             "",
             "",
@@ -1862,15 +2576,21 @@ fn atomic_extmarks_move_with_edits_and_act_as_one_unit() {
     // Text typed before the mark moves it.
     app.type_text("a ");
     assert_eq!(input.value(), "see a @main.rs now");
-    assert_eq!(input.extmark(mention).unwrap().range(), 6..14);
+    let saved = input.extmark(mention).unwrap();
+    assert_eq!(saved.range(), 6..14);
     assert_eq!(input.extmarks_at(10).len(), 1);
     // Backspace at its end deletes all of it as one edit.
     input.set_cursor_offset(14);
     app.press("backspace");
     assert_eq!(input.value(), "see a  now");
     assert_eq!(input.extmark(mention), None);
+    // Undo brings the mark back with the text, its options included, and redo removes it again (473).
     app.press("ctrl+-");
     assert_eq!(input.value(), "see a @main.rs now");
+    assert_eq!(input.extmark(mention), Some(saved));
+    app.press("ctrl+.");
+    assert_eq!((input.value().as_str(), input.extmark(mention)), ("see a  now", None));
+    app.press("ctrl+-");
     // Delete at the start of a mark does the same; replacing the value removes every mark.
     let again = input.add_extmark(6..14, ExtmarkOptions::default().atomic());
     input.set_cursor_offset(6);
@@ -1882,25 +2602,202 @@ fn atomic_extmarks_move_with_edits_and_act_as_one_unit() {
 }
 
 #[test]
-fn vertical_moves_into_an_atomic_extmark_go_to_its_nearer_edge() {
+fn moves_into_an_atomic_extmark_go_to_its_nearer_edge() {
     use opentui::widget::ExtmarkOptions;
+    // As Core's: nearer the start goes to the start of the character before it, even a wide one or a tab, or with
+    // none to the end of the line above; halfway or nearer the end to the end. The mark is on row 1 after `char`, at
+    // 11 + width..19 + width.
+    for (char, width) in [("a", 1), ("日", 2), ("👍", 2), ("\t", 2), ("", 0)] {
+        let app = TestApp::new(20, 4);
+        let area = Textarea::new(&app).grow(1.0);
+        area.set_text(format!("0123456789\n{char}@main.rs\nxxxxxxxxxx"));
+        app.root().add(&area);
+        area.focus();
+        area.add_extmark(11 + width..19 + width, ExtmarkOptions::default().atomic());
+        app.render();
+        let before = if width == 0 { 10 } else { 11 };
+        for (key, from, to) in [
+            ("left", 19 + width, before),
+            ("down", width + 1, before),
+            ("up", 20 + width + width + 1, before),
+            ("down", width + 4, 19 + width),
+            ("down", width + 6, 19 + width),
+        ] {
+            area.set_cursor_offset(from);
+            app.press(key);
+            assert_eq!(area.cursor_offset(), to, "{key} from {from} after {char:?}");
+        }
+    }
+    // Down never goes back: when the start of the character before the mark is where it started, it goes to the end,
+    // and past marks that overlap that end, but not past one that starts there.
+    let wrapped = "日@mainrsxyzuvwABCDEFGHIJKL";
+    for (text, columns, from, marks, to) in [
+        ("a\n\n@main.rs\nb", 20, 2, &[(3, 11)][..], 11),
+        (wrapped, 6, 0, &[(2, 15)], 15),
+        (wrapped, 6, 0, &[(2, 15), (14, 19), (18, 23), (22, 27)], 27),
+        (wrapped, 6, 0, &[(2, 15), (15, 17)], 15),
+    ] {
+        let app = TestApp::new(columns, 4);
+        let area = Textarea::new(&app).grow(1.0);
+        area.set_text(text);
+        app.root().add(&area);
+        area.focus();
+        for &(start, end) in marks {
+            area.add_extmark(start..end, ExtmarkOptions::default().atomic());
+        }
+        app.render();
+        area.set_cursor_offset(from);
+        app.press("down");
+        assert_eq!(area.cursor_offset(), to, "down from {from} with {marks:?}");
+    }
+    // Overlapping marks: Up and Backspace take the mark added first, whatever its position.
     let app = TestApp::new(20, 4);
     let area = Textarea::new(&app).grow(1.0);
-    area.set_text("0123456789\nab@main.rs\nxxxxxxxxxx");
+    area.set_text("0123456789\n0123456789\n0123456789");
     app.root().add(&area);
     area.focus();
-    area.add_extmark(13..21, ExtmarkOptions::default().atomic());
+    for (start, end) in [(14, 20), (11, 16)] {
+        area.add_extmark(start..end, ExtmarkOptions::default().atomic());
+    }
     app.render();
-    // As Core's: nearer the start goes to one before it, nearer the end to the end.
-    area.set_cursor_offset(3);
-    app.press("down");
-    assert_eq!(area.cursor_offset(), 12);
-    area.set_cursor_offset(8);
-    app.press("down");
-    assert_eq!(area.cursor_offset(), 21);
     area.set_cursor_offset(26);
     app.press("up");
-    assert_eq!(area.cursor_offset(), 12);
+    assert_eq!(area.cursor_offset(), 11);
+    area.set_text("abcd");
+    for (start, end) in [(1, 4), (0, 4)] {
+        area.add_extmark(start..end, ExtmarkOptions::default().atomic());
+    }
+    area.set_cursor_offset(4);
+    app.press("backspace");
+    assert_eq!(area.text(), "a");
+    // One mark at a time: chips whose separator spaces were deleted are stepped over and deleted one by one; an older
+    // mark around the cursor does not hide a newer one whose edge is there; the second cell of a wide character is
+    // not a stop; Up from the end of a wrapped mark does not stay there. The cursor is set before the marks.
+    for (text, columns, marks, from, keys, to, after) in [
+        ("xx @a@b@c yy", 20, &[(3, 5), (5, 7), (7, 9)][..], 2, &["right", "delete", "backspace"][..], 3, "xx @c yy"),
+        ("abcdefghijklmno", 20, &[(1, 8), (3, 6)], 3, &["delete"], 3, "abcghijklmno"),
+        ("abcdefghijklmno", 20, &[(1, 8), (3, 6)], 6, &["backspace"], 3, "abcghijklmno"),
+        ("a日b", 20, &[], 2, &[], 1, "a日b"),
+        (wrapped, 6, &[(2, 15)], 15, &["up"], 0, wrapped),
+    ] {
+        let app = TestApp::new(columns, 4);
+        let area = Textarea::new(&app).grow(1.0);
+        area.set_text(text);
+        app.root().add(&area);
+        area.focus();
+        app.render();
+        area.set_cursor_offset(from);
+        for &(start, end) in marks {
+            area.add_extmark(start..end, ExtmarkOptions::default().atomic());
+        }
+        keys.iter().for_each(|key| app.press(key));
+        assert_eq!((area.cursor_offset(), area.text().as_str()), (to, after), "{keys:?} from {from} in {text:?}");
+    }
+}
+
+#[test]
+fn mouse_and_wheel_leave_the_cursor_outside_atomic_extmarks() {
+    use opentui::widget::ExtmarkOptions;
+    // One row of a 24x2 app; a click on row 1 clears a selection left. While a selection is left the cursor and the
+    // selection are `held`. A press's handlers see the pressed cell; then a pointer leaves the cursor at the nearer
+    // outer edge of the marks around it, a cleared drag at the side it came from, the wheel and the setter at the edge
+    // they moved toward. "press" drags through its other cells and types Z before the release. `then` is a key, a wheel step or an offset after the gesture.
+    let one = &[(2, 7)][..];
+    let pasted = "x [Pasted ~20 lines] y";
+    // Rows "@file ", "abcdefghijklmnopqrstuvwx", "yzabcdefghijklmnopqrstuv", "wxyz", "q": a wheel step lands on "wxyz".
+    let wrapped = "@file abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\nq";
+    for (text, marks, from, gesture, held, to) in [
+        ("x @file y", one, 9, "click 2", None, 2),
+        ("x @file y", one, 9, "click 3", None, 2),
+        ("x @file y", one, 9, "click 5", None, 7),
+        ("x @file y", one, 9, "press 3", None, 3),
+        ("x @file y", one, 9, "press 3 5 3", None, 3),
+        (pasted, &[(2, 20)], 22, "click 15", None, 20),
+        ("x @file y", one, 9, "double-click 4", Some((4, (2, 7))), 2),
+        ("x @file y", one, 9, "double-click 4, offset 3", None, 2),
+        ("x @file y", one, 9, "drag 0 4", Some((4, (0, 5))), 2),
+        ("x @file y", one, 9, "drag 8 4", Some((4, (4, 9))), 7),
+        ("x @file y", one, 9, "drag 8 6", Some((6, (6, 9))), 7),
+        ("x @file y", one, 9, "drag 0 4, right", None, 7),
+        ("x @file y", one, 9, "drag 8 6, shift+left", Some((2, (2, 9))), 2),
+        ("x @file y", one, 9, "offset 1, shift+right", Some((7, (1, 8))), 7),
+        ("x @file y", one, 9, "drag 0 1, shift+right", Some((2, (0, 3))), 2),
+        ("b ca", &[(0, 3), (0, 4)], 4, "click 2", None, 4),
+        ("b ca", &[(0, 4), (0, 3)], 4, "click 2", None, 4),
+        ("abcdefgh", &[(0, 6), (2, 8)], 8, "click 3", None, 0),
+        ("abcdefgh", &[(2, 8), (0, 6)], 8, "click 3", None, 0),
+        ("b ca", &[(0, 3), (0, 4)], 0, "offset 2", None, 4),
+        ("b ca", &[(0, 4), (0, 3)], 4, "offset 2", None, 0),
+        ("abcd", &[(2, 4), (1, 3), (0, 2)], 0, "offset 1", None, 4),
+        ("ab\n@file\nc", &[(3, 8)], 2, "wheel down", None, 8),
+        ("ab\n@file\nc", &[(3, 8)], 10, "wheel up", None, 3),
+        (wrapped, &[(0, 5)], 60, "wheel up", None, 55),
+        ("abcd\n@file\nc", &[(5, 10)], 0, "double-click 2, wheel down", Some((7, (0, 4))), 5),
+    ] {
+        let app = TestApp::new(24, 2);
+        let area = Textarea::new(&app).set_text(text).height(1);
+        app.root().add(&area);
+        area.focus();
+        for &(start, end) in marks {
+            area.add_extmark(start..end, ExtmarkOptions::default().atomic());
+        }
+        area.set_cursor_offset(from);
+        app.render();
+        // As OpenCode's prompt: after a press, look up the mark under the cursor.
+        let pressed = Rc::new(Cell::new(None));
+        area.on_mouse({
+            let (area, pressed) = (area.clone(), Rc::clone(&pressed));
+            move |cx, event| {
+                if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                    let (area, pressed) = (area.clone(), Rc::clone(&pressed));
+                    cx.app().defer(move |_| pressed.set(Some(area.cursor_offset())));
+                }
+            }
+        });
+        let (first, then) = gesture.split_once(", ").unwrap_or((gesture, ""));
+        let n: Vec<u16> = first.split(' ').filter_map(|n| n.parse().ok()).collect();
+        match first.split(' ').next().unwrap() {
+            "click" => app.click(n[0], 0),
+            "press" => {
+                app.mouse(MouseEventKind::Down(MouseButton::Left), n[0], 0);
+                n[1..].iter().for_each(|&x| app.mouse(MouseEventKind::Drag(MouseButton::Left), x, 0));
+                app.type_text("Z");
+                app.mouse(MouseEventKind::Up(MouseButton::Left), n[n.len() - 1], 0);
+                assert_eq!(area.text(), "x Z@file y", "{gesture}: typed before the release");
+            }
+            "double-click" => (0..2).for_each(|_| app.click(n[0], 0)),
+            "drag" => app.drag((n[0], 0), (n[1], 0)),
+            "offset" => drop(area.set_cursor_offset(u32::from(n[0]))),
+            _ => app.scroll(0, 0, first.ends_with("down")),
+        }
+        if first.starts_with("click") || first.starts_with("press") {
+            assert_eq!(pressed.get(), Some(u32::from(n[0])), "{gesture}: the press's handler");
+        }
+        match then.split_once(' ') {
+            Some(("wheel", way)) => app.scroll(0, 0, way == "down"),
+            Some(("offset", at)) => drop(area.set_cursor_offset(at.parse().unwrap())),
+            _ if !then.is_empty() => app.press(then),
+            _ => {}
+        }
+        let selection = area.view().selection().unwrap().filter(|(start, end)| start != end);
+        assert_eq!(selection.map(|range| (area.cursor_offset(), range)), held, "{gesture} in {text:?} with {marks:?}");
+        if selection.is_some() {
+            app.click(0, 1);
+        }
+        assert_eq!(area.cursor_offset(), to, "{gesture} from {from} in {text:?} with {marks:?}");
+    }
+    // An undo that brings back the only mark leaves the cursor outside it, as other edits do.
+    let app = TestApp::new(24, 2);
+    let area = Textarea::new(&app).set_text("x ABCD y").height(1);
+    app.root().add(&area);
+    area.focus();
+    area.add_extmark(2..6, ExtmarkOptions::default().atomic());
+    app.render();
+    app.drag((0, 0), (3, 0));
+    app.press("backspace");
+    assert_eq!(area.text(), "CD y");
+    app.press("ctrl+-");
+    assert_eq!((area.text().as_str(), area.cursor_offset()), ("x ABCD y", 6));
 }
 
 #[test]
@@ -1997,6 +2894,11 @@ fn the_console_shows_messages_from_any_thread() {
     // Following new messages; moving and resizing; Escape hides it.
     console.log(LogLevel::Error, "failed");
     assert!(rows(&app)[9].ends_with("ERROR failed"));
+    // Scrolled up, it keeps its place as messages arrive.
+    console.focus();
+    app.press("home");
+    console.log(LogLevel::Info, "later");
+    assert!(rows(&app)[8].ends_with("starting"), "{:?}", rows(&app));
     console.position(ConsolePosition::Right).size_percent(50.0);
     assert!(rows(&app)[0].starts_with("app content         "), "{:?}", rows(&app));
     console.focus();
@@ -2036,6 +2938,41 @@ fn drags_report_targets_and_drops() {
     log.borrow_mut().clear();
     app.drag((1, 0), (3, 0));
     assert!(log.borrow().is_empty());
+    // A press during a drag means the drag's release was lost: the press ends the drag, with its leaves before its own
+    // handlers and no drop, on the old target, elsewhere or on the source, and a drag it starts is its own.
+    let reenter = Rc::new(Cell::new(false));
+    app.root().on_mouse({
+        let (log, reenter) = (Rc::clone(&log), Rc::clone(&reenter));
+        move |cx, event| {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                log.borrow_mut().push("press".to_owned());
+                if reenter.get() {
+                    let drag = MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), x: 22, y: 1, ..*event };
+                    cx.app().dispatch(Event::Mouse(drag));
+                }
+            }
+        }
+    });
+    for ((x, y), (to_x, to_y), drag) in [((22, 1), (23, 1), true), ((12, 1), (13, 1), true), ((1, 0), (22, 1), false)] {
+        log.borrow_mut().clear();
+        app.mouse(MouseEventKind::Down(MouseButton::Left), 1, 0);
+        app.mouse(MouseEventKind::Drag(MouseButton::Left), 22, 1);
+        app.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        if drag {
+            app.mouse(MouseEventKind::Drag(MouseButton::Left), to_x, to_y);
+        }
+        app.mouse(MouseEventKind::Up(MouseButton::Left), to_x, to_y);
+        assert_eq!(*log.borrow(), ["press", "right over", "right out", "press"]);
+    }
+    // A drag that the press's handler starts is the new gesture's: its own release ends it, with a drop.
+    log.borrow_mut().clear();
+    app.mouse(MouseEventKind::Down(MouseButton::Left), 1, 0);
+    app.mouse(MouseEventKind::Drag(MouseButton::Left), 22, 1);
+    reenter.set(true);
+    app.mouse(MouseEventKind::Down(MouseButton::Left), 1, 0);
+    app.mouse(MouseEventKind::Up(MouseButton::Left), 22, 1);
+    let ends = ["press", "right over", "right out", "press", "right over", "right out", "drop on right at 22"];
+    assert_eq!(*log.borrow(), ends);
 }
 
 #[test]

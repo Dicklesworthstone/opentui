@@ -14,8 +14,10 @@ import {
 import { StyledText, fg } from "../lib/styled-text.js"
 import type { ExtmarksController } from "../lib/extmarks.js"
 
-// A key sequence with a control character is a key that has no binding, not text. Paste keeps controls.
+// A key sequence with a control character is a key that has no binding, not text.
 const unsupportedKeyCharacters = /[\x00-\x1f\x7f-\x9f]/
+// A paste drops control characters (Unicode Cc) but tab, LF and CR once escape sequences are gone, as Rust's editors.
+const pastedControlCharacters = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g
 
 function clonePlaceholder(value: StyledText | string | null): StyledText | string | null {
   if (value === null || typeof value === "string") return value
@@ -134,6 +136,7 @@ export const defaultTextareaKeyBindings: KeyBinding[] = [
   { name: "right", super: true, action: "visual-line-end" },
   { name: "up", super: true, action: "buffer-home" },
   { name: "down", super: true, action: "buffer-end" },
+  { name: "backspace", super: true, action: "delete-to-line-start" },
   { name: "left", super: true, shift: true, action: "select-visual-line-home" },
   { name: "right", super: true, shift: true, action: "select-visual-line-end" },
   { name: "up", super: true, shift: true, action: "select-buffer-home" },
@@ -282,7 +285,7 @@ export class TextareaRenderable extends EditBufferRenderable {
   }
 
   public handlePaste(event: PasteEvent): void {
-    this.insertText(stripAnsiSequences(decodePasteBytes(event.bytes)))
+    this.insertText(stripAnsiSequences(decodePasteBytes(event.bytes)).replace(pastedControlCharacters, ""))
   }
 
   public handleKeyPress(key: KeyEvent): boolean {
@@ -411,9 +414,9 @@ export class TextareaRenderable extends EditBufferRenderable {
     return this._submitListener
   }
 
-  public set keyBindings(bindings: KeyBinding[]) {
-    this._keyBindings = bindings
-    const mergedBindings = mergeKeyBindings(defaultTextareaKeyBindings, bindings)
+  public set keyBindings(bindings: KeyBinding[] | null | undefined) {
+    this._keyBindings = bindings ?? []
+    const mergedBindings = mergeKeyBindings(defaultTextareaKeyBindings, this._keyBindings)
     this._keyBindingsMap = buildKeyBindingsMap(mergedBindings, this._keyAliasMap)
   }
 
@@ -423,6 +426,7 @@ export class TextareaRenderable extends EditBufferRenderable {
     this._keyBindingsMap = buildKeyBindingsMap(mergedBindings, this._keyAliasMap)
   }
 
+  /** Mark endpoints count document display cells, including one per newline. */
   public get extmarks(): ExtmarksController {
     return this.editorView.extmarks
   }

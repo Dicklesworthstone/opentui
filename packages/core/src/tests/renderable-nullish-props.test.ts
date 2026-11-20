@@ -5,7 +5,7 @@ import { CliRenderEvents, Renderable, RGBA, SyntaxStyle, TabSelectRenderable } f
 import { createTestRenderer, type TestRenderer } from "../testing/test-renderer.js"
 import { Edge, Gutter } from "../yoga.js"
 
-// React writes `null` when a prop is removed, and Solid writes `undefined` when a prop expression becomes undefined.
+// React and Solid write `undefined` when a prop or style key is removed, and `null` when the app passes it.
 // Every public setter of every exported renderable accepts both, keeps frames rendering, and restores the value that
 // the constructor uses when the option is omitted.
 
@@ -16,10 +16,7 @@ const excludedClasses: Record<string, string> = {
 
 // Key: `prop` for every class, or `Class.prop`. None of these accepted a nullish write on `main` either, unless noted.
 const excludedProps: Record<string, string> = {
-  keyBindings: "list without a default",
   traits: "editor traits without a default",
-  cursorStyle: "style object without a default",
-  options: "Select, TabSelect: option list without a default",
   "TextRenderable.content": "text without a default",
   "CodeRenderable.content": "text without a default",
   "InputRenderable.value": "text without a default",
@@ -74,6 +71,9 @@ const layoutSamples: Record<string, unknown> = {
   flexWrap: "wrap",
   layoutMode: "list",
   alignItems: "center",
+  alignContent: "space-evenly",
+  aspectRatio: 1.5,
+  boxSizing: "content-box",
   alignSelf: "center",
   justifyContent: "center",
   position: "absolute",
@@ -89,9 +89,8 @@ const layoutSamples: Record<string, unknown> = {
 
 const edges = [Edge.Left, Edge.Top, Edge.Right, Edge.Bottom, Edge.Horizontal, Edge.Vertical, Edge.All]
 const styleGetters = `getWidth getHeight getMinWidth getMinHeight getMaxWidth getMaxHeight getFlexBasis getFlexGrow
-  getFlexShrink getFlexDirection getFlexWrap getAlignItems getAlignSelf getJustifyContent getPositionType`.split(
-  /\s+/,
-) as (keyof Renderable)[]
+  getFlexShrink getFlexDirection getFlexWrap getAlignItems getAlignContent getAspectRatio getBoxSizing getAlignSelf
+  getJustifyContent getPositionType`.split(/\s+/) as (keyof Renderable)[]
 
 // The constructor overrides these options.
 const constructorOverrides = { "DiffRenderable.flexDirection": "view", "MarkdownRenderable.flexDirection": "column" }
@@ -138,6 +137,62 @@ function classOptions(name: string, style = syntaxStyle): object {
   }
   return { width: 12, height: 4, ...options[name] }
 }
+
+test.each([
+  ["split diff", "left-code", "right-code"],
+  ["invalid diff", "error-code"],
+  ["markdown", "block-0", "block-2"],
+])("%s updates existing code panes when the client changes", (kind, ...ids) => {
+  const node =
+    kind === "markdown"
+      ? new core.MarkdownRenderable(renderer, { id: "doc", syntaxStyle, content: "```\na\n```\n\ntext\n\n```\nb\n```" })
+      : new core.DiffRenderable(renderer, {
+          id: "doc",
+          view: "split",
+          syntaxStyle,
+          diff:
+            kind === "split diff" ? "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b" : "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n x",
+        })
+  renderer.root.add(node)
+  const panes = ids.map((id) => node.findDescendantById(`doc-${id}`) as core.CodeRenderable)
+  const fallback = core.getTreeSitterClient()
+  const custom = new Proxy(fallback, {})
+  for (const client of [custom, undefined]) {
+    node.treeSitterClient = client
+    expect(node.treeSitterClient === client).toBe(true)
+    for (const pane of panes) expect(pane.treeSitterClient === (client ?? fallback)).toBe(true)
+  }
+  node.destroyRecursively()
+})
+
+test.each([
+  ["lineNumbers", new Map([[0, 42]])],
+  ["lineSigns", new Map([[0, { before: ">" }]])],
+  ["lineColors", new Map([[0, "red"]])],
+  ["hideLineNumbers", new Set([0])],
+] as const)("gutter paints a live %s write like the constructor", async (key, value) => {
+  const mount = (options: core.LineNumberOptions) => {
+    const numbers = new core.LineNumberRenderable(renderer, options)
+    numbers.add(new core.TextRenderable(renderer, { content: "first\nsecond" }))
+    renderer.root.add(numbers)
+    return numbers
+  }
+  const frame = async () => {
+    await renderOnce()
+    return captureSpans()
+  }
+  const fresh = mount({ [key]: value })
+  const expected = await frame()
+  fresh.destroyRecursively()
+  const live = mount({})
+  const initial = await frame()
+  expect(initial).not.toEqual(expected)
+  Object.assign(live, { [key]: value })
+  expect(await frame()).toEqual(expected)
+  Object.assign(live, { [key]: undefined })
+  expect(await frame()).toEqual(initial)
+  live.destroyRecursively()
+})
 
 const renderableClasses = Object.entries(core).filter(
   (entry): entry is [string, RenderableClass] =>

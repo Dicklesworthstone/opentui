@@ -1,4 +1,4 @@
-import { BaseRenderable, Renderable, type RenderableOptions } from "../Renderable.js"
+import { type BaseRenderable, isRenderable, Renderable, type RenderableOptions } from "../Renderable.js"
 import type { CliRenderer } from "../renderer.js"
 import type { RenderContext } from "../types.js"
 import { createSlotRegistry, SlotRegistry, type SlotRegistryOptions } from "./registry.js"
@@ -152,7 +152,7 @@ function ensureValidNode(node: unknown, pluginId: string, mount: BaseRenderable)
     throw new Error(`Plugin "${pluginId}" returned an async value. Core slots require synchronous renderers.`)
   }
 
-  if (!(node instanceof BaseRenderable)) {
+  if (!isRenderable(node)) {
     throw new Error(`Plugin "${pluginId}" must return a BaseRenderable`)
   }
 
@@ -560,17 +560,21 @@ export class SlotRenderable<
       }
     }
 
+    // Plugin nodes arrive as BaseRenderable; go through the wide dynamic
+    // contract, which validates at runtime.
+    const mountTarget: BaseRenderable = this
+
     for (let index = 0; index < desiredNodes.length; index++) {
       const node = desiredNodes[index]
 
       if (node.parent !== this) {
-        this.add(node, index)
+        mountTarget.add(node, index)
         continue
       }
 
       const childAtIndex = this.getChildren()[index]
       if (childAtIndex !== node) {
-        this.add(node, index)
+        mountTarget.add(node, index)
       }
     }
 

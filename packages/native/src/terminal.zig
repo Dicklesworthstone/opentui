@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const atomic = std.atomic;
 const assert = std.debug.assert;
+const api = @import("context_abi_c");
 const ansi = @import("ansi.zig");
 const base64Encode = @import("utils.zig").base64Encode;
 const utf8 = @import("utf8.zig");
@@ -13,7 +14,7 @@ pub const Terminal = @This();
 
 const kitty_queries_max = 4;
 /// Kitty keyboard flags that stop raw ESC: disambiguate and report all keys.
-const kitty_escape_flags: u8 = 0b1001;
+const kitty_escape_flags: u8 = api.OT_KITTY_KEYBOARD_DISAMBIGUATE | api.OT_KITTY_KEYBOARD_ALL_KEYS_AS_ESCAPES;
 
 pub const Capabilities = struct {
     kitty_keyboard: bool = false,
@@ -102,11 +103,17 @@ pub const MouseLevel = enum {
     pixels, // pixel coordinates
 };
 
+/// Ordinals are opentui.h's OT_CURSOR_STYLE_* values.
 pub const CursorStyle = enum {
     block,
     line,
     underline,
     default,
+
+    comptime {
+        for (.{ .{ .block, api.OT_CURSOR_STYLE_BLOCK }, .{ .line, api.OT_CURSOR_STYLE_LINE }, .{ .underline, api.OT_CURSOR_STYLE_UNDERLINE }, .{ .default, api.OT_CURSOR_STYLE_DEFAULT } }) |pair|
+            if (@backingInt(@as(CursorStyle, pair[0])) != pair[1]) @compileError("CursorStyle differs from opentui.h");
+    }
 };
 
 pub const MousePointerStyle = enum(u8) {
@@ -192,16 +199,10 @@ pub const ClipboardTarget = enum(u8) {
 };
 
 pub const Options = struct {
-    // Kitty keyboard protocol flags (progressive enhancement):
+    // Kitty keyboard protocol flags (progressive enhancement), opentui.h's OT_KITTY_KEYBOARD_*:
     // See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement
-    // Bit 0 (0b1):     Disambiguate escape codes (fixes ESC timing, alt+key ambiguity, ctrl+c as event)
-    // Bit 1 (0b10):    Report event types (press/repeat/release)
-    // Bit 2 (0b100):   Report alternate keys (e.g., numpad vs regular, shifted, base layout)
-    // Bit 3 (0b1000):  Report all keys as escape codes
-    // Bit 4 (0b10000): Report text associated with key events
-    // Default 0b00101 (5) = disambiguate + alternate keys
-    // Use 0b00111 (7) to also enable event types for key release detection
-    kitty_keyboard_flags: u8 = 0b00101,
+    // Add EVENT_TYPES for key release detection.
+    kitty_keyboard_flags: u8 = api.OT_KITTY_KEYBOARD_DISAMBIGUATE | api.OT_KITTY_KEYBOARD_ALTERNATE_KEYS,
     remote_mode: RemoteMode = .local,
     // Optional forwarded environment values. Caller owns the map.
     env_map: ?*const std.process.Environ.Map = null,
@@ -231,6 +232,9 @@ skip_explicit_width_query: bool = false,
 startup_cursor_query_pending: bool = false,
 startup_cursor_query_captured: bool = false,
 explicit_width_probe_reports_pending: u8 = 0,
+explicit_width_probe_first_column: u16 = 0,
+/// Setup probes OSC 66 (an alternate screen of 3+ rows), so the probe's answer, not XTVERSION, decides explicit width.
+explicit_width_probed: bool = false,
 /// The host ends each query batch with DA1 and waits for its reply (sentinel mode).
 reply_sentinel: bool = false,
 synchronized_output: SynchronizedOutput = .auto,
@@ -394,11 +398,9 @@ pub fn queryTerminalSend(self: *Terminal, tty: anytype) !void {
     self.state.theme_queries_sent = true;
 
     // Send xtversion first (used for tmux detection)
-    try tty.writeAll(ansi.ANSI.xtversion ++
-        ansi.ANSI.hideCursor ++
-        ansi.ANSI.saveCursorState);
+    try tty.writeAll(ansi.ANSI.xtversion ++ ansi.ANSI.hideCursor);
 
-    // Capture the current cursor position before temporary home-position queries.
+    // Capture the startup cursor position, which seeds the split scrollback.
     try tty.writeAll(ansi.ANSI.cursorPositionRequest);
 
     // Probes are never DCS wrapped, and screen prints a DCS body as text. tmux
@@ -416,26 +418,22 @@ pub fn queryTerminalSend(self: *Terminal, tty: anytype) !void {
     self.recordKittyQuery();
 
     // Inside tmux, graphics replies cannot describe the passthrough endpoint.
-    if (!self.skip_graphics_query and !self.isInTmux()) {
-        try tty.writeAll(ansi.ANSI.kittyGraphicsQuery);
-        if (!self.reply_sentinel) try tty.writeAll(ansi.ANSI.primaryDeviceAttrs);
-    }
+    if (!self.skip_graphics_query and !self.isInTmux() and !self.remoteTmuxHint()) try tty.writeAll(ansi.ANSI.kittyGraphicsQuery);
+    // Its reply settles the 2026 decision and Sixel; sentinel mode sends it at the end of setup instead.
+    if (!self.reply_sentinel) try tty.writeAll(ansi.ANSI.primaryDeviceAttrs);
 
-    if (!self.skip_explicit_width_query) {
-        self.explicit_width_probe_reports_pending = 2;
-        try tty.writeAll(ansi.ANSI.home ++
-            ansi.ANSI.explicitWidthQuery ++
-            ansi.ANSI.cursorPositionRequest ++
-            ansi.ANSI.home ++
-            ansi.ANSI.scaledTextQuery ++
-            ansi.ANSI.cursorPositionRequest);
-    } else {
-        self.explicit_width_probe_reports_pending = 0;
-    }
+    // Only queryExplicitWidth's own reports count; a key between packets is not one.
+    self.explicit_width_probe_reports_pending = 0;
+}
 
-    try tty.writeAll(ansi.ANSI.restoreCursorState);
-    // Terminals answer in order: the DA1 reply follows every other reply of the batch.
-    if (self.reply_sentinel) try tty.writeAll(ansi.ANSI.primaryDeviceAttrs);
+/// Draws OSC 66 probes: call only on the alternate screen just entered; it saves its own cursor, not another app's.
+/// They run on row 2 (the 2-row `s=2` cell needs row 3), so no reply equals a modified F3 key (`CSI 1;m R`).
+pub fn queryExplicitWidth(self: *Terminal, tty: anytype) !void {
+    if (self.skip_explicit_width_query) return;
+    self.explicit_width_probe_reports_pending = 2;
+    const row_two = "\x1b[2H";
+    try tty.writeAll(ansi.ANSI.saveCursorState ++ row_two ++ ansi.ANSI.explicitWidthQuery ++ ansi.ANSI.cursorPositionRequest ++
+        row_two ++ ansi.ANSI.scaledTextQuery ++ ansi.ANSI.cursorPositionRequest ++ ansi.ANSI.restoreCursorState);
 }
 
 /// ConPTY draws 24-bit color, but a remote app's output never reaches this process's console.
@@ -613,13 +611,12 @@ fn detectNotificationProtocol(value: []const u8) ?NotificationProtocol {
         return .osc777;
     }
 
-    // OSC 9 is the iTerm2 notification sequence. ConEmu also uses OSC 9 for
-    // multiple extensions, so use it only for terminal families with documented
-    // notification support rather than as a generic fallback.
+    // OSC 9 is the iTerm2 notification sequence. ConEmu reads every OSC 9 as
+    // one of its subcommands and shows no notification, so use it only for
+    // terminal families with documented notification support.
     if (std.ascii.findIgnoreCase(value, "iterm") != null or
         std.ascii.findIgnoreCase(value, "Apple_Terminal") != null or
-        std.ascii.findIgnoreCase(value, "Terminal.app") != null or
-        std.ascii.findIgnoreCase(value, "conemu") != null)
+        std.ascii.findIgnoreCase(value, "Terminal.app") != null)
     {
         return .osc9;
     }
@@ -1322,6 +1319,16 @@ fn identityEnv(self: *const Terminal) ?*const std.process.Environ.Map {
     return env_map;
 }
 
+/// A remote client's TMUX (a tmux server started from an ssh login) or tmux TERM (ssh from a client tmux):
+/// tmux shows an unwrapped graphics query as its pane title, and its XTVERSION reply comes after the startup
+/// batch. The hint only holds that query back; like the other identity keys, it does not name the multiplexer.
+fn remoteTmuxHint(self: *const Terminal) bool {
+    if (self.identityEnv() != null) return false;
+    const env = self.opts.env_map orelse return false;
+    const tmux: []const u8 = env.get("TMUX") orelse "";
+    return tmux.len > 0 or std.mem.startsWith(u8, env.get("TERM") orelse "", "tmux");
+}
+
 /// TERM comes from the innermost terminal. TERM_PROGRAM can be inherited from the terminal that
 /// started it, so it counts only when TERM does not name another terminal.
 fn envWidthIdentity(self: *const Terminal, env: *const std.process.Environ.Map) WidthIdentity {
@@ -1422,17 +1429,19 @@ pub fn processCapabilityResponse(self: *Terminal, response: []const u8) void {
             self.setCursorPosition(col, row, self.state.cursor.visible);
             self.startup_cursor_query_captured = true;
             self.startup_cursor_query_pending = false;
-        } else if (self.explicit_width_probe_reports_pending > 0) {
+        } else if (self.explicit_width_probe_reports_pending > 0 and row == 2 and col <= 3) {
+            // A probe reply is on row 2, columns 1 to 3; a key or a repeated report forwarded as a reply is skipped.
             const probe_index = 2 - self.explicit_width_probe_reports_pending;
             self.explicit_width_probe_reports_pending -= 1;
             // Terminals answer in order, and the probes follow the capability queries.
             self.sync_reply_settled = true;
 
-            if (row == 1 and probe_index == 0 and col == 2) {
+            // A terminal that draws `w=1` (column 2) also moves for `s=2`: kitty to column 3, foot to 2. Deciding on
+            // the pair keeps a stray column-2 report, such as a repeated startup report, from passing alone.
+            if (probe_index == 0) self.explicit_width_probe_first_column = col;
+            if (probe_index == 1 and self.explicit_width_probe_first_column == 2 and col >= 2) {
                 self.caps.explicit_width = true;
-            } else if (row == 1 and probe_index == 1 and col == 3) {
-                self.caps.explicit_width = true;
-                self.caps.scaled_text = true;
+                self.caps.scaled_text = col == 3;
             }
         }
 
@@ -1462,6 +1471,14 @@ pub fn processCapabilityResponse(self: *Terminal, response: []const u8) void {
         self.caps.kitty_keyboard = true;
         self.caps.bracketed_paste = true;
         self.caps.hyperlinks = true;
+    }
+    // OSC 66 text sizing where setup runs no probe (the main screen): kitty since 0.40, foot since 1.21 (width only).
+    if (self.term_info.from_xtversion and !self.skip_explicit_width_query and !self.explicit_width_probed) {
+        const name = self.getTerminalName();
+        const version = self.getTerminalVersion();
+        const kitty = std.ascii.eqlIgnoreCase(name, "kitty") and semanticVersionAtLeast(version, 0, 40);
+        if (kitty or (std.ascii.eqlIgnoreCase(name, "foot") and semanticVersionAtLeast(version, 1, 21))) self.caps.explicit_width = true;
+        if (kitty) self.caps.scaled_text = true;
     }
     // Inside screen a reply may describe the terminal outside it, and screen drops 24-bit SGR.
     if (!self.insideScreen() and (truecolor_reply or (self.term_info.from_xtversion and isTruecolorTerminal(self.getTerminalName())))) {
@@ -1657,46 +1674,22 @@ pub fn setKittyKeyboardFlags(self: *Terminal, flags: u8) void {
     self.opts.kitty_keyboard_flags = flags;
 }
 
-fn writePassthroughSequence(self: *Terminal, tty: anytype, sequence: []const u8) !void {
-    const is_tmux = self.isInTmux();
-    if (is_tmux) {
-        try tty.writeAll(ansi.ANSI.tmuxDcsStart);
-        for (sequence) |c| {
-            if (c == '\x1b') try tty.writeByte('\x1b');
-            try tty.writeByte(c);
-        }
-        try tty.writeAll(ansi.ANSI.tmuxDcsEnd);
-        return;
-    }
-
-    if (!self.remote) {
-        if (self.opts.env_map) |map| {
-            if (map.get("STY") != null) {
-                try tty.writeAll(ansi.ANSI.screenDcsStart);
-                for (sequence) |c| {
-                    if (c == '\x1b') try tty.writeByte('\x1b');
-                    try tty.writeByte(c);
-                }
-                try tty.writeAll(ansi.ANSI.screenDcsEnd);
-                return;
-            }
-        }
-    }
-
-    try tty.writeAll(sequence);
-}
-
-fn writeSanitizedNotificationText(writer: anytype, text: []const u8, replace_semicolon: bool) !void {
-    for (text) |c| {
-        if (c < 0x20 or c == 0x7f or c == '\x1b' or (replace_semicolon and c == ';')) {
+/// A C0, DEL, or C1 control in the text can end the OSC and start another one, so each becomes a space.
+/// GNU screen forwards only the low byte of a code point (U+4E07 as BEL), so there every non-ASCII
+/// code point becomes a space too.
+fn writeSanitizedNotificationText(writer: anytype, text: []const u8, replace_semicolon: bool, ascii: bool) !void {
+    var code_points = std.unicode.Utf8View.initUnchecked(text).iterator();
+    while (code_points.nextCodepointSlice()) |slice| {
+        const code_point = std.unicode.utf8Decode(slice) catch unreachable;
+        if (utf8.isControl(code_point) or (ascii and code_point >= 0x80) or (replace_semicolon and code_point == ';')) {
             try writer.writeByte(' ');
         } else {
-            try writer.writeByte(c);
+            try writer.writeAll(slice);
         }
     }
 }
 
-fn writeOsc99Payload(allocator: std.mem.Allocator, writer: anytype, id: []const u8, payload_type: []const u8, payload: []const u8, done: bool) !void {
+fn writeOsc99Payload(allocator: std.mem.Allocator, writer: anytype, id: []const u8, payload_type: []const u8, payload: []const u8, done: bool, end: []const u8) !void {
     const encoded_len = std.base64.standard.Encoder.calcSize(payload.len);
     const encoded_buf = try allocator.alloc(u8, encoded_len);
     defer allocator.free(encoded_buf);
@@ -1704,19 +1697,23 @@ fn writeOsc99Payload(allocator: std.mem.Allocator, writer: anytype, id: []const 
 
     try writer.print("\x1b]99;i={s}:p={s}:e=1:d={d};", .{ id, payload_type, @intFromBool(done) });
     try writer.writeAll(encoded);
-    try writer.writeAll("\x1b\\");
+    try writer.writeAll(end);
 }
 
 pub fn writeNotification(self: *Terminal, allocator: std.mem.Allocator, tty: anytype, message: []const u8, title: ?[]const u8) !bool {
     if (!self.caps.notifications or self.notification_protocol == .none) {
         return false;
     }
+    const notification_title = title orelse "";
+    if (!std.unicode.utf8ValidateSlice(message) or !std.unicode.utf8ValidateSlice(notification_title)) return false;
 
     self.notification_id_counter +%= 1;
 
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     const writer = &buffer.writer;
+    const end = oscEnd(self.multiplexer);
+    const ascii = self.multiplexer == .screen;
 
     switch (self.notification_protocol) {
         .none => return false,
@@ -1724,43 +1721,38 @@ pub fn writeNotification(self: *Terminal, allocator: std.mem.Allocator, tty: any
             const id = try std.fmt.allocPrint(allocator, "opentui-{d}", .{self.notification_id_counter});
             defer allocator.free(id);
 
-            if (title) |notification_title| {
-                if (notification_title.len > 0) {
-                    try writeOsc99Payload(allocator, writer, id, "title", notification_title, false);
-                    try writeOsc99Payload(allocator, writer, id, "body", message, true);
-                } else {
-                    try writeOsc99Payload(allocator, writer, id, "body", message, true);
-                }
-            } else {
-                try writeOsc99Payload(allocator, writer, id, "body", message, true);
-            }
+            if (notification_title.len > 0) try writeOsc99Payload(allocator, writer, id, "title", notification_title, false, end);
+            try writeOsc99Payload(allocator, writer, id, "body", message, true, end);
         },
         .osc777 => {
             try writer.writeAll("\x1b]777;notify;");
-            if (title) |notification_title| {
-                try writeSanitizedNotificationText(writer, notification_title, true);
+            if (title != null) {
+                try writeSanitizedNotificationText(writer, notification_title, true, ascii);
                 try writer.writeByte(';');
-                try writeSanitizedNotificationText(writer, message, true);
+                try writeSanitizedNotificationText(writer, message, true, ascii);
             } else {
-                try writeSanitizedNotificationText(writer, message, true);
+                try writeSanitizedNotificationText(writer, message, true, ascii);
                 try writer.writeByte(';');
             }
-            try writer.writeAll("\x1b\\");
+            try writer.writeAll(end);
         },
         .osc9 => {
-            try writer.writeAll("\x1b]9;");
-            if (title) |notification_title| {
-                if (notification_title.len > 0) {
-                    try writeSanitizedNotificationText(writer, notification_title, false);
-                    try writer.writeAll(": ");
-                }
+            // OSC 9 parsers (ConEmu, Windows Terminal, Ghostty, iTerm2) read text that starts with a digit as
+            // a ConEmu subcommand (progress, cwd, tab title, macro), so a space keeps it a notification.
+            const lead = if (notification_title.len > 0) notification_title else message;
+            try writer.writeAll(if (lead.len > 0 and std.ascii.isDigit(lead[0])) "\x1b]9; " else "\x1b]9;");
+            if (notification_title.len > 0) {
+                try writeSanitizedNotificationText(writer, notification_title, false, ascii);
+                try writer.writeAll(": ");
             }
-            try writeSanitizedNotificationText(writer, message, false);
-            try writer.writeAll("\x1b\\");
+            try writeSanitizedNotificationText(writer, message, false, ascii);
+            try writer.writeAll(end);
         },
     }
 
-    try self.writePassthroughSequence(tty, buffer.written());
+    var passthrough = try PassthroughWriter(@TypeOf(tty)).init(tty, self.multiplexer);
+    try passthrough.writeAll(buffer.written());
+    try passthrough.finish();
     return true;
 }
 
@@ -1794,46 +1786,76 @@ pub fn writeClipboard(self: *Terminal, tty: anytype, target: ClipboardTarget, te
     }
     _ = try self.clipboardSequenceSize(text_utf8.len);
 
-    if (self.isInTmux()) {
-        try tty.writeAll(ansi.ANSI.tmuxDcsStart);
-        try writeClipboardSequence(tty, target, text_utf8, true, "\x1b\\");
-        try tty.writeAll(ansi.ANSI.tmuxDcsEnd);
-        return;
-    }
-
-    if (self.isInScreen()) {
-        var screen_writer = ScreenPassthroughWriter(@TypeOf(tty)).init(tty);
-        try writeClipboardSequence(&screen_writer, target, text_utf8, false, "\x07");
-        try screen_writer.finish();
-        return;
-    }
-
-    try writeClipboardSequence(tty, target, text_utf8, false, "\x1b\\");
+    var writer = try PassthroughWriter(@TypeOf(tty)).init(tty, self.multiplexer);
+    try writer.writeAll("\x1b]52;");
+    try writer.writeByte(target.toChar());
+    try writer.writeByte(';');
+    try writeClipboardBase64(&writer, text_utf8);
+    try writer.writeAll(oscEnd(self.multiplexer));
+    try writer.finish();
 }
 
-fn ScreenPassthroughWriter(comptime Writer: type) type {
+/// GNU screen ends its DCS at the first ST, so an OSC that passes through it ends with BEL.
+fn oscEnd(multiplexer: Multiplexer) []const u8 {
+    return if (multiplexer == .screen) "\x07" else "\x1b\\";
+}
+
+/// Writes sequences through the multiplexer around the terminal: tmux takes one DCS with every ESC
+/// doubled, and GNU screen DCS chunks of at most SCREEN_PASSTHROUGH_CHUNK_SIZE bytes.
+fn PassthroughWriter(comptime Writer: type) type {
     return struct {
         writer: Writer,
+        multiplexer: Multiplexer,
         buffer: [SCREEN_PASSTHROUGH_CHUNK_SIZE]u8 = undefined,
         length: usize = 0,
 
         const Self = @This();
 
-        fn init(writer: Writer) Self {
-            return .{ .writer = writer };
+        fn init(writer: Writer, multiplexer: Multiplexer) !Self {
+            if (multiplexer == .tmux) try writer.writeAll(ansi.ANSI.tmuxDcsStart);
+            return .{ .writer = writer, .multiplexer = multiplexer };
         }
 
         pub fn writeAll(self: *Self, bytes: []const u8) !void {
-            for (bytes) |byte| try self.writeByte(byte);
+            switch (self.multiplexer) {
+                .tmux => {
+                    var rest = bytes;
+                    while (std.mem.findScalar(u8, rest, '\x1b')) |at| {
+                        try self.writer.writeAll(rest[0..at]);
+                        try self.writer.writeAll("\x1b\x1b");
+                        rest = rest[at + 1 ..];
+                    }
+                    try self.writer.writeAll(rest);
+                },
+                .screen => {
+                    // Screen forwards only the low byte of a code point, so its writers send ASCII.
+                    for (bytes) |byte| assert(byte < 0x80);
+                    var rest = bytes;
+                    while (rest.len > 0) {
+                        if (self.length == self.buffer.len) {
+                            // An ESC that ends a full chunk starts the next one, with the byte after it.
+                            const esc = self.buffer[self.length - 1] == '\x1b';
+                            self.length -= @intFromBool(esc);
+                            try self.flush();
+                            if (esc) self.buffer[0] = '\x1b';
+                            self.length = @intFromBool(esc);
+                        }
+                        const count = @min(rest.len, self.buffer.len - self.length);
+                        @memcpy(self.buffer[self.length..][0..count], rest[0..count]);
+                        self.length += count;
+                        rest = rest[count..];
+                    }
+                },
+                else => try self.writer.writeAll(bytes),
+            }
         }
 
         pub fn writeByte(self: *Self, byte: u8) !void {
-            if (self.length == self.buffer.len) try self.flush();
-            self.buffer[self.length] = byte;
-            self.length += 1;
+            try self.writeAll(&.{byte});
         }
 
         fn finish(self: *Self) !void {
+            if (self.multiplexer == .tmux) try self.writer.writeAll(ansi.ANSI.tmuxDcsEnd);
             try self.flush();
         }
 
@@ -1847,14 +1869,6 @@ fn ScreenPassthroughWriter(comptime Writer: type) type {
     };
 }
 
-fn writeClipboardSequence(writer: anytype, target: ClipboardTarget, text_utf8: []const u8, escape: bool, terminator: []const u8) !void {
-    try writeClipboardBytes(writer, "\x1b]52;", escape);
-    try writer.writeByte(target.toChar());
-    try writer.writeByte(';');
-    try writeClipboardBase64(writer, text_utf8);
-    try writeClipboardBytes(writer, terminator, escape);
-}
-
 fn writeClipboardBase64(writer: anytype, source: []const u8) !void {
     const source_chunk_size = 3 * 1024;
     var encoded_buffer: [4 * 1024]u8 = undefined;
@@ -1866,18 +1880,6 @@ fn writeClipboardBase64(writer: anytype, source: []const u8) !void {
         const encoded = base64Encode(&encoded_buffer, chunk);
         try writer.writeAll(encoded);
         offset += chunk_len;
-    }
-}
-
-fn writeClipboardBytes(writer: anytype, bytes: []const u8, escape: bool) !void {
-    if (!escape) {
-        try writer.writeAll(bytes);
-        return;
-    }
-
-    for (bytes) |byte| {
-        if (byte == '\x1b') try writer.writeByte('\x1b');
-        try writer.writeByte(byte);
     }
 }
 

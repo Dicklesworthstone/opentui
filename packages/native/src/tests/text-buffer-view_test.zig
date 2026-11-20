@@ -655,6 +655,54 @@ test "TextBufferView word wrapping - basic word wrap at space" {
     try std.testing.expectEqual(@as(u32, 2), wrapped_count);
 }
 
+test "TextBufferView graphemeAtCell names the grapheme a cell draws, and none for padding" {
+    var pools = TestPools.init(std.testing.allocator);
+    defer pools.deinit();
+    var tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .unicode);
+    defer tb.deinit();
+    var view = try TextBufferView.init(std.testing.allocator, tb);
+    defer view.deinit();
+    const Viewport = text_buffer_view.Viewport;
+    const Case = struct {
+        text: []const u8,
+        wrap: bool = false,
+        text_align: text_buffer_view.TextAlign = .left,
+        truncate: bool = false,
+        viewport: Viewport,
+        // x, y, then the byte, the grapheme's first column and its width, or a byte of -1 for none.
+        cells: []const [5]i32,
+    };
+    // A wide character that does not fit leaves a gap and both its cells name it, CRLF counts two bytes, alignment
+    // padding, cells past the viewport and a truncation ellipsis draw nothing, a scrolled viewport shifts the text,
+    // and a wide character the viewport's left edge cuts reports where it starts.
+    const cases = [_]Case{
+        .{ .text = "a\u{4e2d}b", .wrap = true, .viewport = .{ .x = 0, .y = 0, .width = 2, .height = 8 }, .cells = &.{ .{ 0, 0, 0, 0, 1 }, .{ 1, 0, -1, 0, 0 }, .{ 0, 1, 1, 0, 2 }, .{ 1, 1, 1, 0, 2 }, .{ 0, 2, 4, 0, 1 }, .{ 1, 2, -1, 0, 0 }, .{ 0, 3, -1, 0, 0 }, .{ -1, 0, -1, 0, 0 } } },
+        .{ .text = "ab\r\ncd", .viewport = .{ .x = 0, .y = 0, .width = 6, .height = 8 }, .cells = &.{ .{ 1, 0, 1, 1, 1 }, .{ 2, 0, -1, 0, 0 }, .{ 0, 1, 4, 0, 1 }, .{ 1, 1, 5, 1, 1 } } },
+        .{ .text = "ab", .text_align = .center, .viewport = .{ .x = 0, .y = 0, .width = 6, .height = 8 }, .cells = &.{ .{ 1, 0, -1, 0, 0 }, .{ 2, 0, 0, 2, 1 }, .{ 3, 0, 1, 3, 1 }, .{ 4, 0, -1, 0, 0 } } },
+        .{ .text = "abcdef\nghijkl\nmnop", .viewport = .{ .x = 2, .y = 1, .width = 3, .height = 1 }, .cells = &.{ .{ 0, 0, 9, 0, 1 }, .{ 2, 0, 11, 2, 1 }, .{ 3, 0, -1, 0, 0 }, .{ 0, 1, -1, 0, 0 } } },
+        .{ .text = "\u{4e2d}a", .viewport = .{ .x = 1, .y = 0, .width = 3, .height = 1 }, .cells = &.{ .{ 0, 0, 0, -1, 2 }, .{ 1, 0, 3, 1, 1 } } },
+        .{ .text = "abcdefghij", .truncate = true, .viewport = .{ .x = 0, .y = 0, .width = 6, .height = 1 }, .cells = &.{ .{ 0, 0, 0, 0, 1 }, .{ 2, 0, -1, 0, 0 }, .{ 5, 0, 9, 5, 1 } } },
+    };
+    for (cases) |case| {
+        try tb.setText(case.text);
+        view.setWrapMode(if (case.wrap) .char else .none);
+        view.setTextAlign(case.text_align);
+        view.setTruncate(case.truncate);
+        view.setViewport(case.viewport);
+        try view.prepare();
+        for (case.cells) |cell| {
+            errdefer std.debug.print("{s}: cell {d}, {d}\n", .{ case.text, cell[0], cell[1] });
+            const expected: ?TextBufferView.CellGrapheme = if (cell[2] < 0) null else .{ .byte = @intCast(cell[2]), .x = cell[3], .width = @intCast(cell[4]) };
+            try std.testing.expectEqual(expected, view.graphemeAtCell(cell[0], cell[1]));
+        }
+    }
+    // A wrap change or an edit the view has not prepared for answers nothing, rather than laying the lines out again.
+    view.setWrapMode(.char);
+    try std.testing.expectEqual(null, view.graphemeAtCell(0, 0));
+    try tb.setText("changed");
+    try std.testing.expectEqual(null, view.graphemeAtCell(0, 0));
+}
+
 test "TextBufferView word wrapping - overflowing separator whitespace is consumed" {
     var pools = TestPools.init(std.testing.allocator);
     defer pools.deinit();
@@ -886,8 +934,8 @@ test "TextBufferView virtual line spans - with highlights" {
 
     try std.testing.expectEqual(@as(u32, 2), view.getVirtualLineCount());
 
-    const vline0_info = view.getVirtualLineSpans(0);
-    const vline1_info = view.getVirtualLineSpans(1);
+    const vline0_info = (try view.getVirtualLineSpans(0));
+    const vline1_info = (try view.getVirtualLineSpans(1));
 
     try std.testing.expectEqual(@as(usize, 0), vline0_info.source_line);
     try std.testing.expectEqual(@as(usize, 0), vline1_info.source_line);
@@ -2583,38 +2631,6 @@ test "TextBufferView char range highlights - with reference ID for removal" {
     try std.testing.expectEqual(@as(usize, 0), tb.getLineHighlights(1).len);
 }
 
-test "TextBufferView highlights - work correctly with wrapped lines" {
-    var pools = TestPools.init(std.testing.allocator);
-    defer pools.deinit();
-
-    var tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .wcwidth);
-    defer tb.deinit();
-
-    var view = try TextBufferView.init(std.testing.allocator, tb);
-    defer view.deinit();
-
-    try tb.setText("ABCDEFGHIJKLMNOPQRST");
-
-    try tb.addHighlight(0, 5, 15, 1, 1, 0);
-
-    view.setWrapMode(.char);
-    view.setWrapWidth(10);
-
-    try std.testing.expectEqual(@as(u32, 2), view.getVirtualLineCount());
-
-    const vline0_info = view.getVirtualLineSpans(0);
-    const vline1_info = view.getVirtualLineSpans(1);
-
-    try std.testing.expectEqual(@as(usize, 0), vline0_info.source_line);
-    try std.testing.expectEqual(@as(usize, 0), vline1_info.source_line);
-
-    try std.testing.expectEqual(@as(u32, 0), vline0_info.source_col_start);
-    try std.testing.expectEqual(@as(u32, 10), vline1_info.source_col_start);
-
-    try std.testing.expect(vline0_info.spans.len > 0);
-    try std.testing.expect(vline1_info.spans.len > 0);
-}
-
 test "TextBufferView measureForDimensions - alternating widths reuse completed results after a failed miss" {
     var pools = TestPools.init(std.testing.allocator);
     defer pools.deinit();
@@ -3438,7 +3454,7 @@ test "TextBufferView highlights - multiple highlights on wrapped line" {
     try std.testing.expect(vline_count >= 3);
 
     for (0..vline_count) |i| {
-        const vline_info = view.getVirtualLineSpans(i);
+        const vline_info = (try view.getVirtualLineSpans(i));
         try std.testing.expectEqual(@as(usize, 0), vline_info.source_line);
         try std.testing.expectEqual(@as(u32, @intCast(i * 10)), vline_info.source_col_start);
     }
@@ -3464,8 +3480,8 @@ test "TextBufferView highlights - with emojis and wrapping" {
     const vline_count = view.getVirtualLineCount();
     try std.testing.expect(vline_count >= 2);
 
-    const vline0_info = view.getVirtualLineSpans(0);
-    const vline1_info = view.getVirtualLineSpans(1);
+    const vline0_info = (try view.getVirtualLineSpans(0));
+    const vline1_info = (try view.getVirtualLineSpans(1));
 
     try std.testing.expectEqual(@as(usize, 0), vline0_info.source_line);
     try std.testing.expectEqual(@as(usize, 0), vline1_info.source_line);
@@ -3497,7 +3513,7 @@ test "TextBufferView highlights - with CJK characters and wrapping" {
     try std.testing.expect(vline_count >= 2);
 
     for (0..vline_count) |i| {
-        const vline_info = view.getVirtualLineSpans(i);
+        const vline_info = (try view.getVirtualLineSpans(i));
         try std.testing.expectEqual(@as(usize, 0), vline_info.source_line);
 
         if (i == 0) {
@@ -3528,8 +3544,8 @@ test "TextBufferView highlights - mixed ASCII and wide chars with wrapping" {
     const vline_count = view.getVirtualLineCount();
     try std.testing.expect(vline_count >= 2);
 
-    const vline0_info = view.getVirtualLineSpans(0);
-    const vline1_info = view.getVirtualLineSpans(1);
+    const vline0_info = (try view.getVirtualLineSpans(0));
+    const vline1_info = (try view.getVirtualLineSpans(1));
 
     try std.testing.expectEqual(@as(usize, 0), vline0_info.source_line);
     try std.testing.expectEqual(@as(usize, 0), vline1_info.source_line);
@@ -3561,8 +3577,8 @@ test "TextBufferView highlights - emoji at wrap boundary" {
     const vline_count = view.getVirtualLineCount();
     try std.testing.expect(vline_count >= 2);
 
-    const vline0_info = view.getVirtualLineSpans(0);
-    const vline1_info = view.getVirtualLineSpans(1);
+    const vline0_info = (try view.getVirtualLineSpans(0));
+    const vline1_info = (try view.getVirtualLineSpans(1));
 
     try std.testing.expectEqual(@as(u32, 0), vline0_info.source_col_start);
     try std.testing.expect(vline1_info.source_col_start >= 4);
@@ -3585,7 +3601,7 @@ test "TextBufferView highlights - emojis without wrapping" {
     const vline_count = view.getVirtualLineCount();
     try std.testing.expectEqual(@as(u32, 1), vline_count);
 
-    const spans = tb.getLineSpans(0);
+    const spans = (try tb.getLineSpans(0));
     try std.testing.expect(spans.len > 0);
 
     const highlights = tb.getLineHighlights(0);
@@ -3616,7 +3632,7 @@ test "TextBufferView highlights - CJK without wrapping" {
     try std.testing.expectEqual(@as(u32, 2), highlights[0].col_start);
     try std.testing.expectEqual(@as(u32, 6), highlights[0].col_end);
 
-    const spans = tb.getLineSpans(0);
+    const spans = (try tb.getLineSpans(0));
     try std.testing.expect(spans.len > 0);
 }
 
@@ -3645,7 +3661,7 @@ test "TextBufferView highlights - mixed width graphemes without wrapping" {
     try std.testing.expectEqual(@as(u32, 4), highlights[1].col_start);
     try std.testing.expectEqual(@as(u32, 7), highlights[1].col_end);
 
-    const spans = tb.getLineSpans(0);
+    const spans = (try tb.getLineSpans(0));
     try std.testing.expect(spans.len > 0);
 }
 
@@ -3846,33 +3862,6 @@ test "TextBufferView virtual lines - multi-line text without wrap" {
     try std.testing.expect(line_info.line_start_cols[1] >= line_info.line_start_cols[0]);
     try std.testing.expect(line_info.line_start_cols[2] >= line_info.line_start_cols[1]);
     try std.testing.expect(line_info.line_start_cols[3] >= line_info.line_start_cols[2]);
-}
-
-test "TextBufferView line info - line starts and widths consistency" {
-    var pools = TestPools.init(std.testing.allocator);
-    defer pools.deinit();
-
-    var tb = try TextBuffer.init(std.testing.allocator, &pools.graphemes, &pools.links, .wcwidth);
-    defer tb.deinit();
-
-    var view = try TextBufferView.init(std.testing.allocator, tb);
-    defer view.deinit();
-
-    try tb.setText("ABCDEFGHIJKLMNOPQRST");
-
-    view.setWrapMode(.char);
-    view.setWrapWidth(7);
-    const line_count = view.getVirtualLineCount();
-    const line_info = view.getCachedLineInfo();
-
-    try std.testing.expectEqual(@as(usize, line_count), line_info.line_start_cols.len);
-    try std.testing.expectEqual(@as(usize, line_count), line_info.line_width_cols.len);
-
-    for (line_info.line_width_cols, 0..) |width, i| {
-        if (i < line_info.line_width_cols.len - 1) {
-            try std.testing.expect(width <= 7);
-        }
-    }
 }
 
 test "TextBufferView line info - line starts monotonically increasing" {

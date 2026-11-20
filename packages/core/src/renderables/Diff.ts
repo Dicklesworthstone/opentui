@@ -6,7 +6,7 @@ import { RGBA, parseColor } from "../lib/RGBA.js"
 import { SyntaxStyle } from "../syntax-style.js"
 import { parsePatch, type StructuredPatch } from "diff"
 import { TextRenderable } from "./Text.js"
-import type { TreeSitterClient } from "../lib/tree-sitter/index.js"
+import { getTreeSitterClient, type TreeSitterClient } from "../lib/tree-sitter/index.js"
 import type { MouseEvent } from "../renderer.js"
 
 interface LogicalLine {
@@ -418,7 +418,7 @@ export class DiffRenderable extends Renderable {
         width: "100%",
         flexGrow: 1,
         flexShrink: 1,
-        ...(this._treeSitterClient !== undefined && { treeSitterClient: this._treeSitterClient }),
+        treeSitterClient: this._treeSitterClient,
       })
       super.add(this.errorCodeRenderable)
     } else {
@@ -456,7 +456,7 @@ export class DiffRenderable extends Renderable {
         ...(drawUnstyledText !== undefined && { drawUnstyledText }),
         ...(this._selectionBg !== undefined && { selectionBg: this._selectionBg }),
         ...(this._selectionFg !== undefined && { selectionFg: this._selectionFg }),
-        ...(this._treeSitterClient !== undefined && { treeSitterClient: this._treeSitterClient }),
+        treeSitterClient: this._treeSitterClient,
       }
       const newRenderable = new CodeRenderable(this.ctx, codeOptions)
 
@@ -601,7 +601,8 @@ export class DiffRenderable extends Renderable {
       let newLineNum = hunk.newStart
 
       for (const line of hunk.lines) {
-        const firstChar = line[0]
+        // parsePatch keeps a blank line inside a hunk as "", a context line whose space some tools drop.
+        const firstChar = line[0] ?? " "
         const content = line.slice(1)
 
         if (firstChar === "+") {
@@ -704,7 +705,7 @@ export class DiffRenderable extends Renderable {
       let i = 0
       while (i < hunk.lines.length) {
         const line = hunk.lines[i]
-        const firstChar = line[0]
+        const firstChar = line[0] ?? " "
 
         if (firstChar === " ") {
           const content = line.slice(1)
@@ -731,7 +732,7 @@ export class DiffRenderable extends Renderable {
 
           while (i < hunk.lines.length) {
             const currentLine = hunk.lines[i]
-            const currentChar = currentLine[0]
+            const currentChar = currentLine[0] ?? " "
 
             if (currentChar === " " || currentChar === "\\") {
               break
@@ -1053,6 +1054,18 @@ export class DiffRenderable extends Renderable {
     if (this._filetype !== value) {
       this._filetype = value
       this.rebuildView()
+    }
+  }
+
+  public get treeSitterClient(): TreeSitterClient | undefined {
+    return this._treeSitterClient
+  }
+
+  public set treeSitterClient(value: TreeSitterClient | undefined) {
+    if (this._treeSitterClient === value) return
+    this._treeSitterClient = value ?? undefined
+    for (const code of [this.leftCodeRenderable, this.rightCodeRenderable, this.errorCodeRenderable]) {
+      if (code && !code.isDestroyed) code.treeSitterClient = value ?? getTreeSitterClient()
     }
   }
 

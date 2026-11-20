@@ -1,7 +1,863 @@
 // Generated from packages/native/include/opentui.h and scripts/native-abi-pointers.ts.
 // Run `bun run generate:abi` in packages/core. Do not edit.
 // Inspect audit input: bun scripts/native-abi.ts --audit
-// ABI audit SHA-256: 0343a50f78a6a5f452f63126af22cc088018ccf7075c2d0ef337e1bab720772e
+// ABI audit SHA-256: 18064486de0ef6f07485fe84137c19de73adf5cb04f907845033cc34b05a4981
+
+export const OT_CONTEXT_ABI_VERSION = 2
+export const OT_OK = 0
+export const OT_INVALID_ARGUMENT = -1
+export const OT_UNSUPPORTED_VERSION = -2
+export const OT_OUT_OF_MEMORY = -3
+export const OT_WRONG_THREAD = -4
+export const OT_INTERNAL_ERROR = -5
+export const OT_CONTEXT_BUSY = -6
+export const OT_WRONG_CONTEXT = -7
+export const OT_WRONG_KIND = -8
+export const OT_STALE_HANDLE = -9
+export const OT_WRONG_SESSION = -10
+export const OT_OUTPUT_BACKPRESSURE = -11
+export const OT_SESSION_CLOSED = -12
+export const OT_OUTPUT_BUSY = -13
+export const OT_STALE_OUTPUT = -14
+export const OT_OUTPUT_FAILED = -15
+export const OT_OBJECT_LIMIT = -16
+export const OT_RENDERER_ATTACHED = -17
+export const OT_RENDERER_NOT_ATTACHED = -18
+export const OT_INVALID_PHASE = -19
+export const OT_CONTROL_PACKET_LIMIT = -20
+export const OT_LEASE_LIMIT = -21
+export const OT_LEASE_BYTES_LIMIT = -22
+export const OT_STALE_LEASE = -23
+export const OT_UNSUPPORTED_RESOURCE = -24
+export const OT_STALE_FRAME = -25
+export const OT_LAYOUT_LIMIT = -26
+export const OT_FRAME_BUSY = -27
+export const OT_FRAME_REQUEST_LIMIT = -28
+export const OT_IMAGE_UNSUPPORTED_FORMAT = -40
+export const OT_IMAGE_UNSUPPORTED_COLOR_SPACE = -41
+export const OT_IMAGE_MALFORMED_DATA = -42
+export const OT_IMAGE_DIMENSION_LIMIT = -43
+export const OT_IMAGE_MEMORY_LIMIT = -44
+export const OT_IMAGE_OUTPUT_TOO_SMALL = -45
+export const OT_IMAGE_UNSUPPORTED_FEATURE = -46
+export const OT_IMAGE_BUSY = -47
+export const OT_VIDEO_FAILED = -60
+export const OT_AUDIO_DECODE_FAILED = -61
+export const OT_AUDIO_DEVICE_FAILED = -62
+export const OT_SCENE_ROOT = 0
+export const OT_SCENE_BOX = 1
+export const OT_SCENE_TEXT = 2
+export const OT_SCENE_SLIDER = 3
+export const OT_SCENE_ARROW = 4
+export const OT_SCENE_EDITOR = 5
+export const OT_SCENE_CUSTOM = 6
+export const OT_SCENE_TEXT_VIEW = 7
+export const OT_SCENE_IMAGE = 8
+export const OT_SCENE_VIDEO = 9
+export const OT_SCENE_WRAP_NONE = 0
+export const OT_SCENE_WRAP_CHAR = 1
+export const OT_SCENE_WRAP_WORD = 2
+export const OT_SCENE_ALIGN_LEFT = 0
+export const OT_SCENE_ALIGN_CENTER = 1
+export const OT_SCENE_ALIGN_RIGHT = 2
+export const OT_STYLE_ENUM = 0
+export const OT_STYLE_FLOAT = 1
+export const OT_STYLE_VALUE = 2
+export const OT_STYLE_BORDER = 3
+export const OT_STYLE_DIMENSION = 4
+export const OT_STYLE_BORDER_WIDTH = 0
+export const OT_STYLE_FLAGS_NONE = 0
+export const OT_STYLE_DISABLE_FLEX_SHRINK = 1
+export const OT_STYLE_CONTENT = 2
+export const OT_STYLE_ENUM_DIRECTION = 0
+export const OT_STYLE_ENUM_FLEX_DIRECTION = 1
+export const OT_STYLE_ENUM_JUSTIFY_CONTENT = 2
+export const OT_STYLE_ENUM_ALIGN_CONTENT = 3
+export const OT_STYLE_ENUM_ALIGN_ITEMS = 4
+export const OT_STYLE_ENUM_ALIGN_SELF = 5
+export const OT_STYLE_ENUM_POSITION_TYPE = 6
+export const OT_STYLE_ENUM_FLEX_WRAP = 7
+export const OT_STYLE_ENUM_OVERFLOW = 8
+export const OT_STYLE_ENUM_DISPLAY = 9
+export const OT_STYLE_ENUM_BOX_SIZING = 10
+export const OT_STYLE_ENUM_LAYOUT_MODE = 11
+export const OT_STYLE_FLOAT_FLEX = 0
+export const OT_STYLE_FLOAT_FLEX_GROW = 1
+export const OT_STYLE_FLOAT_FLEX_SHRINK = 2
+export const OT_STYLE_FLOAT_ASPECT_RATIO = 3
+export const OT_STYLE_VALUE_WIDTH = 0
+export const OT_STYLE_VALUE_HEIGHT = 1
+export const OT_STYLE_VALUE_MIN_WIDTH = 2
+export const OT_STYLE_VALUE_MIN_HEIGHT = 3
+export const OT_STYLE_VALUE_MAX_WIDTH = 4
+export const OT_STYLE_VALUE_MAX_HEIGHT = 5
+export const OT_STYLE_VALUE_FLEX_BASIS = 6
+export const OT_STYLE_VALUE_MARGIN = 7
+export const OT_STYLE_VALUE_PADDING = 8
+export const OT_STYLE_VALUE_POSITION = 9
+export const OT_STYLE_VALUE_GAP = 10
+export const OT_DIMENSION_WIDTH = 0
+export const OT_DIMENSION_HEIGHT = 1
+export const OT_UNIT_UNDEFINED = 0
+export const OT_UNIT_POINT = 1
+export const OT_UNIT_PERCENT = 2
+export const OT_UNIT_AUTO = 3
+export const OT_EDGE_NONE = 0
+export const OT_EDGE_LEFT = 0
+export const OT_EDGE_TOP = 1
+export const OT_EDGE_RIGHT = 2
+export const OT_EDGE_BOTTOM = 3
+export const OT_EDGE_START = 4
+export const OT_EDGE_END = 5
+export const OT_EDGE_HORIZONTAL = 6
+export const OT_EDGE_VERTICAL = 7
+export const OT_EDGE_ALL = 8
+export const OT_GUTTER_COLUMN = 0
+export const OT_GUTTER_ROW = 1
+export const OT_GUTTER_ALL = 2
+export const OT_DIRECTION_INHERIT = 0
+export const OT_DIRECTION_LTR = 1
+export const OT_DIRECTION_RTL = 2
+export const OT_FLEX_DIRECTION_COLUMN = 0
+export const OT_FLEX_DIRECTION_COLUMN_REVERSE = 1
+export const OT_FLEX_DIRECTION_ROW = 2
+export const OT_FLEX_DIRECTION_ROW_REVERSE = 3
+export const OT_JUSTIFY_FLEX_START = 0
+export const OT_JUSTIFY_CENTER = 1
+export const OT_JUSTIFY_FLEX_END = 2
+export const OT_JUSTIFY_SPACE_BETWEEN = 3
+export const OT_JUSTIFY_SPACE_AROUND = 4
+export const OT_JUSTIFY_SPACE_EVENLY = 5
+export const OT_ALIGN_AUTO = 0
+export const OT_ALIGN_FLEX_START = 1
+export const OT_ALIGN_CENTER = 2
+export const OT_ALIGN_FLEX_END = 3
+export const OT_ALIGN_STRETCH = 4
+export const OT_ALIGN_BASELINE = 5
+export const OT_ALIGN_SPACE_BETWEEN = 6
+export const OT_ALIGN_SPACE_AROUND = 7
+export const OT_ALIGN_SPACE_EVENLY = 8
+export const OT_POSITION_STATIC = 0
+export const OT_POSITION_RELATIVE = 1
+export const OT_POSITION_ABSOLUTE = 2
+export const OT_FLEX_WRAP_NONE = 0
+export const OT_FLEX_WRAP_WRAP = 1
+export const OT_FLEX_WRAP_REVERSE = 2
+export const OT_OVERFLOW_VISIBLE = 0
+export const OT_OVERFLOW_HIDDEN = 1
+export const OT_OVERFLOW_SCROLL = 2
+export const OT_DISPLAY_FLEX = 0
+export const OT_DISPLAY_NONE = 1
+export const OT_BOX_SIZING_BORDER_BOX = 0
+export const OT_BOX_SIZING_CONTENT_BOX = 1
+export const OT_LAYOUT_MODE_FLEX = 0
+export const OT_LAYOUT_MODE_LIST = 1
+export const OT_DISPLAY_CONTENTS = 2
+export const OT_YOGA_ERRATA_NONE = 0
+export const OT_YOGA_ERRATA_STRETCH_FLEX_BASIS = 1
+export const OT_YOGA_ERRATA_ABSOLUTE_POSITION_WITHOUT_INSETS_EXCLUDES_PADDING = 2
+export const OT_YOGA_ERRATA_ABSOLUTE_PERCENT_AGAINST_INNER_SIZE = 4
+export const OT_YOGA_ERRATA_ALL = 2147483647
+export const OT_YOGA_ERRATA_CLASSIC = 2147483646
+export const OT_YOGA_EXPERIMENTAL_FEATURE_WEB_FLEX_BASIS = 0
+export const OT_YOGA_LOG_LEVEL_ERROR = 0
+export const OT_YOGA_LOG_LEVEL_WARN = 1
+export const OT_YOGA_LOG_LEVEL_INFO = 2
+export const OT_YOGA_LOG_LEVEL_DEBUG = 3
+export const OT_YOGA_LOG_LEVEL_VERBOSE = 4
+export const OT_YOGA_LOG_LEVEL_FATAL = 5
+export const OT_YOGA_NODE_TYPE_DEFAULT = 0
+export const OT_YOGA_NODE_TYPE_TEXT = 1
+export const OT_STYLE_ENUM_DIRECTION_MAX = 2
+export const OT_STYLE_ENUM_FLEX_DIRECTION_MAX = 3
+export const OT_STYLE_ENUM_JUSTIFY_CONTENT_MAX = 5
+export const OT_STYLE_ENUM_ALIGN_CONTENT_MAX = 8
+export const OT_STYLE_ENUM_ALIGN_ITEMS_MAX = 8
+export const OT_STYLE_ENUM_ALIGN_SELF_MAX = 8
+export const OT_STYLE_ENUM_POSITION_TYPE_MAX = 2
+export const OT_STYLE_ENUM_FLEX_WRAP_MAX = 2
+export const OT_STYLE_ENUM_OVERFLOW_MAX = 2
+export const OT_STYLE_ENUM_DISPLAY_MAX = 1
+export const OT_STYLE_ENUM_BOX_SIZING_MAX = 1
+export const OT_STYLE_ENUM_LAYOUT_MODE_MAX = 1
+export const OT_MEASURE_UNDEFINED = 0
+export const OT_MEASURE_EXACTLY = 1
+export const OT_MEASURE_AT_MOST = 2
+export const OT_LAYOUT_PUBLIC = 0
+export const OT_LAYOUT_YOGA = 1
+export const OT_LAYOUT_PAINT = 2
+export const OT_LAYOUT_CONTENT = 3
+export const OT_BORDER_NONE = 0
+export const OT_BORDER_LEFT = 1
+export const OT_BORDER_BOTTOM = 2
+export const OT_BORDER_RIGHT = 4
+export const OT_BORDER_TOP = 8
+export const OT_BORDER_ALL = 15
+export const OT_BORDER_SINGLE = 0
+export const OT_BORDER_DOUBLE = 1
+export const OT_BORDER_ROUNDED = 2
+export const OT_BORDER_HEAVY = 3
+export const OT_COLOR_RGB = 0
+export const OT_COLOR_INDEXED = 1
+export const OT_COLOR_DEFAULT = 2
+export const OT_COLOR_CHANNEL_MASK = 255
+export const OT_COLOR_META_SHIFT = 8
+export const OT_COLOR_ANSI_0 = 0
+export const OT_COLOR_ANSI_1 = 8388608
+export const OT_COLOR_ANSI_2 = 32768
+export const OT_COLOR_ANSI_3 = 8421376
+export const OT_COLOR_ANSI_4 = 128
+export const OT_COLOR_ANSI_5 = 8388736
+export const OT_COLOR_ANSI_6 = 32896
+export const OT_COLOR_ANSI_7 = 12632256
+export const OT_COLOR_ANSI_8 = 8421504
+export const OT_COLOR_ANSI_9 = 16711680
+export const OT_COLOR_ANSI_10 = 65280
+export const OT_COLOR_ANSI_11 = 16776960
+export const OT_COLOR_ANSI_12 = 255
+export const OT_COLOR_ANSI_13 = 16711935
+export const OT_COLOR_ANSI_14 = 65535
+export const OT_COLOR_ANSI_15 = 16777215
+export const OT_COLOR_CUBE_BASE = 55
+export const OT_COLOR_CUBE_STEP = 40
+export const OT_COLOR_GRAY_BASE = 8
+export const OT_COLOR_GRAY_STEP = 10
+export const OT_ATTR_BOLD = 1
+export const OT_ATTR_DIM = 2
+export const OT_ATTR_ITALIC = 4
+export const OT_ATTR_UNDERLINE = 8
+export const OT_ATTR_BLINK = 16
+export const OT_ATTR_INVERSE = 32
+export const OT_ATTR_HIDDEN = 64
+export const OT_ATTR_STRIKETHROUGH = 128
+export const OT_ATTR_BASE_MASK = 255
+export const OT_ATTR_LINK_SHIFT = 8
+export const OT_ATTR_LINK_MASK = 16777215
+export const OT_SCENE_TEXT_SELECTION_RESET = 0
+export const OT_SCENE_TEXT_SELECTION_SET = 1
+export const OT_SCENE_TEXT_SELECTION_UPDATE = 2
+export const OT_SCENE_TEXT_SELECTION_COLORS = 3
+export const OT_SCENE_TEXT_SELECTION_CELL = 0
+export const OT_SCENE_TEXT_SELECTION_WORD = 1
+export const OT_SCENE_TEXT_SELECTION_LINE = 2
+export const OT_SCENE_TEXT_SELECTION_BACKGROUND = 1
+export const OT_SCENE_TEXT_SELECTION_FOREGROUND = 2
+export const OT_SCENE_TEXT_FOREGROUND = 1
+export const OT_SCENE_TEXT_BACKGROUND = 2
+export const OT_SCENE_TEXT_LINK = 4
+export const OT_SCENE_MUTATIONS_MAX = 4096
+export const OT_SCENE_FULL_PATH_FORCED = 1
+export const OT_SCENE_FULL_PATH_SCREEN = 2
+export const OT_SCENE_FULL_PATH_IMAGES = 4
+export const OT_SCENE_FULL_PATH_TAINTED = 8
+export const OT_SCENE_FULL_PATH_UNRETAINED = 16
+export const OT_SCENE_FULL_PATH_OPTIONS = 32
+export const OT_SCENE_FULL_PATH_NON_LOCAL = 64
+export const OT_CURSOR_STYLE_BLOCK = 0
+export const OT_CURSOR_STYLE_LINE = 1
+export const OT_CURSOR_STYLE_UNDERLINE = 2
+export const OT_CURSOR_STYLE_DEFAULT = 3
+export const OT_SCENE_HOOK_UPDATE = 1
+export const OT_SCENE_HOOK_RESIZE = 2
+export const OT_SCENE_HOOK_LAYOUT_CHANGED = 4
+export const OT_SCENE_HOOK_RENDER_BEFORE = 8
+export const OT_SCENE_HOOK_RENDER_AFTER = 16
+export const OT_SCENE_HOOK_RENDER_SELF = 32
+export const OT_SCENE_HOOK_IDLE_UPDATE = 64
+export const OT_SCENE_HOOK_SCROLL = 128
+export const OT_SCENE_FRAME_DONE = 0
+export const OT_SCENE_FRAME_UPDATE = 1
+export const OT_SCENE_FRAME_RESIZE = 2
+export const OT_SCENE_FRAME_LAYOUT_CHANGED = 3
+export const OT_SCENE_FRAME_RECORD = 4
+export const OT_SCENE_FRAME_SCROLL = 5
+export const OT_SCENE_GEOMETRY_PAINT = 1
+export const OT_SCENE_GEOMETRY_PUBLIC = 2
+export const OT_SCENE_PROPERTY_Z_INDEX = 1
+export const OT_SCENE_PROPERTY_OPACITY = 2
+export const OT_SCENE_PROPERTY_TRANSLATE_X = 4
+export const OT_SCENE_PROPERTY_TRANSLATE_Y = 8
+export const OT_SCENE_PROPERTY_BORDER = 16
+export const OT_SCENE_PROPERTY_SHOULD_FILL = 32
+export const OT_SCENE_PROPERTY_BACKGROUND = 64
+export const OT_SCENE_PROPERTY_BORDER_COLOR = 128
+export const OT_SCENE_PROPERTY_BORDER_STYLE = 256
+export const OT_SCENE_PROPERTY_FOCUSABLE = 512
+export const OT_SCENE_PROPERTY_FOCUSED_BORDER_COLOR = 1024
+export const OT_SCENE_PROPERTY_STYLE = 2048
+export const OT_SCENE_PROPERTY_RESET_BORDER_CHARACTERS = 4096
+export const OT_SCENE_PROPERTY_RECORD_MAX = 88
+export const OT_SCENE_PROPERTY_BYTES_MAX = 360448
+export const OT_SCENE_SCROLL_X = 1
+export const OT_SCENE_SCROLL_Y = 2
+export const OT_SCENE_SCROLL_FOLLOW_NONE = 0
+export const OT_SCENE_SCROLL_FOLLOW_TOP = 1
+export const OT_SCENE_SCROLL_FOLLOW_BOTTOM = 2
+export const OT_SCENE_SCROLL_FOLLOW_LEFT = 3
+export const OT_SCENE_SCROLL_FOLLOW_RIGHT = 4
+export const OT_SCENE_SCROLL_FILL_WRAPPER = 1
+export const OT_SCENE_SCROLL_FILL_VIEWPORT = 2
+export const OT_SCENE_SCROLL_FILL_CONTENT = 4
+export const OT_SCENE_SCROLL_BAR_AUTO = 0
+export const OT_SCENE_SCROLL_BAR_ALWAYS = 1
+export const OT_SCENE_SCROLL_BAR_NEVER = 2
+export const OT_SCENE_SCROLL_BAR_INSET = 0
+export const OT_SCENE_SCROLL_BAR_OVERLAY = 1
+export const OT_SCENE_SCROLL_RELATIVE_X = 1
+export const OT_SCENE_SCROLL_RELATIVE_Y = 2
+export const OT_SCENE_SCROLL_REAPPLY = 4
+export const OT_SCENE_SCROLL_REQUEST_INTO_VIEW = 0
+export const OT_SCENE_SCROLL_REQUEST_ANCHOR = 1
+export const OT_SCENE_SCROLL_REQUEST_LAYOUT = 2
+export const OT_SCENE_SCROLL_ALIGN_NEAREST = 0
+export const OT_SCENE_SCROLL_ALIGN_START = 1
+export const OT_SCENE_SCROLL_ALIGN_END = 2
+export const OT_SCENE_SCROLL_PADDING_MAX = 65535
+export const OT_SCENE_SCROLL_CHANGED_OFFSET_X = 1
+export const OT_SCENE_SCROLL_CHANGED_OFFSET_Y = 2
+export const OT_SCENE_SCROLL_CHANGED_CONTENT = 4
+export const OT_SCENE_SCROLL_CHANGED_VIEWPORT = 8
+export const OT_SCENE_SCROLL_CHANGED_LAYOUT = 16
+export const OT_SCENE_DEBUG_FULL_FRAME = 1
+export const OT_SCENE_DEBUG_VERIFY = 2
+export const OT_SESSION_OPEN = 0
+export const OT_SESSION_CLOSING = 1
+export const OT_SESSION_CLOSED_STATE = 2
+export const OT_SESSION_FAILED = 3
+export const OT_SESSION_CANCELLED_STATE = 4
+export const OT_SESSION_REMOTE_AUTO = 0
+export const OT_SESSION_REMOTE_LOCAL = 1
+export const OT_SESSION_REMOTE_REMOTE = 2
+export const OT_SESSION_ENV_ENTRIES_MAX = 256
+export const OT_SESSION_ENV_BYTES_MAX = 65536
+export const OT_RENDER_PRESENTED = 0
+export const OT_RENDER_PENDING = 1
+export const OT_RENDER_SKIPPED = 2
+export const OT_RENDER_FAILED = 3
+export const OT_SPLIT_SNAPSHOTS_MAX = 64
+export const OT_SESSION_BUFFER_CURRENT = 0
+export const OT_SESSION_BUFFER_NEXT = 1
+export const OT_WIDTH_METHOD_WCWIDTH = 0
+export const OT_WIDTH_METHOD_UNICODE = 1
+export const OT_WIDTH_METHOD_NO_ZWJ = 2
+export const OT_WIDTH_METHOD_UNICODE_WIDE = 3
+export const OT_BUFFER_RESPECT_ALPHA = 1
+export const OT_EMBEDDED_TERMINAL_CURSOR_BAR = 0
+export const OT_EMBEDDED_TERMINAL_CURSOR_BLOCK = 1
+export const OT_EMBEDDED_TERMINAL_CURSOR_UNDERLINE = 2
+export const OT_EMBEDDED_TERMINAL_CURSOR_BLOCK_HOLLOW = 3
+export const OT_EMBEDDED_TERMINAL_MOD_SHIFT = 1
+export const OT_EMBEDDED_TERMINAL_MOD_CTRL = 2
+export const OT_EMBEDDED_TERMINAL_MOD_ALT = 4
+export const OT_EMBEDDED_TERMINAL_MOD_SUPER = 8
+export const OT_EMBEDDED_TERMINAL_MOD_CAPS_LOCK = 16
+export const OT_EMBEDDED_TERMINAL_MOD_NUM_LOCK = 32
+export const OT_EMBEDDED_TERMINAL_KEY_RELEASE = 0
+export const OT_EMBEDDED_TERMINAL_KEY_PRESS = 1
+export const OT_EMBEDDED_TERMINAL_KEY_REPEAT = 2
+export const OT_EMBEDDED_TERMINAL_MOUSE_PRESS = 0
+export const OT_EMBEDDED_TERMINAL_MOUSE_RELEASE = 1
+export const OT_EMBEDDED_TERMINAL_MOUSE_MOTION = 2
+export const OT_EMBEDDED_TERMINAL_BUTTON_NONE = -1
+export const OT_EMBEDDED_TERMINAL_BUTTON_UNKNOWN = 0
+export const OT_EMBEDDED_TERMINAL_BUTTON_LEFT = 1
+export const OT_EMBEDDED_TERMINAL_BUTTON_RIGHT = 2
+export const OT_EMBEDDED_TERMINAL_BUTTON_MIDDLE = 3
+export const OT_EMBEDDED_TERMINAL_BUTTON_FOUR = 4
+export const OT_EMBEDDED_TERMINAL_BUTTON_FIVE = 5
+export const OT_EMBEDDED_TERMINAL_BUTTON_SIX = 6
+export const OT_EMBEDDED_TERMINAL_BUTTON_SEVEN = 7
+export const OT_EMBEDDED_TERMINAL_INPUT_BYTES_MAX = 1048576
+export const OT_EMBEDDED_TERMINAL_INVALIDATE = 0
+export const OT_EMBEDDED_TERMINAL_SCROLL = 1
+export const OT_EMBEDDED_TERMINAL_CLEAR_SELECTION = 2
+export const OT_EMBEDDED_TERMINAL_SET_TRANSPARENT_BACKGROUND = 3
+export const OT_EMBEDDED_TERMINAL_RESPONSE_BYTES_MAX = 1048576
+export const OT_EDIT_BUFFER_FOLLOW_SESSION_WIDTH = 1
+export const OT_EDIT_CURSOR_CHANGED = 1
+export const OT_EDIT_CONTENT_CHANGED = 2
+export const OT_EDIT_HISTORY_CURSOR_CHANGED = 4
+export const OT_MOUSE_POINTER_AUTO = 0
+export const OT_MOUSE_POINTER_DEFAULT = 1
+export const OT_MOUSE_POINTER_NONE = 2
+export const OT_MOUSE_POINTER_CONTEXT_MENU = 3
+export const OT_MOUSE_POINTER_HELP = 4
+export const OT_MOUSE_POINTER_POINTER = 5
+export const OT_MOUSE_POINTER_PROGRESS = 6
+export const OT_MOUSE_POINTER_WAIT = 7
+export const OT_MOUSE_POINTER_CELL = 8
+export const OT_MOUSE_POINTER_CROSSHAIR = 9
+export const OT_MOUSE_POINTER_TEXT = 10
+export const OT_MOUSE_POINTER_VERTICAL_TEXT = 11
+export const OT_MOUSE_POINTER_ALIAS = 12
+export const OT_MOUSE_POINTER_COPY = 13
+export const OT_MOUSE_POINTER_MOVE = 14
+export const OT_MOUSE_POINTER_NO_DROP = 15
+export const OT_MOUSE_POINTER_NOT_ALLOWED = 16
+export const OT_MOUSE_POINTER_GRAB = 17
+export const OT_MOUSE_POINTER_GRABBING = 18
+export const OT_MOUSE_POINTER_ALL_SCROLL = 19
+export const OT_MOUSE_POINTER_COL_RESIZE = 20
+export const OT_MOUSE_POINTER_ROW_RESIZE = 21
+export const OT_MOUSE_POINTER_N_RESIZE = 22
+export const OT_MOUSE_POINTER_E_RESIZE = 23
+export const OT_MOUSE_POINTER_S_RESIZE = 24
+export const OT_MOUSE_POINTER_W_RESIZE = 25
+export const OT_MOUSE_POINTER_NE_RESIZE = 26
+export const OT_MOUSE_POINTER_NW_RESIZE = 27
+export const OT_MOUSE_POINTER_SE_RESIZE = 28
+export const OT_MOUSE_POINTER_SW_RESIZE = 29
+export const OT_MOUSE_POINTER_EW_RESIZE = 30
+export const OT_MOUSE_POINTER_NS_RESIZE = 31
+export const OT_MOUSE_POINTER_NESW_RESIZE = 32
+export const OT_MOUSE_POINTER_NWSE_RESIZE = 33
+export const OT_MOUSE_POINTER_ZOOM_IN = 34
+export const OT_MOUSE_POINTER_ZOOM_OUT = 35
+export const OT_MOUSE_POINTER_MAX = 35
+export const OT_MOUSE_POINTER_UNCHANGED = 4294967295
+export const OT_EDIT_DELETE_FORWARD = 0
+export const OT_EDIT_BACKSPACE = 1
+export const OT_EDIT_NEW_LINE = 2
+export const OT_EDIT_DELETE_LINE = 3
+export const OT_EDIT_MOVE_LEFT = 4
+export const OT_EDIT_MOVE_RIGHT = 5
+export const OT_EDIT_MOVE_UP = 6
+export const OT_EDIT_MOVE_DOWN = 7
+export const OT_EDIT_GOTO_LINE = 8
+export const OT_EDIT_CURSOR_OFFSET = 9
+export const OT_EDIT_CLEAR = 10
+export const OT_EDIT_CLEAR_HISTORY = 11
+export const OT_EDIT_DEBUG_ROPE = 12
+export const OT_EDIT_CURSOR_OFFSET_ATOMIC = 13
+export const OT_EDIT_KEEP_OUTSIDE = 14
+export const OT_EDIT_ATOMIC = 1
+export const OT_EDIT_POSITION_CURSOR = 0
+export const OT_EDIT_POSITION_NEXT_WORD = 1
+export const OT_EDIT_POSITION_PREV_WORD = 2
+export const OT_EDIT_POSITION_EOL = 3
+export const OT_EDIT_POSITION_OFFSET = 4
+export const OT_EDIT_POSITION_COORDS = 5
+export const OT_EDIT_POSITION_LINE_START = 6
+export const OT_EDIT_POSITION_END = 7
+export const OT_EDIT_POSITION_PREV_CHAR = 8
+export const OT_EDIT_BYTE_TO_CELL = 0
+export const OT_EDIT_CELL_TO_BYTE = 1
+export const OT_EDIT_UTF16_TO_CELL = 2
+export const OT_EDIT_CELL_TO_UTF16 = 3
+export const OT_EDITOR_STYLE_FOREGROUND = 1
+export const OT_EDITOR_STYLE_BACKGROUND = 2
+export const OT_EDITOR_STYLE_ATTRIBUTES = 4
+export const OT_EDITOR_STYLE_ATTRIBUTE_MASK = 8
+export const OT_EDIT_HIGHLIGHT_ADD_LINE = 0
+export const OT_EDIT_HIGHLIGHT_ADD_RANGE = 1
+export const OT_EDIT_HIGHLIGHT_REMOVE_REF = 2
+export const OT_EDIT_HIGHLIGHT_CLEAR_LINE = 3
+export const OT_EDIT_HIGHLIGHT_CLEAR_ALL = 4
+export const OT_STYLE_RUN_FLAG = 2147483648
+export const OT_GROUP_SET_NAME_COUNT_MAX = 16
+export const OT_GROUP_SET_NAME_BYTE_COUNT_MAX = 64
+export const OT_EDIT_MARK_ADD = 0
+export const OT_EDIT_MARK_REMOVE = 1
+export const OT_EDIT_MARK_CLEAR = 2
+export const OT_EDIT_MARK_ATOMIC = 1
+export const OT_EDIT_MARK_STYLE_VALUE = 2
+export const OT_EDIT_MARK_ANY_KIND = 4294967295
+export const OT_MD_CONCEAL = 1
+export const OT_MD_HYPERLINKS = 2
+export const OT_MD_MATH = 4
+export const OT_MD_HOOK = 8
+export const OT_MD_HOOK_FILTER_BYTE_COUNT_MAX = 256
+export const OT_MD_PARAGRAPH = 0
+export const OT_MD_HEADING = 1
+export const OT_MD_CODE = 2
+export const OT_MD_HTML = 3
+export const OT_MD_RULE = 4
+export const OT_MD_TABLE = 5
+export const OT_MD_TABLE_ROW = 6
+export const OT_MD_TABLE_CELL = 7
+export const OT_MD_QUOTE = 8
+export const OT_MD_LIST = 9
+export const OT_MD_ITEM = 10
+export const OT_MD_BLOCK_CLOSED = 1
+export const OT_MD_BLOCK_SETEXT = 2
+export const OT_MD_BLOCK_ORDERED = 4
+export const OT_MD_BLOCK_TIGHT = 8
+export const OT_MD_BLOCK_TASK = 16
+export const OT_MD_BLOCK_CHECKED = 32
+export const OT_MD_BLOCK_BLANK_AFTER = 64
+export const OT_MD_BLOCK_FENCED = 128
+export const OT_MD_BLOCK_HOOKED = 256
+export const OT_MD_BLOCK_MATH = 512
+export const OT_MD_BLOCK_HEADER = 1024
+export const OT_MD_BLOCK_OPEN = 2048
+export const OT_MD_BLOCK_ALIGN_LEFT = 4096
+export const OT_MD_BLOCK_ALIGN_RIGHT = 8192
+export const OT_MD_SPAN_CODE = 1
+export const OT_MD_SPAN_MATH = 2
+export const OT_EDITOR_MOVE_UP = 0
+export const OT_EDITOR_MOVE_DOWN = 1
+export const OT_EDITOR_GOTO_LINE_END = 2
+export const OT_EDITOR_DELETE_SELECTION = 3
+export const OT_EDITOR_CURSOR_OFFSET = 4
+export const OT_EDITOR_WRAP_MODE = 5
+export const OT_EDITOR_TAB_INDICATOR = 6
+export const OT_EDITOR_SELECT_SET = 0
+export const OT_EDITOR_SELECT_UPDATE = 1
+export const OT_EDITOR_SELECT_RESET = 2
+export const OT_EDITOR_SELECT_LOCAL = 3
+export const OT_EDITOR_SELECT_LOCAL_UPDATE = 4
+export const OT_EDITOR_SELECT_LOCAL_RESET = 5
+export const OT_EDITOR_SELECT_CELL = 6
+export const OT_EDITOR_SELECT_OCCUPANCY = 7
+export const OT_EDITOR_SELECT_INCLUSIVE = 8
+export const OT_EDITOR_SELECT_COLORS = 9
+export const OT_SELECT_DOCUMENT_SET = 0
+export const OT_SELECT_DOCUMENT_UPDATE = 1
+export const OT_SELECT_DOCUMENT_RESET = 2
+export const OT_SELECT_VIEWPORT_SET = 3
+export const OT_SELECT_VIEWPORT_UPDATE = 4
+export const OT_SELECT_VIEWPORT_RESET = 5
+export const OT_SELECTION_CELL = 0
+export const OT_SELECTION_WORD = 1
+export const OT_SELECTION_LINE = 2
+export const OT_SELECTION_OCCUPANCY_CELL = 0
+export const OT_SELECTION_OCCUPANCY_BOUNDARY = 1
+export const OT_EDITOR_POSITION_CURSOR = 0
+export const OT_EDITOR_POSITION_NEXT_WORD = 1
+export const OT_EDITOR_POSITION_PREV_WORD = 2
+export const OT_EDITOR_POSITION_EOL = 3
+export const OT_EDITOR_POSITION_VISUAL_SOL = 4
+export const OT_EDITOR_POSITION_VISUAL_EOL = 5
+export const OT_IMAGE_FIT = 0
+export const OT_IMAGE_COVER = 1
+export const OT_IMAGE_FILL = 2
+export const OT_IMAGE_PROTOCOL_AUTO = 0
+export const OT_IMAGE_PROTOCOL_KITTY = 1
+export const OT_IMAGE_PROTOCOL_SIXEL = 2
+export const OT_IMAGE_PROTOCOL_BLOCKS = 3
+export const OT_IMAGE_DRAW_SOURCE_WIDTH = 1
+export const OT_IMAGE_DRAW_SOURCE_HEIGHT = 2
+export const OT_IMAGE_ENCODED_BYTES_MAX = 67108864
+export const OT_IMAGE_FORMAT_UNKNOWN = 0
+export const OT_IMAGE_FORMAT_PNG = 1
+export const OT_IMAGE_FORMAT_RGBA = 2
+export const OT_IMAGE_FORMAT_JPEG = 3
+export const OT_IMAGE_FORMAT_WEBP = 4
+export const OT_IMAGE_FORMAT_GIF = 5
+export const OT_IMAGE_ASSUMED_SRGB = 0
+export const OT_IMAGE_EXPLICIT_SRGB = 1
+export const OT_IMAGE_RGBA8 = 0
+export const OT_IMAGE_BGRA8 = 1
+export const OT_IMAGE_ALPHA_STRAIGHT = 0
+export const OT_IMAGE_ALPHA_OPAQUE = 1
+export const OT_IMAGE_FILTER_DEFAULT = 0
+export const OT_IMAGE_FILTER_AREA = 1
+export const OT_IMAGE_FILTER_TRIANGLE = 2
+export const OT_IMAGE_FILTER_CUBIC_BSPLINE = 3
+export const OT_IMAGE_FILTER_CATMULL_ROM = 4
+export const OT_IMAGE_FILTER_MITCHELL = 5
+export const OT_IMAGE_FILTER_NEAREST = 6
+export const OT_IMAGE_ROTATE_90 = 0
+export const OT_IMAGE_ROTATE_180 = 1
+export const OT_IMAGE_ROTATE_270 = 2
+export const OT_IMAGE_FLIP = 3
+export const OT_IMAGE_FLOP = 4
+export const OT_IMAGE_BLEND_SOURCE_OVER = 0
+export const OT_IMAGE_BLEND_SOURCE = 1
+export const OT_IMAGE_BLEND_DESTINATION_OVER = 2
+export const OT_VIDEO_OPEN_NO_AUDIO = 1
+export const OT_VIDEO_PLAYING = 1
+export const OT_VIDEO_ENDED = 2
+export const OT_VIDEO_BUFFERING = 4
+export const OT_VIDEO_AUDIO = 8
+export const OT_VIDEO_HAS_FRAME = 16
+export const OT_VIDEO_ERROR = 32
+export const OT_AUDIO_START_NO_DEVICE = 1
+export const OT_TEXT_VIEW_WRAP_WIDTH = 0
+export const OT_TEXT_VIEW_WRAP_MODE = 1
+export const OT_TEXT_VIEW_FIRST_LINE_OFFSET = 2
+export const OT_TEXT_VIEW_TAB_INDICATOR = 3
+export const OT_TEXT_VIEW_TRUNCATE = 4
+export const OT_TEXT_VIEW_TEXT_ALIGN = 5
+export const OT_TEXT_REPLACEMENT_COUNT_MAX = 256
+export const OT_TEXT_REPLACEMENT_CHUNKS_MAX = 4096
+export const OT_TEXT_REPLACEMENT_BYTES_MAX = 4194304
+export const OT_TEXT_REPLACEMENT_URL_BYTES_MAX = 1048576
+export const OT_BUFFER_TEXT_BYTES_MAX = 65536
+export const OT_BUFFER_DRAW_CLEAR = 0
+export const OT_BUFFER_DRAW_FILL = 1
+export const OT_BUFFER_DRAW_TEXT = 2
+export const OT_BUFFER_DRAW_CELL = 3
+export const OT_BUFFER_DRAW_CELL_BLEND = 4
+export const OT_BUFFER_DRAW_CHAR = 5
+export const OT_BUFFER_DRAW_BOX = 6
+export const OT_BUFFER_DRAW_COMPOSE = 7
+export const OT_BUFFER_DRAW_RESPECT_ALPHA = 8
+export const OT_BUFFER_DRAW_HAS_BACKGROUND = 1
+export const OT_BUFFER_DRAW_HAS_SOURCE_WIDTH = 2
+export const OT_BUFFER_DRAW_HAS_SOURCE_HEIGHT = 4
+export const OT_BUFFER_DRAW_FIT_ELLIPSIS = 16
+export const OT_BUFFER_STACK_DEPTH_MAX = 256
+export const OT_BUFFER_STACK_GET_OPACITY = 0
+export const OT_BUFFER_STACK_PUSH_SCISSOR = 1
+export const OT_BUFFER_STACK_POP_SCISSOR = 2
+export const OT_BUFFER_STACK_CLEAR_SCISSORS = 3
+export const OT_BUFFER_STACK_PUSH_OPACITY = 4
+export const OT_BUFFER_STACK_POP_OPACITY = 5
+export const OT_BUFFER_STACK_CLEAR_OPACITY = 6
+export const OT_BUFFER_GRID_INNER = 1
+export const OT_BUFFER_GRID_OUTER = 2
+export const OT_CELL_CHAR_KIND_MASK = 3221225472
+export const OT_CELL_CHAR_IMAGE = 1073741824
+export const OT_CELL_CHAR_GRAPHEME = 2147483648
+export const OT_CELL_CHAR_CONTINUATION = 3221225472
+export const OT_SESSION_CONTROL_PACKET_BYTES = 4096
+export const OT_TERMINAL_ALTERNATE_SCREEN = 1
+export const OT_TERMINAL_MOUSE = 2
+export const OT_TERMINAL_MOUSE_MOVEMENT = 4
+export const OT_TERMINAL_CLEAR_ON_CLOSE = 8
+export const OT_TERMINAL_REPLY_SENTINEL = 16
+export const OT_TERMINAL_SYNC_ALWAYS = 32
+export const OT_TERMINAL_SYNC_NEVER = 64
+export const OT_TERMINAL_HOST_MULTIPLEXER = 128
+export const OT_KITTY_KEYBOARD_DISAMBIGUATE = 1
+export const OT_KITTY_KEYBOARD_EVENT_TYPES = 2
+export const OT_KITTY_KEYBOARD_ALTERNATE_KEYS = 4
+export const OT_KITTY_KEYBOARD_ALL_KEYS_AS_ESCAPES = 8
+export const OT_KITTY_KEYBOARD_REPORT_TEXT = 16
+export const OT_KITTY_KEYBOARD_ALL = 31
+export const OT_CONTROL_CAPABILITY_RESPONSE = 1
+export const OT_CONTROL_TITLE = 2
+export const OT_CONTROL_MOUSE = 3
+export const OT_CONTROL_KITTY_KEYBOARD_FLAGS = 4
+export const OT_CONTROL_RESTORE_MODES = 5
+export const OT_CONTROL_QUERY_PIXEL_RESOLUTION = 6
+export const OT_CONTROL_QUERY_THEME_COLORS = 7
+export const OT_CONTROL_CURSOR = 8
+export const OT_CONTROL_RESET_BACKGROUND = 9
+export const OT_CONTROL_PALETTE_QUERY = 10
+export const OT_CONTROL_PROGRAM_STATUS = 11
+export const OT_CONTROL_END_REPLY_SENTINEL = 12
+export const OT_CURSOR_POSITION = 1
+export const OT_CURSOR_STYLE = 2
+export const OT_CURSOR_BLINKING = 4
+export const OT_CURSOR_COLOR = 8
+export const OT_CURSOR_MOUSE_POINTER = 16
+export const OT_PROGRAM_STATE_IDLE = 1
+export const OT_PROGRAM_STATE_WORKING = 2
+export const OT_PROGRAM_STATE_DONE = 3
+export const OT_PROGRAM_STATE_BLOCKED = 4
+export const OT_PROGRAM_STATE_ERROR = 5
+export const OT_PROGRAM_STATE_CLEAR = 6
+export const OT_PROGRAM_KIND_PERMISSION = 1
+export const OT_PROGRAM_KIND_QUESTION = 2
+export const OT_PROGRAM_KIND_AUTH = 3
+export const OT_PROGRAM_STATUS_PROGRESS = 1
+export const OT_CAP_KITTY_KEYBOARD = 1
+export const OT_CAP_KITTY_GRAPHICS = 2
+export const OT_CAP_RGB = 4
+export const OT_CAP_ANSI256 = 8
+export const OT_CAP_SGR_PIXELS = 16
+export const OT_CAP_COLOR_SCHEME_UPDATES = 32
+export const OT_CAP_EXPLICIT_WIDTH = 64
+export const OT_CAP_SCALED_TEXT = 128
+export const OT_CAP_SIXEL = 256
+export const OT_CAP_FOCUS_TRACKING = 512
+export const OT_CAP_SYNC = 1024
+export const OT_CAP_BRACKETED_PASTE = 2048
+export const OT_CAP_HYPERLINKS = 4096
+export const OT_CAP_OSC52 = 8192
+export const OT_CAP_NOTIFICATIONS = 16384
+export const OT_CAP_EXPLICIT_CURSOR_POSITIONING = 32768
+export const OT_CAP_REMOTE = 65536
+export const OT_CAP_PROGRAM_STATUS = 131072
+export const OT_TERMINAL_UNINITIALIZED = 0
+export const OT_TERMINAL_SETTING_UP = 1
+export const OT_TERMINAL_ACTIVE = 2
+export const OT_TERMINAL_SUSPENDING = 3
+export const OT_TERMINAL_SUSPENDED = 4
+export const OT_TERMINAL_RESUMING = 5
+export const OT_TERMINAL_CLOSING = 6
+export const OT_TERMINAL_RESTORED = 7
+export const OT_TERMINAL_FAILED = 8
+export const OT_TERMINAL_CANCELLED = 9
+export const OT_PUMP_IDLE = 0
+export const OT_PUMP_AGAIN = 1
+export const OT_PUMP_OUTPUT_PENDING = 2
+export const OT_PUMP_WAIT_UNTIL = 3
+export const OT_PUMP_CLOSED = 4
+export const OT_STDOUT_IDLE = 0
+export const OT_STDOUT_IN_FLIGHT = 1
+export const OT_INPUT_KEY = 1
+export const OT_INPUT_MOUSE = 2
+export const OT_INPUT_PASTE = 3
+export const OT_INPUT_FOCUS = 4
+export const OT_INPUT_REPLY = 5
+export const OT_INPUT_KEY_PRESS = 1
+export const OT_INPUT_KEY_REPEAT = 2
+export const OT_INPUT_KEY_RELEASE = 3
+export const OT_INPUT_MOUSE_DOWN = 1
+export const OT_INPUT_MOUSE_UP = 2
+export const OT_INPUT_MOUSE_MOVE = 3
+export const OT_INPUT_MOUSE_DRAG = 4
+export const OT_INPUT_MOUSE_SCROLL = 5
+export const OT_INPUT_MOUSE_BUTTON_NONE = 255
+export const OT_INPUT_FOCUS_OUT = 0
+export const OT_INPUT_FOCUS_IN = 1
+export const OT_INPUT_MOD_SHIFT = 1
+export const OT_INPUT_MOD_ALT = 2
+export const OT_INPUT_MOD_CTRL = 4
+export const OT_INPUT_MOD_SUPER = 8
+export const OT_INPUT_MOD_HYPER = 16
+export const OT_INPUT_MOD_META = 32
+export const OT_INPUT_MOD_CAPS_LOCK = 64
+export const OT_INPUT_MOD_NUM_LOCK = 128
+export const OT_INPUT_KEY_KITTY = 1
+export const OT_INPUT_KEY_TEXT_TRUNCATED = 2
+export const OT_INPUT_KEY_TYPED = 4
+export const OT_INPUT_PASTE_START = 1
+export const OT_INPUT_PASTE_END = 2
+export const OT_INPUT_REPLY_FRAGMENT = 1
+export const OT_INPUT_REPLY_CURSOR_POSITION = 2
+export const OT_INPUT_REPLY_CSI = 1
+export const OT_INPUT_REPLY_SS3 = 2
+export const OT_INPUT_REPLY_OSC = 3
+export const OT_INPUT_REPLY_DCS = 4
+export const OT_INPUT_REPLY_APC = 5
+export const OT_INPUT_KEY_ESCAPE = 27
+export const OT_INPUT_KEY_ENTER = 13
+export const OT_INPUT_KEY_TAB = 9
+export const OT_INPUT_KEY_BACKSPACE = 127
+export const OT_INPUT_KEY_INSERT = 57348
+export const OT_INPUT_KEY_DELETE = 57349
+export const OT_INPUT_KEY_LEFT = 57350
+export const OT_INPUT_KEY_RIGHT = 57351
+export const OT_INPUT_KEY_UP = 57352
+export const OT_INPUT_KEY_DOWN = 57353
+export const OT_INPUT_KEY_PAGE_UP = 57354
+export const OT_INPUT_KEY_PAGE_DOWN = 57355
+export const OT_INPUT_KEY_HOME = 57356
+export const OT_INPUT_KEY_END = 57357
+export const OT_INPUT_KEY_CAPS_LOCK = 57358
+export const OT_INPUT_KEY_SCROLL_LOCK = 57359
+export const OT_INPUT_KEY_NUM_LOCK = 57360
+export const OT_INPUT_KEY_PRINT_SCREEN = 57361
+export const OT_INPUT_KEY_PAUSE = 57362
+export const OT_INPUT_KEY_MENU = 57363
+export const OT_INPUT_KEY_F1 = 57364
+export const OT_INPUT_KEY_F35 = 57398
+export const OT_INPUT_KEY_KP_0 = 57399
+export const OT_INPUT_KEY_KP_9 = 57408
+export const OT_INPUT_KEY_KP_DECIMAL = 57409
+export const OT_INPUT_KEY_KP_DIVIDE = 57410
+export const OT_INPUT_KEY_KP_MULTIPLY = 57411
+export const OT_INPUT_KEY_KP_SUBTRACT = 57412
+export const OT_INPUT_KEY_KP_ADD = 57413
+export const OT_INPUT_KEY_KP_ENTER = 57414
+export const OT_INPUT_KEY_KP_EQUAL = 57415
+export const OT_INPUT_KEY_KP_SEPARATOR = 57416
+export const OT_INPUT_KEY_KP_LEFT = 57417
+export const OT_INPUT_KEY_KP_RIGHT = 57418
+export const OT_INPUT_KEY_KP_UP = 57419
+export const OT_INPUT_KEY_KP_DOWN = 57420
+export const OT_INPUT_KEY_KP_PAGE_UP = 57421
+export const OT_INPUT_KEY_KP_PAGE_DOWN = 57422
+export const OT_INPUT_KEY_KP_HOME = 57423
+export const OT_INPUT_KEY_KP_END = 57424
+export const OT_INPUT_KEY_KP_INSERT = 57425
+export const OT_INPUT_KEY_KP_DELETE = 57426
+export const OT_INPUT_KEY_KP_BEGIN = 57427
+export const OT_INPUT_KEY_MEDIA_PLAY = 57428
+export const OT_INPUT_KEY_MEDIA_PAUSE = 57429
+export const OT_INPUT_KEY_MEDIA_PLAY_PAUSE = 57430
+export const OT_INPUT_KEY_MEDIA_REVERSE = 57431
+export const OT_INPUT_KEY_MEDIA_STOP = 57432
+export const OT_INPUT_KEY_MEDIA_FAST_FORWARD = 57433
+export const OT_INPUT_KEY_MEDIA_REWIND = 57434
+export const OT_INPUT_KEY_MEDIA_TRACK_NEXT = 57435
+export const OT_INPUT_KEY_MEDIA_TRACK_PREVIOUS = 57436
+export const OT_INPUT_KEY_MEDIA_RECORD = 57437
+export const OT_INPUT_KEY_LOWER_VOLUME = 57438
+export const OT_INPUT_KEY_RAISE_VOLUME = 57439
+export const OT_INPUT_KEY_MUTE_VOLUME = 57440
+export const OT_INPUT_KEY_LEFT_SHIFT = 57441
+export const OT_INPUT_KEY_LEFT_CONTROL = 57442
+export const OT_INPUT_KEY_LEFT_ALT = 57443
+export const OT_INPUT_KEY_LEFT_SUPER = 57444
+export const OT_INPUT_KEY_LEFT_HYPER = 57445
+export const OT_INPUT_KEY_LEFT_META = 57446
+export const OT_INPUT_KEY_RIGHT_SHIFT = 57447
+export const OT_INPUT_KEY_RIGHT_CONTROL = 57448
+export const OT_INPUT_KEY_RIGHT_ALT = 57449
+export const OT_INPUT_KEY_RIGHT_SUPER = 57450
+export const OT_INPUT_KEY_RIGHT_HYPER = 57451
+export const OT_INPUT_KEY_RIGHT_META = 57452
+export const OT_INPUT_KEY_ISO_LEVEL3_SHIFT = 57453
+export const OT_INPUT_KEY_ISO_LEVEL5_SHIFT = 57454
+export const OT_INPUT_EXPECT_REPLIES = 1
+export const OT_INPUT_EXPECT_KITTY_KEYBOARD = 2
+export const OT_INPUT_EXPECT_CURSOR_POSITION = 4
+export const OT_INPUT_EXPECT_SENTINEL = 8
+export const OT_INPUT_EXPECT_ESCAPE_PREFIX = 16
+export const OT_INPUT_EVENTS_MIN = 4
+export const OT_INPUT_PAYLOAD_BYTES_MIN = 4384
+export const OT_INPUT_TIMEOUT_NS = 20000000
+export const OT_DIAGNOSTIC_MESSAGE_BYTES = 4096
+export const OT_DIAGNOSTIC_TRUNCATED = 1
+export const OT_DIAGNOSTIC_QUEUE_MAX = 64
+export const OT_SCENE_RECORD_BYTES_MAX = 67108864
+export const OT_SCENE_RECORD_PHASE_BEFORE = 0
+export const OT_SCENE_RECORD_PHASE_SELF = 1
+export const OT_SCENE_RECORD_PHASE_AFTER = 2
+export const OT_SCENE_RECORD_SLOT = 0
+export const OT_SCENE_RECORD_DRAW = 1
+export const OT_SCENE_RECORD_STACK = 2
+export const OT_SCENE_RECORD_GRID = 3
+export const OT_SCENE_RECORD_PACKED = 4
+export const OT_SCENE_RECORD_SUPERSAMPLE = 5
+export const OT_SCENE_RECORD_GRAYSCALE = 6
+export const OT_SCENE_RECORD_COLOR_MATRIX = 7
+export const OT_SCENE_RECORD_TEXT_VIEW = 8
+export const OT_SCENE_RECORD_EDITOR_VIEW = 9
+export const OT_SCENE_RECORD_SCENE_BODY = 10
+export const OT_SCENE_RECORD_IMAGE = 11
+export const OT_SCENE_RECORD_UNICODE = 12
+export const OT_SCENE_RECORD_CELLS = 13
+export const OT_SCENE_RECORD_GRAYSCALE_FOREGROUND = 1
+export const OT_SCENE_RECORD_GRAYSCALE_BACKGROUND = 2
+export const OT_SCENE_RECORD_GRAYSCALE_SUPERSAMPLED = 4
+export const OT_INPUT_RESET_KEEP_REPLY = 1
+export const OT_CLIPBOARD_OPERATION_PENDING = 0
+export const OT_CLIPBOARD_OPERATION_READ = 1
+export const OT_CLIPBOARD_OPERATION_EMPTY = 2
+export const OT_CLIPBOARD_OPERATION_WRITTEN = 3
+export const OT_CLIPBOARD_OPERATION_CLEARED = 4
+export const OT_CLIPBOARD_OPERATION_UNSUPPORTED = 5
+export const OT_CLIPBOARD_OPERATION_CANCELLED = 6
+export const OT_CLIPBOARD_OPERATION_TIMED_OUT = 7
+export const OT_CLIPBOARD_OPERATION_LIMIT_EXCEEDED = 8
+export const OT_CLIPBOARD_OPERATION_FAILED = 9
+export const OT_CLIPBOARD_OPERATION_INVALID_HANDLE = 10
+export const OT_CLIPBOARD_START_OK = 0
+export const OT_CLIPBOARD_START_INVALID_SERVICE = 1
+export const OT_CLIPBOARD_START_SHUTTING_DOWN = 2
+export const OT_CLIPBOARD_START_LIMIT_EXCEEDED = 3
+export const OT_CLIPBOARD_START_INVALID_ARGUMENT = 4
+export const OT_CLIPBOARD_START_OUT_OF_MEMORY = 5
+export const OT_CLIPBOARD_CANCEL_REQUESTED = 0
+export const OT_CLIPBOARD_CANCEL_ALREADY_TERMINAL = 1
+export const OT_CLIPBOARD_CANCEL_INVALID_HANDLE = 2
+export const OT_CLIPBOARD_COPY_OK = 0
+export const OT_CLIPBOARD_COPY_BUFFER_TOO_SMALL = 1
+export const OT_CLIPBOARD_COPY_INVALID_HANDLE = 2
+export const OT_CLIPBOARD_COPY_INVALID_STATE = 3
+export const OT_CLIPBOARD_COPY_INVALID_ARGUMENT = 4
+export const OT_CLIPBOARD_DESTROY_DESTROYED = 0
+export const OT_CLIPBOARD_DESTROY_NOT_READY = 1
+export const OT_CLIPBOARD_DESTROY_INVALID_HANDLE = 2
+export const OT_CLIPBOARD_SHUTDOWN_PENDING = 0
+export const OT_CLIPBOARD_SHUTDOWN_READY = 1
+export const OT_CLIPBOARD_SHUTDOWN_INVALID_HANDLE = 2
 
 export const nativeSymbols = {
   ot_scene_set_hooks: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
@@ -17,6 +873,8 @@ export const nativeSymbols = {
   ot_scene_clear_children: { args: ["ptr", "buffer"], returns: "i32" },
   ot_scene_set_measure: { args: ["ptr", "buffer", "ptr"], returns: "i32" },
   ot_scene_has_measure: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
+  ot_scene_reaches_hooks: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
+  ot_scene_painted: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
   ot_scene_mark_dirty: { args: ["ptr", "buffer"], returns: "i32" },
   ot_scene_set_style: { args: ["ptr", "buffer", "u32", "u32", "u32", "u32", "f32", "u32"], returns: "i32" },
   ot_scene_get_style: { args: ["ptr", "buffer", "u32", "u32", "u32", "buffer"], returns: "i32" },
@@ -43,9 +901,11 @@ export const nativeSymbols = {
   ot_scene_get_text: { args: ["ptr", "buffer", "ptr", "u32", "buffer"], returns: "i32" },
   ot_scene_get_text_info: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
   ot_scene_get_text_lines: { args: ["ptr", "buffer", "u32", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_scene_get_text_byte_at: { args: ["ptr", "buffer", "i32", "i32", "buffer"], returns: "i32" },
   ot_scene_get_layout: { args: ["ptr", "buffer", "u32", "buffer"], returns: "i32" },
   ot_scene_paint: { args: ["ptr", "buffer", "buffer", "u32", "u32", "buffer"], returns: "i32" },
   ot_scene_hit_test: { args: ["ptr", "buffer", "i32", "i32", "buffer"], returns: "i32" },
+  ot_scene_hit_test_excluding: { args: ["ptr", "buffer", "i32", "i32", "u32", "buffer"], returns: "i32" },
   ot_scene_get_stats: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
   ot_scene_set_debug_flags: { args: ["ptr", "buffer", "u32"], returns: "i32" },
   ot_scene_get_cursor_state: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
@@ -101,6 +961,7 @@ export const nativeSymbols = {
     args: ["ptr", "buffer", "u32", "u32", "u32", "u32", "u32", "ptr", "u32", "buffer"],
     returns: "i32",
   },
+  ot_edit_buffer_convert_offset: { args: ["ptr", "buffer", "u32", "u32", "buffer"], returns: "i32" },
   ot_edit_buffer_measure_text: { args: ["ptr", "buffer", "ptr", "u32", "buffer"], returns: "i32" },
   ot_edit_measure_text: { args: ["ptr", "ptr", "u32", "u32", "u32", "buffer"], returns: "i32" },
   ot_edit_buffer_set_defaults: { args: ["ptr", "buffer", "u32", "buffer"], returns: "i32" },
@@ -109,6 +970,24 @@ export const nativeSymbols = {
   ot_syntax_style_get_count: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
   ot_edit_buffer_highlight: { args: ["ptr", "buffer", "u32", "u32", "ptr"], returns: "i32" },
   ot_edit_buffer_get_highlights: { args: ["ptr", "buffer", "u32", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_context_group_set: { args: ["ptr", "buffer", "u32", "buffer", "u32", "buffer"], returns: "i32" },
+  ot_edit_buffer_set_layer: { args: ["ptr", "buffer", "u32", "u32", "u32", "ptr", "u32"], returns: "i32" },
+  ot_edit_buffer_mark: { args: ["ptr", "buffer", "u32", "ptr", "ptr"], returns: "i32" },
+  ot_edit_buffer_get_marks: { args: ["ptr", "buffer", "u32", "u32", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_markdown_create: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
+  ot_markdown_destroy: { args: ["ptr", "buffer"], returns: "i32" },
+  ot_markdown_set_options: { args: ["ptr", "buffer", "buffer", "buffer"], returns: "i32" },
+  ot_markdown_append: { args: ["ptr", "buffer", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_markdown_set: { args: ["ptr", "buffer", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_markdown_finish: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
+  ot_markdown_get_source: { args: ["ptr", "buffer", "buffer", "buffer"], returns: "i32" },
+  ot_markdown_read_changes: { args: ["ptr", "buffer", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_markdown_read_source: { args: ["ptr", "buffer", "u32", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_markdown_read_leaf: {
+    args: ["ptr", "buffer", "u32", "ptr", "u32", "buffer", "ptr", "ptr", "u32", "buffer", "ptr", "u32", "buffer"],
+    returns: "i32",
+  },
+  ot_markdown_bind: { args: ["ptr", "buffer", "u32", "buffer"], returns: "i32" },
   ot_editor_view_set_viewport: { args: ["ptr", "buffer", "buffer", "u32", "u32"], returns: "i32" },
   ot_editor_view_get_viewport: { args: ["ptr", "buffer", "buffer"], returns: "i32" },
   ot_editor_view_set_scroll_margin: { args: ["ptr", "buffer", "f32"], returns: "i32" },
@@ -195,8 +1074,10 @@ export const nativeSymbols = {
   ot_text_buffer_get_range: { args: ["ptr", "buffer", "u32", "u32", "ptr", "u32", "buffer"], returns: "i32" },
   ot_text_buffer_set_defaults: { args: ["ptr", "buffer", "u32", "buffer"], returns: "i32" },
   ot_text_buffer_set_tab_width: { args: ["ptr", "buffer", "u32"], returns: "i32" },
+  ot_text_buffer_set_width_method: { args: ["ptr", "buffer", "u32"], returns: "i32" },
   ot_text_buffer_highlight: { args: ["ptr", "buffer", "u32", "u32", "ptr"], returns: "i32" },
   ot_text_buffer_get_highlights: { args: ["ptr", "buffer", "u32", "ptr", "u32", "buffer"], returns: "i32" },
+  ot_text_buffer_set_layer: { args: ["ptr", "buffer", "u32", "u32", "u32", "ptr", "u32"], returns: "i32" },
   ot_text_buffer_view_set_viewport: { args: ["ptr", "buffer", "buffer", "u32"], returns: "i32" },
   ot_text_buffer_view_command: { args: ["ptr", "buffer", "u32", "u32"], returns: "i32" },
   ot_text_buffer_view_set_tab_color: { args: ["ptr", "buffer", "ptr"], returns: "i32" },
@@ -905,7 +1786,7 @@ export const nativeLayouts = {
       struct_size: { offset: 0, size: 4, alignment: 4, type: "u32" },
       abi_version: { offset: 4, size: 4, alignment: 4, type: "u32" },
       width_method: { offset: 8, size: 4, alignment: 4, type: "u32" },
-      reserved: { offset: 12, size: 4, alignment: 4, type: "u32" },
+      flags: { offset: 12, size: 4, alignment: 4, type: "u32" },
     },
   },
   ot_edit_buffer_info: {
@@ -973,6 +1854,71 @@ export const nativeLayouts = {
       style_id: { offset: 8, size: 4, alignment: 4, type: "u32" },
       priority: { offset: 12, size: 4, alignment: 4, type: "u32" },
       ref: { offset: 16, size: 4, alignment: 4, type: "u32" },
+    },
+  },
+  ot_highlight_run: {
+    size: 12,
+    alignment: 4,
+    fields: {
+      start_byte: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      end_byte: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      group_set: { offset: 8, size: 4, alignment: 4, type: "u32" },
+    },
+  },
+  ot_edit_mark: {
+    size: 76,
+    alignment: 4,
+    fields: {
+      struct_size: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      abi_version: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      id: { offset: 8, size: 4, alignment: 4, type: "u32" },
+      kind: { offset: 12, size: 4, alignment: 4, type: "u32" },
+      flags: { offset: 16, size: 4, alignment: 4, type: "u32" },
+      style: { offset: 20, size: 4, alignment: 4, type: "u32" },
+      value: { offset: 24, size: 32, alignment: 4, type: "ot_editor_style" },
+      priority: { offset: 56, size: 4, alignment: 4, type: "u32" },
+      start: { offset: 60, size: 4, alignment: 4, type: "u32" },
+      end: { offset: 64, size: 4, alignment: 4, type: "u32" },
+      start_byte: { offset: 68, size: 4, alignment: 4, type: "u32" },
+      end_byte: { offset: 72, size: 4, alignment: 4, type: "u32" },
+    },
+  },
+  ot_markdown_options: {
+    size: 296,
+    alignment: 8,
+    fields: {
+      struct_size: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      abi_version: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      flags: { offset: 8, size: 4, alignment: 4, type: "u32" },
+      source_byte_limit: { offset: 12, size: 4, alignment: 4, type: "u32" },
+      syntax_style: { offset: 16, size: 16, alignment: 8, type: "ot_handle" },
+      hook_filter_byte_count: { offset: 32, size: 4, alignment: 4, type: "u32" },
+      reserved: { offset: 36, size: 4, alignment: 4, type: "u32" },
+      hook_filter: { offset: 40, size: 256, alignment: 1, type: "[256]u8" },
+    },
+  },
+  ot_markdown_result: {
+    size: 12,
+    alignment: 4,
+    fields: {
+      changed_block_count: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      committed_top_level_count: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      removed_from_index: { offset: 8, size: 4, alignment: 4, type: "u32" },
+    },
+  },
+  ot_markdown_block: {
+    size: 32,
+    alignment: 4,
+    fields: {
+      index: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      parent_index: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      kind: { offset: 8, size: 2, alignment: 2, type: "u16" },
+      flags: { offset: 10, size: 2, alignment: 2, type: "u16" },
+      source_start_byte: { offset: 12, size: 4, alignment: 4, type: "u32" },
+      source_end_byte: { offset: 16, size: 4, alignment: 4, type: "u32" },
+      info_start_byte: { offset: 20, size: 4, alignment: 4, type: "u32" },
+      info_end_byte: { offset: 24, size: 4, alignment: 4, type: "u32" },
+      number: { offset: 28, size: 4, alignment: 4, type: "u32" },
     },
   },
   ot_editor_viewport: {
@@ -1578,6 +2524,27 @@ export const nativeLayouts = {
       background: { offset: 48, size: 8, alignment: 2, type: "[4]u16" },
     },
   },
+  ot_scene_cell: {
+    size: 24,
+    alignment: 4,
+    fields: {
+      character: { offset: 0, size: 4, alignment: 4, type: "u32" },
+      attributes: { offset: 4, size: 4, alignment: 4, type: "u32" },
+      foreground: { offset: 8, size: 8, alignment: 2, type: "[4]u16" },
+      background: { offset: 16, size: 8, alignment: 2, type: "[4]u16" },
+    },
+  },
+  ot_scene_record_cells: {
+    size: 24,
+    alignment: 4,
+    fields: {
+      header: { offset: 0, size: 8, alignment: 4, type: "ot_scene_record_header" },
+      x: { offset: 8, size: 4, alignment: 4, type: "i32" },
+      y: { offset: 12, size: 4, alignment: 4, type: "i32" },
+      width: { offset: 16, size: 4, alignment: 4, type: "u32" },
+      count: { offset: 20, size: 4, alignment: 4, type: "u32" },
+    },
+  },
 } as const
 
 export const nativeConstants = {
@@ -1730,6 +2697,22 @@ export const nativeConstants = {
   OT_BOX_SIZING_CONTENT_BOX: 1,
   OT_LAYOUT_MODE_FLEX: 0,
   OT_LAYOUT_MODE_LIST: 1,
+  OT_DISPLAY_CONTENTS: 2,
+  OT_YOGA_ERRATA_NONE: 0,
+  OT_YOGA_ERRATA_STRETCH_FLEX_BASIS: 1,
+  OT_YOGA_ERRATA_ABSOLUTE_POSITION_WITHOUT_INSETS_EXCLUDES_PADDING: 2,
+  OT_YOGA_ERRATA_ABSOLUTE_PERCENT_AGAINST_INNER_SIZE: 4,
+  OT_YOGA_ERRATA_ALL: 2147483647,
+  OT_YOGA_ERRATA_CLASSIC: 2147483646,
+  OT_YOGA_EXPERIMENTAL_FEATURE_WEB_FLEX_BASIS: 0,
+  OT_YOGA_LOG_LEVEL_ERROR: 0,
+  OT_YOGA_LOG_LEVEL_WARN: 1,
+  OT_YOGA_LOG_LEVEL_INFO: 2,
+  OT_YOGA_LOG_LEVEL_DEBUG: 3,
+  OT_YOGA_LOG_LEVEL_VERBOSE: 4,
+  OT_YOGA_LOG_LEVEL_FATAL: 5,
+  OT_YOGA_NODE_TYPE_DEFAULT: 0,
+  OT_YOGA_NODE_TYPE_TEXT: 1,
   OT_STYLE_ENUM_DIRECTION_MAX: 2,
   OT_STYLE_ENUM_FLEX_DIRECTION_MAX: 3,
   OT_STYLE_ENUM_JUSTIFY_CONTENT_MAX: 5,
@@ -1748,6 +2731,7 @@ export const nativeConstants = {
   OT_LAYOUT_PUBLIC: 0,
   OT_LAYOUT_YOGA: 1,
   OT_LAYOUT_PAINT: 2,
+  OT_LAYOUT_CONTENT: 3,
   OT_BORDER_NONE: 0,
   OT_BORDER_LEFT: 1,
   OT_BORDER_BOTTOM: 2,
@@ -1763,9 +2747,41 @@ export const nativeConstants = {
   OT_COLOR_DEFAULT: 2,
   OT_COLOR_CHANNEL_MASK: 255,
   OT_COLOR_META_SHIFT: 8,
+  OT_COLOR_ANSI_0: 0,
+  OT_COLOR_ANSI_1: 8388608,
+  OT_COLOR_ANSI_2: 32768,
+  OT_COLOR_ANSI_3: 8421376,
+  OT_COLOR_ANSI_4: 128,
+  OT_COLOR_ANSI_5: 8388736,
+  OT_COLOR_ANSI_6: 32896,
+  OT_COLOR_ANSI_7: 12632256,
+  OT_COLOR_ANSI_8: 8421504,
+  OT_COLOR_ANSI_9: 16711680,
+  OT_COLOR_ANSI_10: 65280,
+  OT_COLOR_ANSI_11: 16776960,
+  OT_COLOR_ANSI_12: 255,
+  OT_COLOR_ANSI_13: 16711935,
+  OT_COLOR_ANSI_14: 65535,
+  OT_COLOR_ANSI_15: 16777215,
+  OT_COLOR_CUBE_BASE: 55,
+  OT_COLOR_CUBE_STEP: 40,
+  OT_COLOR_GRAY_BASE: 8,
+  OT_COLOR_GRAY_STEP: 10,
+  OT_ATTR_BOLD: 1,
+  OT_ATTR_DIM: 2,
+  OT_ATTR_ITALIC: 4,
+  OT_ATTR_UNDERLINE: 8,
+  OT_ATTR_BLINK: 16,
+  OT_ATTR_INVERSE: 32,
+  OT_ATTR_HIDDEN: 64,
+  OT_ATTR_STRIKETHROUGH: 128,
+  OT_ATTR_BASE_MASK: 255,
+  OT_ATTR_LINK_SHIFT: 8,
+  OT_ATTR_LINK_MASK: 16777215,
   OT_SCENE_TEXT_SELECTION_RESET: 0,
   OT_SCENE_TEXT_SELECTION_SET: 1,
   OT_SCENE_TEXT_SELECTION_UPDATE: 2,
+  OT_SCENE_TEXT_SELECTION_COLORS: 3,
   OT_SCENE_TEXT_SELECTION_CELL: 0,
   OT_SCENE_TEXT_SELECTION_WORD: 1,
   OT_SCENE_TEXT_SELECTION_LINE: 2,
@@ -1782,6 +2798,10 @@ export const nativeConstants = {
   OT_SCENE_FULL_PATH_UNRETAINED: 16,
   OT_SCENE_FULL_PATH_OPTIONS: 32,
   OT_SCENE_FULL_PATH_NON_LOCAL: 64,
+  OT_CURSOR_STYLE_BLOCK: 0,
+  OT_CURSOR_STYLE_LINE: 1,
+  OT_CURSOR_STYLE_UNDERLINE: 2,
+  OT_CURSOR_STYLE_DEFAULT: 3,
   OT_SCENE_HOOK_UPDATE: 1,
   OT_SCENE_HOOK_RESIZE: 2,
   OT_SCENE_HOOK_LAYOUT_CHANGED: 4,
@@ -1837,6 +2857,7 @@ export const nativeConstants = {
   OT_SCENE_SCROLL_ALIGN_NEAREST: 0,
   OT_SCENE_SCROLL_ALIGN_START: 1,
   OT_SCENE_SCROLL_ALIGN_END: 2,
+  OT_SCENE_SCROLL_PADDING_MAX: 65535,
   OT_SCENE_SCROLL_CHANGED_OFFSET_X: 1,
   OT_SCENE_SCROLL_CHANGED_OFFSET_Y: 2,
   OT_SCENE_SCROLL_CHANGED_CONTENT: 4,
@@ -1858,6 +2879,7 @@ export const nativeConstants = {
   OT_RENDER_PENDING: 1,
   OT_RENDER_SKIPPED: 2,
   OT_RENDER_FAILED: 3,
+  OT_SPLIT_SNAPSHOTS_MAX: 64,
   OT_SESSION_BUFFER_CURRENT: 0,
   OT_SESSION_BUFFER_NEXT: 1,
   OT_WIDTH_METHOD_WCWIDTH: 0,
@@ -1865,10 +2887,38 @@ export const nativeConstants = {
   OT_WIDTH_METHOD_NO_ZWJ: 2,
   OT_WIDTH_METHOD_UNICODE_WIDE: 3,
   OT_BUFFER_RESPECT_ALPHA: 1,
+  OT_EMBEDDED_TERMINAL_CURSOR_BAR: 0,
+  OT_EMBEDDED_TERMINAL_CURSOR_BLOCK: 1,
+  OT_EMBEDDED_TERMINAL_CURSOR_UNDERLINE: 2,
+  OT_EMBEDDED_TERMINAL_CURSOR_BLOCK_HOLLOW: 3,
+  OT_EMBEDDED_TERMINAL_MOD_SHIFT: 1,
+  OT_EMBEDDED_TERMINAL_MOD_CTRL: 2,
+  OT_EMBEDDED_TERMINAL_MOD_ALT: 4,
+  OT_EMBEDDED_TERMINAL_MOD_SUPER: 8,
+  OT_EMBEDDED_TERMINAL_MOD_CAPS_LOCK: 16,
+  OT_EMBEDDED_TERMINAL_MOD_NUM_LOCK: 32,
+  OT_EMBEDDED_TERMINAL_KEY_RELEASE: 0,
+  OT_EMBEDDED_TERMINAL_KEY_PRESS: 1,
+  OT_EMBEDDED_TERMINAL_KEY_REPEAT: 2,
+  OT_EMBEDDED_TERMINAL_MOUSE_PRESS: 0,
+  OT_EMBEDDED_TERMINAL_MOUSE_RELEASE: 1,
+  OT_EMBEDDED_TERMINAL_MOUSE_MOTION: 2,
+  OT_EMBEDDED_TERMINAL_BUTTON_NONE: -1,
+  OT_EMBEDDED_TERMINAL_BUTTON_UNKNOWN: 0,
+  OT_EMBEDDED_TERMINAL_BUTTON_LEFT: 1,
+  OT_EMBEDDED_TERMINAL_BUTTON_RIGHT: 2,
+  OT_EMBEDDED_TERMINAL_BUTTON_MIDDLE: 3,
+  OT_EMBEDDED_TERMINAL_BUTTON_FOUR: 4,
+  OT_EMBEDDED_TERMINAL_BUTTON_FIVE: 5,
+  OT_EMBEDDED_TERMINAL_BUTTON_SIX: 6,
+  OT_EMBEDDED_TERMINAL_BUTTON_SEVEN: 7,
+  OT_EMBEDDED_TERMINAL_INPUT_BYTES_MAX: 1048576,
   OT_EMBEDDED_TERMINAL_INVALIDATE: 0,
   OT_EMBEDDED_TERMINAL_SCROLL: 1,
   OT_EMBEDDED_TERMINAL_CLEAR_SELECTION: 2,
   OT_EMBEDDED_TERMINAL_SET_TRANSPARENT_BACKGROUND: 3,
+  OT_EMBEDDED_TERMINAL_RESPONSE_BYTES_MAX: 1048576,
+  OT_EDIT_BUFFER_FOLLOW_SESSION_WIDTH: 1,
   OT_EDIT_CURSOR_CHANGED: 1,
   OT_EDIT_CONTENT_CHANGED: 2,
   OT_EDIT_HISTORY_CURSOR_CHANGED: 4,
@@ -1923,6 +2973,9 @@ export const nativeConstants = {
   OT_EDIT_CLEAR: 10,
   OT_EDIT_CLEAR_HISTORY: 11,
   OT_EDIT_DEBUG_ROPE: 12,
+  OT_EDIT_CURSOR_OFFSET_ATOMIC: 13,
+  OT_EDIT_KEEP_OUTSIDE: 14,
+  OT_EDIT_ATOMIC: 1,
   OT_EDIT_POSITION_CURSOR: 0,
   OT_EDIT_POSITION_NEXT_WORD: 1,
   OT_EDIT_POSITION_PREV_WORD: 2,
@@ -1932,15 +2985,60 @@ export const nativeConstants = {
   OT_EDIT_POSITION_LINE_START: 6,
   OT_EDIT_POSITION_END: 7,
   OT_EDIT_POSITION_PREV_CHAR: 8,
+  OT_EDIT_BYTE_TO_CELL: 0,
+  OT_EDIT_CELL_TO_BYTE: 1,
+  OT_EDIT_UTF16_TO_CELL: 2,
+  OT_EDIT_CELL_TO_UTF16: 3,
   OT_EDITOR_STYLE_FOREGROUND: 1,
   OT_EDITOR_STYLE_BACKGROUND: 2,
   OT_EDITOR_STYLE_ATTRIBUTES: 4,
+  OT_EDITOR_STYLE_ATTRIBUTE_MASK: 8,
   OT_EDIT_HIGHLIGHT_ADD_LINE: 0,
   OT_EDIT_HIGHLIGHT_ADD_RANGE: 1,
   OT_EDIT_HIGHLIGHT_REMOVE_REF: 2,
   OT_EDIT_HIGHLIGHT_CLEAR_LINE: 3,
   OT_EDIT_HIGHLIGHT_CLEAR_ALL: 4,
   OT_STYLE_RUN_FLAG: 2147483648,
+  OT_GROUP_SET_NAME_COUNT_MAX: 16,
+  OT_GROUP_SET_NAME_BYTE_COUNT_MAX: 64,
+  OT_EDIT_MARK_ADD: 0,
+  OT_EDIT_MARK_REMOVE: 1,
+  OT_EDIT_MARK_CLEAR: 2,
+  OT_EDIT_MARK_ATOMIC: 1,
+  OT_EDIT_MARK_STYLE_VALUE: 2,
+  OT_EDIT_MARK_ANY_KIND: 4294967295,
+  OT_MD_CONCEAL: 1,
+  OT_MD_HYPERLINKS: 2,
+  OT_MD_MATH: 4,
+  OT_MD_HOOK: 8,
+  OT_MD_HOOK_FILTER_BYTE_COUNT_MAX: 256,
+  OT_MD_PARAGRAPH: 0,
+  OT_MD_HEADING: 1,
+  OT_MD_CODE: 2,
+  OT_MD_HTML: 3,
+  OT_MD_RULE: 4,
+  OT_MD_TABLE: 5,
+  OT_MD_TABLE_ROW: 6,
+  OT_MD_TABLE_CELL: 7,
+  OT_MD_QUOTE: 8,
+  OT_MD_LIST: 9,
+  OT_MD_ITEM: 10,
+  OT_MD_BLOCK_CLOSED: 1,
+  OT_MD_BLOCK_SETEXT: 2,
+  OT_MD_BLOCK_ORDERED: 4,
+  OT_MD_BLOCK_TIGHT: 8,
+  OT_MD_BLOCK_TASK: 16,
+  OT_MD_BLOCK_CHECKED: 32,
+  OT_MD_BLOCK_BLANK_AFTER: 64,
+  OT_MD_BLOCK_FENCED: 128,
+  OT_MD_BLOCK_HOOKED: 256,
+  OT_MD_BLOCK_MATH: 512,
+  OT_MD_BLOCK_HEADER: 1024,
+  OT_MD_BLOCK_OPEN: 2048,
+  OT_MD_BLOCK_ALIGN_LEFT: 4096,
+  OT_MD_BLOCK_ALIGN_RIGHT: 8192,
+  OT_MD_SPAN_CODE: 1,
+  OT_MD_SPAN_MATH: 2,
   OT_EDITOR_MOVE_UP: 0,
   OT_EDITOR_MOVE_DOWN: 1,
   OT_EDITOR_GOTO_LINE_END: 2,
@@ -1984,6 +3082,7 @@ export const nativeConstants = {
   OT_IMAGE_PROTOCOL_BLOCKS: 3,
   OT_IMAGE_DRAW_SOURCE_WIDTH: 1,
   OT_IMAGE_DRAW_SOURCE_HEIGHT: 2,
+  OT_IMAGE_ENCODED_BYTES_MAX: 67108864,
   OT_IMAGE_FORMAT_UNKNOWN: 0,
   OT_IMAGE_FORMAT_PNG: 1,
   OT_IMAGE_FORMAT_RGBA: 2,
@@ -2053,6 +3152,10 @@ export const nativeConstants = {
   OT_BUFFER_STACK_CLEAR_OPACITY: 6,
   OT_BUFFER_GRID_INNER: 1,
   OT_BUFFER_GRID_OUTER: 2,
+  OT_CELL_CHAR_KIND_MASK: 3221225472,
+  OT_CELL_CHAR_IMAGE: 1073741824,
+  OT_CELL_CHAR_GRAPHEME: 2147483648,
+  OT_CELL_CHAR_CONTINUATION: 3221225472,
   OT_SESSION_CONTROL_PACKET_BYTES: 4096,
   OT_TERMINAL_ALTERNATE_SCREEN: 1,
   OT_TERMINAL_MOUSE: 2,
@@ -2062,6 +3165,12 @@ export const nativeConstants = {
   OT_TERMINAL_SYNC_ALWAYS: 32,
   OT_TERMINAL_SYNC_NEVER: 64,
   OT_TERMINAL_HOST_MULTIPLEXER: 128,
+  OT_KITTY_KEYBOARD_DISAMBIGUATE: 1,
+  OT_KITTY_KEYBOARD_EVENT_TYPES: 2,
+  OT_KITTY_KEYBOARD_ALTERNATE_KEYS: 4,
+  OT_KITTY_KEYBOARD_ALL_KEYS_AS_ESCAPES: 8,
+  OT_KITTY_KEYBOARD_REPORT_TEXT: 16,
+  OT_KITTY_KEYBOARD_ALL: 31,
   OT_CONTROL_CAPABILITY_RESPONSE: 1,
   OT_CONTROL_TITLE: 2,
   OT_CONTROL_MOUSE: 3,
@@ -2240,6 +3349,7 @@ export const nativeConstants = {
   OT_INPUT_TIMEOUT_NS: 20000000,
   OT_DIAGNOSTIC_MESSAGE_BYTES: 4096,
   OT_DIAGNOSTIC_TRUNCATED: 1,
+  OT_DIAGNOSTIC_QUEUE_MAX: 64,
   OT_SCENE_RECORD_BYTES_MAX: 67108864,
   OT_SCENE_RECORD_PHASE_BEFORE: 0,
   OT_SCENE_RECORD_PHASE_SELF: 1,
@@ -2257,6 +3367,7 @@ export const nativeConstants = {
   OT_SCENE_RECORD_SCENE_BODY: 10,
   OT_SCENE_RECORD_IMAGE: 11,
   OT_SCENE_RECORD_UNICODE: 12,
+  OT_SCENE_RECORD_CELLS: 13,
   OT_SCENE_RECORD_GRAYSCALE_FOREGROUND: 1,
   OT_SCENE_RECORD_GRAYSCALE_BACKGROUND: 2,
   OT_SCENE_RECORD_GRAYSCALE_SUPERSAMPLED: 4,

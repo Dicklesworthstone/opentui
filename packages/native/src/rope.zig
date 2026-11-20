@@ -408,6 +408,8 @@ pub fn Rope(comptime T: type) type {
 
         pub const UndoNode = struct {
             root: *const Node,
+            /// The owner's state paired with `root`, as `Rope.aux` was when the node stored it.
+            aux: usize,
             metrics_generation: u64,
             next: ?*UndoNode = null,
             branches: ?*UndoBranch = null,
@@ -420,6 +422,12 @@ pub fn Rope(comptime T: type) type {
         };
 
         root: *const Node,
+        /// Opaque owner state paired with `root`: history stores it with each root and undo and
+        /// redo restore it with the root (an edit buffer's marks). A new rope starts at 0.
+        aux: usize = 0,
+        /// No history node holds `aux`, so its owner may change it in place. Every history move
+        /// that stores or loads an `aux` clears it.
+        aux_owned: bool = false,
         metrics_generation: u64 = 0,
         allocator: Allocator,
         empty_leaf: *const Node,
@@ -1027,6 +1035,53 @@ pub fn Rope(comptime T: type) type {
             return position;
         }
 
+        /// `seekCount`, plus the sum of `summed` over the leaves before that leaf.
+        pub fn seekCountSum(self: *const Self, comptime counted: fn (*const Metrics) u32, comptime summed: fn (*const Metrics) u32, n: u32) ?struct { leaf_index: u32, sum: u32 } {
+            if (n >= counted(&self.root.metrics())) return null;
+            text_work.add(.line_seeks, 1);
+            var node = self.root;
+            var rest = n;
+            var leaf_index: u32 = 0;
+            var sum: u32 = 0;
+            while (node.* == .branch) {
+                text_work.add(.line_seek_nodes, 1);
+                const left = node.branch.left.metrics();
+                if (rest < counted(&left)) {
+                    node = node.branch.left;
+                } else {
+                    rest -= counted(&left);
+                    leaf_index += left.count;
+                    sum += summed(&left);
+                    node = node.branch.right;
+                }
+            }
+            return .{ .leaf_index = leaf_index, .sum = sum };
+        }
+
+        pub const KeyFindResult = struct { leaf: *const T, leaf_index: u32, before: u32 };
+
+        /// The leaf whose range along `key` holds `target` (start <= target < start + key), and the
+        /// key before it; null when `target` is at or past the total.
+        pub fn seekKey(self: *const Self, comptime key: fn (*const Metrics) u32, target: u32) ?KeyFindResult {
+            if (target >= key(&self.root.metrics())) return null;
+            var node = self.root;
+            var before: u32 = 0;
+            var leaf_index: u32 = 0;
+            while (true) switch (node.*) {
+                .branch => |*b| {
+                    const left = b.left.metrics();
+                    if (target < before + key(&left)) {
+                        node = b.left;
+                    } else {
+                        before += key(&left);
+                        leaf_index += left.count;
+                        node = b.right;
+                    }
+                },
+                .leaf => |*l| return .{ .leaf = &l.data, .leaf_index = leaf_index, .before = before },
+            };
+        }
+
         /// Number of leaves that `counted` counts and that start at or before `target`, measured
         /// along `key`, found by one descent. Leaves without key at `target` count.
         pub fn countThrough(self: *const Self, comptime key: fn (*const Metrics) u32, comptime counted: fn (*const Metrics) u32, target: u32) u32 {
@@ -1102,6 +1157,7 @@ pub fn Rope(comptime T: type) type {
             self.push_undo(undo_node);
             self.curr_history = null;
             self.redo_history = null;
+            self.aux_owned = false;
         }
 
         fn create_undo_node(self: *const Self, root: *const Node, meta_: []const u8) !*UndoNode {
@@ -1110,6 +1166,7 @@ pub fn Rope(comptime T: type) type {
             const meta = try self.allocator.dupe(u8, meta_);
             undo_node.* = UndoNode{
                 .root = root,
+                .aux = self.aux,
                 .metrics_generation = self.metrics_generation,
                 .meta = meta,
             };
@@ -1156,12 +1213,17 @@ pub fn Rope(comptime T: type) type {
             undo_node.next = next;
         }
 
+        /// The redo node takes the live `aux` when it holds the live root; a reused node whose
+        /// root was replaced without history keeps the `aux` of its own root.
         pub fn undo(self: *Self, meta: []const u8) ![]const u8 {
             const r = self.curr_history orelse try self.create_undo_node(self.root, meta);
             const h = self.undo_history orelse return error.Stop;
+            if (r.root == self.root) r.aux = self.aux;
             self.undo_history = h.next;
             self.curr_history = h;
             self.root = h.root;
+            self.aux = h.aux;
+            self.aux_owned = false;
             self.metrics_generation = h.metrics_generation;
             self.push_redo(r);
             if (self.undo_depth > 0) self.undo_depth -= 1;
@@ -1172,9 +1234,12 @@ pub fn Rope(comptime T: type) type {
             const u = self.curr_history orelse return error.Stop;
             const h = self.redo_history orelse return error.Stop;
             if (u.root != self.root) return error.Stop;
+            u.aux = self.aux;
             self.redo_history = h.next;
             self.curr_history = h;
             self.root = h.root;
+            self.aux = h.aux;
+            self.aux_owned = false;
             self.metrics_generation = h.metrics_generation;
             self.push_undo(u);
             return h.meta;

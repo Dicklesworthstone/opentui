@@ -1,15 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const SupportedZigVersion = struct {
-    major: u32,
-    minor: u32,
-    patch: u32,
-};
-
-const SUPPORTED_ZIG_VERSIONS = [_]SupportedZigVersion{
-    .{ .major = 0, .minor = 17, .patch = 0 },
-};
+// build.zig.zon's minimum_zig_version names the one Zig version this package builds with. CI's setup-zig reads it too.
+const ZIG_VERSION = std.SemanticVersion.parse(@import("build.zig.zon").minimum_zig_version) catch unreachable;
 
 const SupportedTarget = struct {
     zig_target: []const u8,
@@ -39,6 +32,9 @@ const YOGA_CXX_FLAGS = [_][]const u8{
     "-std=c++20",
     "-fexceptions",
     "-frtti",
+    // Bind Yoga's C++ calls inside the library instead of through the PLT.
+    "-fvisibility-inlines-hidden",
+    "-fno-semantic-interposition",
 };
 
 const YOGA_CXX_SOURCES = [_][]const u8{
@@ -366,6 +362,7 @@ fn addMacOSSystemLibraries(b: *std.Build, module: *std.Build.Module, sdk_path: [
 
 // Set by -Drequire-video. Release builds pass it so a missing FFmpeg prefix fails instead of shipping without video.
 var require_video = false;
+var video_enabled = true;
 var video_unavailable_warned: std.StringHashMapUnmanaged(void) = .empty;
 
 // Names the FFmpeg prefix that scripts/build-ffmpeg.ts builds for this target, if any.
@@ -390,7 +387,7 @@ fn addVideoDependencies(b: *std.Build, module: *std.Build.Module, target: std.Bu
         else => &.{ "-std=c11", "-fvisibility=hidden" },
     };
     const unavailable_flags = appendCFlags(b, base_flags, &.{"-DOTV_NO_FFMPEG"});
-    const target_name = ffmpegTargetName(b, target) orelse {
+    const target_name = (if (video_enabled) ffmpegTargetName(b, target) else null) orelse {
         module.addCSourceFile(.{ .file = b.path("src/video-shim.c"), .flags = unavailable_flags });
         return;
     };
@@ -426,7 +423,9 @@ fn addVideoDependencies(b: *std.Build, module: *std.Build.Module, target: std.Bu
     var lines = std.mem.tokenizeAny(u8, objects, "\r\n");
     while (lines.next()) |object| module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ prefix, object }) });
     switch (target.result.os.tag) {
-        .windows => module.linkSystemLibrary("bcrypt", .{}),
+        // A system import library: pkg-config has nothing for it, and on CI's Windows runners Strawberry Perl's
+        // pkg-config.BAT fails and fails the compile step.
+        .windows => module.linkSystemLibrary("bcrypt", .{ .use_pkg_config = .no }),
         .macos => {
             module.linkFramework("VideoToolbox", .{});
             module.linkFramework("CoreMedia", .{});
@@ -534,6 +533,9 @@ fn addTestFixtures(b: *std.Build, module: *std.Build.Module) void {
     module.addAnonymousImport("input_conformance", .{
         .root_source_file = b.path("../core/src/lib/stdin-parser.conformance.json"),
     });
+    module.addAnonymousImport("markdown_conformance", .{
+        .root_source_file = b.path("../core/src/renderables/markdown.conformance.json"),
+    });
 }
 
 /// Apply dependencies to a module
@@ -589,35 +591,18 @@ fn applyDependencies(
 
 fn checkZigVersion() void {
     const current_version = builtin.zig_version;
-    var is_supported = false;
+    if (current_version.major == ZIG_VERSION.major and
+        current_version.minor == ZIG_VERSION.minor and
+        current_version.patch == ZIG_VERSION.patch) return;
 
-    for (SUPPORTED_ZIG_VERSIONS) |supported| {
-        if (current_version.major == supported.major and
-            current_version.minor == supported.minor and
-            current_version.patch == supported.patch)
-        {
-            is_supported = true;
-            break;
-        }
-    }
-
-    if (!is_supported) {
-        std.debug.print("\x1b[31mError: Unsupported Zig version {}.{}.{}\x1b[0m\n", .{
-            current_version.major,
-            current_version.minor,
-            current_version.patch,
-        });
-        std.debug.print("Supported Zig versions:\n", .{});
-        for (SUPPORTED_ZIG_VERSIONS) |supported| {
-            std.debug.print("  - {}.{}.{}\n", .{
-                supported.major,
-                supported.minor,
-                supported.patch,
-            });
-        }
-        std.debug.print("\nPlease install a supported Zig version to continue.\n", .{});
-        std.process.exit(1);
-    }
+    std.debug.print("\x1b[31mError: Unsupported Zig version {}.{}.{}\x1b[0m\n", .{
+        current_version.major,
+        current_version.minor,
+        current_version.patch,
+    });
+    std.debug.print("Supported Zig versions:\n  - {}.{}.{}\n", .{ ZIG_VERSION.major, ZIG_VERSION.minor, ZIG_VERSION.patch });
+    std.debug.print("\nPlease install a supported Zig version to continue.\n", .{});
+    std.process.exit(1);
 }
 
 pub fn build(b: *std.Build) void {
@@ -631,6 +616,11 @@ pub fn build(b: *std.Build) void {
     const build_all = b.option(bool, "all", "Build for all supported targets") orelse false;
     const gpa_safe_stats = b.option(bool, "gpa-safe-stats", "Enable GPA safety checks for trustworthy allocator stats") orelse false;
     require_video = b.option(bool, "require-video", "Fail when a target's FFmpeg prefix is missing instead of building without video") orelse false;
+    video_enabled = b.option(bool, "video", "Enable FFmpeg video decoding when available") orelse true;
+    if (require_video and !video_enabled) {
+        std.debug.print("error: -Drequire-video conflicts with -Dvideo=false\n", .{});
+        std.process.exit(1);
+    }
     const macos_sdk_path = resolveMacOSSDKPath(b);
     const build_options = b.addOptions();
     build_options.addOption(bool, "gpa_safe_stats", gpa_safe_stats);
@@ -691,8 +681,8 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(test_artifact);
     test_step.dependOn(&run_test.step);
 
-    // Zig 0.17.0 miscompiles some integer casts only in optimized LLVM code,
-    // where utils.zig tests its replacements.
+    // utils.zig replaces std functions whose loads Zig 0.17.1's LLVM backend
+    // splits into bytes (ziglang/zig#37120). Test them in optimized LLVM code.
     const utils_test = b.addTest(.{
         .name = "utils-llvm",
         .root_module = b.createModule(.{
@@ -949,15 +939,19 @@ fn buildTarget(
     const build_step_name = try std.fmt.allocPrint(b.allocator, "build-{s}", .{output_name});
     const build_step = b.step(build_step_name, try std.fmt.allocPrint(b.allocator, "Build for {s}", .{description}));
     for (createLibraries(b, target, optimize, build_options, macos_sdk_path)) |lib| {
-        if (lib.isStaticLibrary() and target.result.os.tag == .linux) {
-            // Linux has no system libc++ to count on, so the archive carries Zig's. The shared library installs the
-            // header.
-            const run = b.addRunArtifact(bundleLibcxxTool(b));
+        const windows = target.result.os.tag == .windows;
+        if (lib.isStaticLibrary() and (windows or target.result.os.tag == .linux)) {
+            // Linux has no system libc++ to count on, so the archive carries Zig's. MSVC has none of MinGW's
+            // runtime, so the Windows archive carries what of it MSVC lacks. The shared library installs the header.
+            const run = b.addRunArtifact(bundleTool(b, windows));
             run.addArgs(&.{ b.graph.zig_exe, zig_target, @tagName(optimize) });
             run.addFileArg(b.addWriteFiles().add("probe.cpp", "int opentui_probe;\n"));
+            if (windows) run.addFileArg(b.path("src/windows-msvc-shim.c"));
+            if (windows) run.addDirectoryArg(std.Build.LazyPath.zig_lib.path(b, "libc/mingw/lib-common"));
             run.addArtifactArg(lib);
-            const archive = run.addOutputFileArg("libopentui.a");
-            const install_archive = b.addInstallFileWithDir(archive, .{ .custom = install_path }, "libopentui.a");
+            const name = if (windows) "opentui-static.lib" else "libopentui.a";
+            const archive = run.addOutputFileArg(name);
+            const install_archive = b.addInstallFileWithDir(archive, .{ .custom = install_path }, name);
             build_step.dependOn(&install_archive.step);
             b.getInstallStep().dependOn(&install_archive.step);
             continue;
@@ -979,17 +973,20 @@ fn buildTarget(
     }
 }
 
-var bundle_libcxx_tool: ?*std.Build.Step.Compile = null;
+var bundle_tools: [2]?*std.Build.Step.Compile = .{ null, null };
 
-fn bundleLibcxxTool(b: *std.Build) *std.Build.Step.Compile {
-    if (bundle_libcxx_tool == null) bundle_libcxx_tool = b.addExecutable(.{
-        .name = "bundle-libcxx",
+/// scripts/bundle-windows-runtime.zig, or scripts/bundle-libcxx.zig for Linux.
+fn bundleTool(b: *std.Build, windows: bool) *std.Build.Step.Compile {
+    const tool = &bundle_tools[@intFromBool(windows)];
+    const name = if (windows) "bundle-windows-runtime" else "bundle-libcxx";
+    if (tool.* == null) tool.* = b.addExecutable(.{
+        .name = name,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/bundle-libcxx.zig"),
+            .root_source_file = b.path(b.fmt("scripts/{s}.zig", .{name})),
             .target = b.graph.host,
         }),
     });
-    return bundle_libcxx_tool.?;
+    return tool.*.?;
 }
 
 fn createLibraries(

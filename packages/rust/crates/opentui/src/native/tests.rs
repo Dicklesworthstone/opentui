@@ -617,7 +617,7 @@ fn frames_pass_scroll_requests_to_the_host() -> Result<()> {
     };
     // The first layout sizes the content, a frame without changes asks nothing, and new content asks again.
     assert_eq!(scrolls(&session)?, [2]);
-    assert_eq!(scrolls(&session)?, []);
+    assert_eq!(scrolls(&session)?, [0; 0]);
     text.set_text("a\nb\nc\nd")?;
     assert_eq!(scrolls(&session)?, [2]);
     Ok(())
@@ -700,6 +700,18 @@ fn controls_and_capabilities_follow_terminal_setup() -> Result<()> {
     session.set_debug_overlay(true, Corner::BottomLeft)?;
     session.control(Control::CapabilityResponse(b"\x1b]7501;?\x1b\\"))?;
     assert!(session.capabilities()?.flags.contains(CapabilityFlags::PROGRAM_STATUS));
+    // OSC 9 text loses its C1 controls (U+009C is ST) and a leading digit that would select a ConEmu subcommand.
+    session.pump_until_quiet(&mut now_ns)?;
+    // No title is not an empty one: OSC 777 puts the message in the title field and leaves the body empty.
+    session.control(Control::CapabilityResponse(b"\x1bP>|ghostty 1.3.1\x1b\\"))?;
+    session.pump_until_quiet(&mut now_ns)?;
+    assert!(session.notify("done", None)?);
+    assert!(contains(&session.pump_until_quiet(&mut now_ns)?, b"\x1b]777;notify;done;\x1b\\"));
+    session.control(Control::CapabilityResponse(b"\x1b]1337;Capabilities=No\x1b\\"))?;
+    session.pump_until_quiet(&mut now_ns)?;
+    assert!(session.notify("4;1;50\u{9c}", None)?);
+    let output = session.pump_until_quiet(&mut now_ns)?;
+    assert!(contains(&output, b"\x1b]9; 4;1;50 \x1b\\"), "{:?}", String::from_utf8_lossy(&output));
     Ok(())
 }
 
@@ -810,6 +822,53 @@ fn capabilities_name_width_methods_multiplexers_and_forced_image_protocols() -> 
 }
 
 #[test]
+fn editor_converts_byte_indices_and_cells() -> Result<()> {
+    let context = context(1)?;
+    for method in [WidthMethod::Unicode, WidthMethod::UnicodeWide, WidthMethod::Wcwidth, WidthMethod::NoZwj] {
+        let buffer = EditBuffer::new(&context, method)?;
+        buffer.set_tab_width(4)?;
+        let emoji = if method == WidthMethod::NoZwj {
+            [("👩‍", 2), ("💻", 2)]
+        } else {
+            [("👩‍💻", if method == WidthMethod::Wcwidth { 4 } else { 2 }), ("", 0)]
+        };
+        let units =
+            [("a", 1), ("\t", 4), ("界", 2), emoji[0], emoji[1], ("e\u{301}", 1), ("\n", 1), ("\n", 1), ("\x0c", 2)];
+        let text = "a\t界👩‍💻e\u{301}\r\n\r\n\x0c";
+        buffer.set_text(text, false)?;
+        let (mut index, mut offset) = (0, 0);
+        for (unit, width) in units {
+            for i in 0..unit.len() {
+                assert_eq!(buffer.byte_index_to_cell_offset(index + i)?, offset);
+            }
+            for c in 0..width {
+                assert_eq!(buffer.cell_offset_to_byte_index(offset + c)?, index);
+            }
+            assert_eq!(buffer.cell_offset_to_byte_index(buffer.byte_index_to_cell_offset(index)?)?, index);
+            index += unit.len();
+            offset += width;
+        }
+        assert_eq!(buffer.byte_index_to_cell_offset(index + 1)?, offset);
+        assert_eq!(buffer.cell_offset_to_byte_index(offset + 1)?, index);
+        // Without a buffer, the same text measures to the offset at its end, as Core's `measureEditText`.
+        assert_eq!(context.measure_edit_text(text, method, 4)?, offset);
+        buffer.set_text("\u{301}界", false)?;
+        assert_eq!(buffer.cell_offset_to_byte_index(0)?, "\u{301}".len());
+        let text = "ab\tcd";
+        for i in 0..text.len() {
+            buffer.set_text(text, false)?;
+            let pos = |i| -> Result<_> {
+                let p = buffer.position(EditQuery::Offset(buffer.byte_index_to_cell_offset(i)?))?.unwrap();
+                Ok((p.row, p.col))
+            };
+            buffer.delete_range(pos(i)?, pos(i + 1)?)?;
+            assert_eq!(buffer.text()?, format!("{}{}", &text[..i], &text[i + 1..]));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn editor_nodes_paint_measure_and_edit_bound_buffers() -> Result<()> {
     // Session, two nodes, buffer, view, and capture lease.
     let context = context(6)?;
@@ -846,6 +905,56 @@ fn editor_nodes_paint_measure_and_edit_bound_buffers() -> Result<()> {
     buffer.set_text("", false)?;
     let capture = session.paint(Color::rgb(0, 0, 0), true, 0)?.capture()?;
     assert_eq!(capture.row(0).trim_end(), "type here");
+    Ok(())
+}
+
+// Expected: every selection call takes any subset of its colors. Actual: `TextView` and `EditorView` set the scene
+// text-selection flags in `ot_editor_selection`, whose values are swapped, so one color failed with InvalidArgument.
+#[test]
+fn selections_take_each_subset_of_their_colors() -> Result<()> {
+    let context = context(9)?;
+    let session = session(&context, 5, 4)?;
+    let root = Node::new(&session, NodeKind::Root, 1)?;
+    let kinds = [NodeKind::Text, NodeKind::TextView, NodeKind::Editor, NodeKind::Editor];
+    let nodes =
+        (0..4).map(|index| Node::new(&session, kinds[index as usize], index + 2)).collect::<Result<Vec<_>>>()?;
+    for (index, node) in (0..).zip(&nodes) {
+        node.insert_into(&root, index)?;
+    }
+    nodes[0].set_text("hello")?;
+    let text_buffer = TextBuffer::new(&context, WidthMethod::Unicode)?;
+    text_buffer.set_text("hello")?;
+    let text_view = TextView::new(&text_buffer)?;
+    nodes[1].set_text_view(Some(&text_view))?;
+    let edit_buffer = EditBuffer::new(&context, WidthMethod::Unicode)?;
+    edit_buffer.set_text("hello", false)?;
+    let (range, local) = (EditorView::new(&edit_buffer, 5, 1)?, EditorView::new(&edit_buffer, 5, 1)?);
+    nodes[2].set_editor_view(Some(&range))?;
+    nodes[3].set_editor_view(Some(&local))?;
+    let (fg, bg) = (Some(Color::rgb(255, 0, 0)), Some(Color::rgb(0, 0, 255)));
+    let transparent = Some(Color::TRANSPARENT);
+    let rows = [(None, None), (fg, None), (None, bg), (fg, bg), (None, transparent)];
+    for colors in rows.map(|(fg, bg)| SelectionColors { fg, bg }) {
+        // Each row starts unselected, so a call that selects nothing cannot pass on the previous row's selection.
+        nodes[0].clear_text_selection()?;
+        text_view.clear_selection()?;
+        range.clear_selection()?;
+        local.clear_selection()?;
+        nodes[0].select_text((0, 0), (1, 0), false, SelectionUnit::Cell, colors)?;
+        text_view.select_local((0, 0), (1, 0), false, SelectionUnit::Cell, colors)?;
+        range.select_range(0, 2, colors)?;
+        local.select_local((0, 0), (1, 0), false, SelectionUnit::Cell, false, colors)?;
+        let selected =
+            [nodes[0].selected_text()?, text_view.selected_text()?, range.selected_text()?, local.selected_text()?];
+        assert_eq!(selected, ["he"; 4], "{colors:?}");
+        // Each view paints its selection as the scene text node does.
+        let capture = session.paint(Color::BLACK, true, 0)?.capture()?;
+        let cells = (0..4).map(|y| capture.cell(0, y).map(|cell| (cell.fg, cell.bg))).collect::<Vec<_>>();
+        assert_eq!(cells, [cells[0]; 4], "{colors:?}");
+        // A transparent background composites onto the frame, so only an opaque one paints as itself.
+        let opaque = colors.bg.filter(|bg| bg.a == 255);
+        assert!(opaque.is_none_or(|bg| cells[0].is_some_and(|cell| cell.1 == bg)), "{colors:?}");
+    }
     Ok(())
 }
 
@@ -1037,9 +1146,11 @@ fn embedded_terminals_encode_input_as_programs_ask() -> Result<()> {
     assert_eq!(key("Enter", "", Modifiers::NONE)?, b"\r");
     assert_eq!(key("KeyC", "c", Modifiers::CTRL)?, b"\x03");
     assert_eq!(key("KeyA", "a", Modifiers::ALT)?, b"\x1ba");
+    // The emulator has no Meta: Kitty Meta goes as Alt, not as Super.
+    assert_eq!(key("KeyA", "a", Modifiers::META)?, b"\x1ba");
     assert_eq!(key("ArrowUp", "", Modifiers::NONE)?, b"\x1b[A");
     terminal.write(b"\x1b[>3u")?;
-    assert_eq!(key("KeyA", "a", Modifiers::META)?, b"\x1b[97;9u");
+    assert_eq!(key("KeyA", "a", Modifiers::META)?, b"\x1b[97;3u");
     let release = TerminalKey {
         kind: KeyEventKind::Release,
         code: "KeyA",

@@ -1,5 +1,6 @@
 import { RGBA } from "./lib/RGBA.js"
 import {
+  NativeEditAtomic,
   NativeEditorCommand,
   NativeEditorPositionQuery,
   NativeEditorSelectionOperation,
@@ -151,10 +152,12 @@ export class EditorView {
     return this.lib.contextEditorViewGetInfo(this.native.handle.context, this.native.handle).totalVirtualLineCount
   }
 
+  /** Selects [start, end) in document display cells, counting each newline as one. */
   public setSelection(start: number, end: number, bgColor?: RGBA, fgColor?: RGBA): void {
     this.select({ operation: NativeEditorSelectionOperation.Set, start, end, bg: bgColor, fg: fgColor })
   }
 
+  /** Sets the exclusive end in document display cells, counting each newline as one. */
   public updateSelection(end: number, bgColor?: RGBA, fgColor?: RGBA): void {
     this.select({ operation: NativeEditorSelectionOperation.Update, end, bg: bgColor, fg: fgColor })
   }
@@ -163,6 +166,7 @@ export class EditorView {
     this.select({ operation: NativeEditorSelectionOperation.Reset })
   }
 
+  /** Returns half-open bounds in document display cells, counting each newline as one. */
   public getSelection(): { start: number; end: number } | null {
     this.guard()
     return this.lib.contextEditorViewGetSelection(this.native.handle.context, this.native.handle).selection
@@ -172,6 +176,7 @@ export class EditorView {
     return this.getSelection() !== null
   }
 
+  /** Selects between viewport-local positions: x in display cells, y in wrapped rows. */
   public setLocalSelection(
     anchorX: number,
     anchorY: number,
@@ -197,6 +202,7 @@ export class EditorView {
     })
   }
 
+  /** Updates the selection between viewport-local cell columns and wrapped rows. */
   public updateLocalSelection(
     anchorX: number,
     anchorY: number,
@@ -242,6 +248,7 @@ export class EditorView {
     return this.lib.contextEditorViewGetSelection(this.native.handle.context, this.native.handle).selectionOccupancy
   }
 
+  /** Selects document cell offsets (one per newline); cell occupancy includes the grapheme at the larger endpoint. */
   public setSelectionInclusive(start: number, end: number, bgColor?: RGBA, fgColor?: RGBA): void {
     this.select({ operation: NativeEditorSelectionOperation.Inclusive, start, end, bg: bgColor, fg: fgColor })
   }
@@ -250,32 +257,45 @@ export class EditorView {
     this.select({ operation: NativeEditorSelectionOperation.Colors, bg: bgColor, fg: fgColor })
   }
 
+  /** Returns selected text as a UTF-16-indexed JavaScript string. */
   public getSelectedText(): string {
     this.guard()
     return this.lib.contextEditorViewGetSelectedText(this.native.handle.context, this.native.handle)
   }
 
+  /** Returns the zero-based logical row and display-cell column. */
   public getCursor(): { row: number; col: number } {
     this.guard()
     const { row, col } = this.editBuffer.getCursorPosition()
     return { row, col }
   }
 
+  /** Returns the buffer text as a UTF-16-indexed JavaScript string. */
   public getText(): string {
     this.guard()
     return this.editBuffer.getText()
   }
 
+  /** Returns viewport and logical cell coordinates; the offset counts document cells, one per newline. */
   public getVisualCursor(): VisualCursor {
     return this.position(NativeEditorPositionQuery.Cursor)
   }
 
-  public moveUpVisual(): void {
-    this.command(NativeEditorCommand.MoveUp)
+  /** @internal Set while an extmarks controller lives: Up and Down apply the cursor rules around virtual extmarks. */
+  public _atomic = false
+
+  private rules(): number {
+    return this._atomic && !this.hasSelection() ? NativeEditAtomic : 0
   }
 
+  /** Moves the cursor up one wrapped row in the view. */
+  public moveUpVisual(): void {
+    this.command(NativeEditorCommand.MoveUp, this.rules())
+  }
+
+  /** Moves the cursor down one wrapped row in the view. */
   public moveDownVisual(): void {
-    this.command(NativeEditorCommand.MoveDown)
+    this.command(NativeEditorCommand.MoveDown, this.rules())
   }
 
   public deleteSelectedText(): void {
@@ -292,26 +312,32 @@ export class EditorView {
     )
   }
 
+  /** Sets the cursor in document display cells, counting each newline as one. Offsets past the end clamp to the end. */
   public setCursorByOffset(offset: number): void {
     this.command(NativeEditorCommand.CursorOffset, offset)
   }
 
+  /** Returns the next word boundary in logical and viewport cell coordinates. */
   public getNextWordBoundary(): VisualCursor {
     return this.position(NativeEditorPositionQuery.NextWord)
   }
 
+  /** Returns the previous word boundary in logical and viewport cell coordinates. */
   public getPrevWordBoundary(): VisualCursor {
     return this.position(NativeEditorPositionQuery.PrevWord)
   }
 
+  /** Returns the logical line end in logical and viewport cell coordinates. */
   public getEOL(): VisualCursor {
     return this.position(NativeEditorPositionQuery.Eol)
   }
 
+  /** Returns the wrapped row start in logical and viewport cell coordinates. */
   public getVisualSOL(): VisualCursor {
     return this.position(NativeEditorPositionQuery.VisualSol)
   }
 
+  /** Returns the wrapped row end in logical and viewport cell coordinates. */
   public getVisualEOL(): VisualCursor {
     return this.position(NativeEditorPositionQuery.VisualEol)
   }
@@ -330,6 +356,16 @@ export class EditorView {
     return this.lib.contextEditorViewGetLines(this.native.handle.context, this.native.handle, true)
   }
 
+  /**
+   * @internal A cursor that a wheel step, a pointer or the offset setter left inside virtual extmarks goes to the outer
+   * edge of the marks around it: toward the end for a positive `direction`, the start for a negative one, or the nearer
+   * edge. Only with an extmarks controller, and not while a selection is left: it holds the cursor at its focus.
+   */
+  public _keepCursorOutside(direction: number): void {
+    if (this.rules()) this.editBuffer._keepOutside(direction)
+  }
+
+  /** Marks use half-open document cell ranges, counting each newline as one. */
   public get extmarks(): any {
     this.guard()
     if (!this._extmarksController) {
